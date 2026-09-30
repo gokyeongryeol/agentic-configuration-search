@@ -1,0 +1,36 @@
+# YOLOE-26x run config — aquarium-qlnqy (workshop experiment).
+#
+# Detector notes:
+# - detector: ultralytics YOLOE-26x (seg), in-process; no server.
+# - Negatives are emulated — neg_eta_grid values are suppression IoU thresholds (0.25–0.75).
+# - lora axis = tail fine-tune (modules 16/19/22 + head) + λ-interpolation arms.
+# - crop_classifier axis = the client applies the same artifact (reclassify → drop background).
+# - All alias/text_negatives mining captions go through the VLM (shared vLLM).
+# - YOLOE scores run low (weak phrases ~1e-3), so the floor is lowered.
+dataset: demo_data/aquarium-qlnqy
+out_dir: runs_yoloe
+rounds: 10
+planner:
+  kind: llm
+  launch:
+    gpu: 3
+    port: 8104
+    persist: true          # attach to the resident vLLM — never restart it
+detector:
+  model: weights_yoloe/yoloe-26x-seg.pt
+  device: "cuda:7"   # check nvidia-smi shows <200MiB right before launch, adjust if not
+query:
+  box_threshold: 0.001
+  threshold_floor: 0.001
+mine:
+  device: "cuda:7"         # dinov3 embedding / classifier training worker — same GPU as detector.device
+  visual_negative_min_score: 0.02   # FP pool score floor matched to YOLOE's score scale (default 0.05)
+search:
+  neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # suppression IoU threshold sweep
+  tiling_configs:
+    - {slice: [384, 384], overlap: 0.25, merge: nmm}   # 2×2 tiles over a 640² image
+lora:                      # tail fine-tune + λ-interpolation arms
+  epochs: 10
+  batch_size: 8
+  lr: 0.001                # AdamW lr0 (the worker pins optimizer=AdamW)
+  device: "cuda:7"

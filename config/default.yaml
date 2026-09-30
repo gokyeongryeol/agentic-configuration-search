@@ -1,0 +1,112 @@
+# agentic-detector-config reference config — every key with its default (README.md is normative)
+#
+# Every value here equals the code default (test_default_yaml_matches_dataclass_defaults
+# in tests/test_config.py guards against drift).
+# A real run config only lists the keys it changes — the rest are filled from defaults,
+# and undeclared keys fail immediately with ConfigError (so typos aren't silently absorbed).
+
+dataset: demo_data/soccer-players-5fuqs   # (required) Roboflow root — needs train/ plus valid/ (holdout; falls back to test/ if valid/ is absent)
+out_dir: runs                             # root for run artifacts (--out takes precedence)
+rounds: 10                                # planner round cap — saturation wins if it stops first
+# β of the decision metric F-beta — 1.0=F1, >1 weights recall, <1 weights precision.
+# Runs through threshold estimation (incl. tau_test), screen scoring, the adoption gate and the rescorer α curve.
+beta: 1.0
+# Operator-supplied description of the dataset (optional) — inserted verbatim into the
+# LLM planner prompt only (the deterministic planner ignores it). With "" the prompt is byte-identical to before this key existed.
+dataset_notes: ""
+# Execution randomness seed — material-mining sampling, lora, crop classifier training, gate bootstrap.
+# Kept separate from split.seed (split boundaries): seed waves hold fit_train/fit_dev fixed
+# and vary only this value to measure search variance.
+run_seed: 0
+
+planner:
+  kind: deterministic                     # deterministic | llm
+  model: Qwen/Qwen3.8-27B-FP8             # vLLM model for kind=llm
+  base_url: null                          # running vLLM endpoint. null = start via launch (attach if persist)
+  crop_notes: true                        # show the VLM crops of every prompt sample and merge its descriptions into the diagnosis
+                                          # (kind=llm only, diagnostic signal only — never on the decision path)
+  launch:                                 # vLLM launch parameters when kind=llm and base_url is null
+    gpu: 3
+    port: 8104
+    host: 127.0.0.1
+    gpu_memory_utilization: 0.9           # vLLM memory share — preallocates weights + KV cache pool
+    max_model_len: 16384                  # headroom for late rounds with long history (the budget guard prevents overflow)
+    startup_timeout: 1800
+    enforce_eager: false                  # true disables CUDA graphs (avoids OOM on shared GPUs)
+    persist: true                         # resident: attach to a healthy port, not torn down at run end
+
+gate:                                     # adoption gate
+  margin: 0.0                             # adopt iff one-sided CI lower bound of Δ micro F(β) ≥ margin **and** Δ > 0
+  bootstrap: 2000                         # paired bootstrap resamples
+  confidence: 0.95                        # CI confidence level (alpha = 1 - confidence)
+
+saturation:                               # stopping rule
+  rounds: 5                               # stop after this many consecutive stalled rounds
+  epsilon: 0.0                            # a round is stalled if the Δ CI lower bound is ≤ this
+
+screen:
+  top_k: 2                                # candidates promoted to holdout after fit_dev scoring
+
+split:                                    # boundaries stay fixed across rounds
+  fit_train_ratio: 0.8                    # fit_train share within train (image-level stratified)
+  seed: 0
+
+detector:                                 # detector — YOLOE (ultralytics), in-process, no server
+  model: weights_yoloe/yoloe-26x-seg.pt   # checkpoint path (relative paths resolve against repo_root)
+  device: "cuda:0"
+  apply_topk: 300
+  iou_threshold: 0.5                      # IoU criterion shared by matching, τ and diagnosis
+
+query:                                    # detector-call contract, fixed regardless of setting
+  box_threshold: 0.03
+  threshold_floor: 0.03                   # multimodal_threshold — floor for τ_c
+
+mine:                                     # mining quotas and hygiene rules (the adoption gate belongs to the loop)
+  exemplars_per_class: 4                  # default quotas 4/2/1/1.
+  fn_exemplars_per_class: 2               #   count axes (exemplar_k etc.) may override per candidate
+  visual_negatives_per_class: 1
+  text_negatives_max_per_class: 1
+  exemplar_selection: kcenter             # kcenter | mean | random
+  kcenter_trim: 0.2                       # outlier fraction dropped before kcenter [0, 1)
+  fn_kcenter_trim: 0.1                    # lighter for the FN arm — filter noise but keep diversity
+  fn_min_candidates: 5                    # FN-mining headroom pre-filter (0=off)
+  fn_min_miss_rate: 0.02                  # minimum miss-rate pre-filter
+  fn_min_area_ratio: 0.3                  # cut tiny candidates relative to median GT area
+  visual_negative_min_score: 0.05                # negative candidate score floor (FP branch only)
+  visual_negative_exclude_gt_iom: 0.7            # exclusion threshold for overlap (IoM) with same-class GT
+  embedder_model: facebook/dinov3-vitl16-pretrain-lvd1689m   # gated — HF_TOKEN, or cache + HF_HUB_OFFLINE=1
+  device: "cuda:0"                        # device for the embedding and crop-classifier training workers
+  text_aliases: {}                        # manual aliases — always override generated ones
+
+search:                                   # value space of the screen (fit_dev) grid (candidate axes decide what is on)
+  max_threshold_candidates: 50
+  tau_tolerance: 0.005                    # τ_c tie tolerance — within it, pick the point with the most margin
+  neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # negative suppression IoU threshold sweep
+  tiling_configs:                         # tile grids — tiling is the zoom (relative to 640px)
+    - {slice: [416, 416], overlap: 0.25, merge: nmm}   # 4 tiles, 1.5× — cheap, gentle
+    - {slice: [320, 320], overlap: 0.25, merge: nmm}   # 9 tiles, 2.0× — for tiny objects
+  modalities: [semantic, text]
+  disabled_axes: []                       # axes the planner may not propose in this run (e.g. [crop_classifier])
+  disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}
+
+rescorer:                                 # discriminator on fit_train + α grid on fit_dev
+  min_samples: 64                         # discriminator fit tripwire — below this P̂ degenerates to a constant
+  min_samples_per_class: 50               # adequate per-class sample count for the α decision (fit_dev rows)
+  alphas: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0] # 0.0 required — not adopting means exactly the current setting
+  margin: 0.005                           # adopt α>0 only if the fit_dev F(β) gain exceeds this
+  ensemble_members: 5
+  inner_folds: 5                          # for the oof_phat diagnostic
+
+crop_classifier:                          # detection reclassification axis — corrects class_confusion (off by default, the planner turns it on)
+  min_samples: 32                         # total crop tripwire — skip training below this
+  min_background: 4                       # minimum background crops — without them reclassification is meaningless
+  margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this
+
+lora:                                     # tail fine-tune + λ-interpolation arms — off by default, the planner turns it on
+  min_images: 20                          # skip training (keep base) if fit_train has fewer images
+  lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]    # 0.0 required — λ=0 is bit-exact base
+  margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this
+  epochs: 10
+  batch_size: 8
+  lr: 0.001                               # AdamW lr0 (the worker pins optimizer=AdamW)
+  device: "cuda:0"                        # keep off the shared vLLM planner GPU (planner.launch.gpu)

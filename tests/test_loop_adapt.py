@@ -1,0 +1,241 @@
+"""crop classifier axis e2e — a stub where server-side reclassification fixes class_confusion.
+
+Scenario: the stub detector **misclassifies** class-2 GT as class 1 (boxes are exact).
+Once the classifier artifact is loaded (FakeAdapt.root) labels are corrected -> fit_dev Δ passes
+-> holdout gate accepts -> the champion carries adapt_root. Training is injected via train_fn.
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from agentic_detector_config.config import config_from_dict
+from agentic_detector_config.core.coco import Split
+from agentic_detector_config.infer import gateway
+from agentic_detector_config.loop.runner import run_rounds
+from tests.conftest import make_split
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    size = lambda i: 20 + (i % 3) * 10  # noqa: E731
+    ds = tmp_path / "ds"
+    make_split(ds / "train", [
+        {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
+         "anns": [(1 if i % 2 else 2, 10, 10, size(i), size(i))]}
+        for i in range(12)])
+    make_split(ds / "valid", [        # the loop's holdout
+        {"name": f"t{i}.png", "w": 100, "h": 80,
+         "anns": [(1 if i < 4 else 2, 10, 10, size(i), size(i))]}
+        for i in range(8)])
+    make_split(ds / "test", [{"name": "v.png", "w": 100, "h": 80,   # report-only — the loop never reads it
+                              "anns": [(1, 10, 10, 20, 20)]}])
+    return ds
+
+
+class FakeAdapt:
+    """Recording fake for adapt_ctl — when root is loaded, the stub corrects labels."""
+
+    def __init__(self):
+        self.root = None
+        self.calls: list = []
+
+    def ctl(self, root):
+        self.root = root
+        self.calls.append(root)
+
+
+def _fake_infer(root, server: FakeAdapt, confuse: bool = True):
+    splits = {n: Split.load(root / n) for n in ("train", "valid")}
+    by_path = {str(s.image_path(e)): e for s in splits.values() for e in s.images}
+
+    def fake(ctx, client, config, queries, ontology, image_paths,
+             alias_to_name=None, **kw):
+        out = []
+        for p in image_paths:
+            dets = []
+            for a in by_path[str(p)].annotations:
+                cid = a.category_id
+                if confuse and cid == 2 and server.root is None:
+                    cid = 1                      # class_confusion — fixed by reclassification
+                dets.append({"box": list(a.bbox_xyxy), "score": 0.9,
+                             "category_id": cid, "sources": ["full"]})
+            out.append(dets)
+        return out
+    return fake
+
+
+def _fakes():
+    return dict(
+        encode_fn=lambda cid, paths: np.array(
+            [[float(i), 0.0] for i in range(len(paths))]),
+        caption_fn=lambda rows: {r["id"]: [f"{r['id'].split('#')[0]} look"]
+                                 for r in rows},
+        vlm_caption_fn=lambda rows: {r["id"]: [f"{r['id'].split('#')[0]} look"]
+                                 for r in rows},
+        refine_alias_fn=lambda name, cn, pool, others: {"alias": None,
+                                                        "reason": "none"},
+        refine_negatives_fn=lambda name, cn, pool, mk: {"keep": [],
+                                                        "rejected": []},
+        client=object())
+
+
+def _fake_train(tmp_path):
+    def train_fn(repo_root, *, manifest, ontology, out_dir, device, log_path):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "classifier.pt").write_bytes(b"fake")
+        return out_dir
+    return train_fn
+
+
+def test_classifier_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
+    server = FakeAdapt()
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
+    import agentic_detector_config.loop.adapt_round as ar
+    monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
+
+    cfg = config_from_dict({
+        "dataset": str(root),
+        # misclassified FPs sit on GT (IoU 1.0), so no background arises — relax the tripwire
+        "crop_classifier": {"min_samples": 4, "min_background": 0,
+                            "margin": 0.01},
+    })
+    cand_file = tmp_path / "candidates.yaml"
+    cand_file.write_text(
+        "- id: fixcls\n  axes: {crop_classifier: true}\n  rationale: fix misclassification\n")
+    result = run_rounds(
+        root, out_dir=tmp_path / "run", planner="deterministic", rounds=1,
+        cfg=cfg, candidates_file=cand_file,
+        detector_hooks={"weights_ctl": lambda w: None, "adapt_ctl": server.ctl,
+                   "repo_root": tmp_path, "base_weights": tmp_path / "b-large"},
+        **_fakes())
+
+    base = result.decisions[0]["micro_f_beta"]
+    assert base == pytest.approx(0.5)            # all 4 cat2 images misclassified
+    r1 = result.decisions[1]
+    assert r1["adopted"] is True and r1["id"] == "human_fixcls"
+    assert result.champion["axes"]["crop_classifier"] is True
+    assert result.champion["eval"]["micro_f_beta"] == pytest.approx(1.0)
+    # champion carries the artifact, and the server stays in that state
+    assert result.champion["adapt_root"] and "artifact" in result.champion["adapt_root"]
+    assert server.root is not None
+    meta = json.loads((tmp_path / "run" / "champion.json").read_text())
+    assert meta["adapt_root"] == result.champion["adapt_root"]
+
+
+def test_classifier_rejected_restores_state(root, tmp_path, monkeypatch):
+    """If the artifact fixes nothing (stub: confuse=False, already perfect), fit_dev
+    Δ=0 -> arm rejected -> current state (None) restored."""
+    server = FakeAdapt()
+    monkeypatch.setattr(gateway, "infer_config",
+                        _fake_infer(root, server, confuse=False))
+    import agentic_detector_config.loop.adapt_round as ar
+    monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
+
+    cfg = config_from_dict({
+        "dataset": str(root),
+        "crop_classifier": {"min_samples": 4, "min_background": 0},
+    })
+    cand_file = tmp_path / "candidates.yaml"
+    cand_file.write_text(
+        "- id: fixcls\n  axes: {crop_classifier: true}\n  rationale: try correction\n")
+    result = run_rounds(
+        root, out_dir=tmp_path / "run", planner="deterministic", rounds=1,
+        cfg=cfg, candidates_file=cand_file,
+        detector_hooks={"weights_ctl": lambda w: None, "adapt_ctl": server.ctl,
+                   "repo_root": tmp_path, "base_weights": tmp_path / "b-large"},
+        **_fakes())
+    assert result.decisions[1]["adopted"] is False
+    assert "human_fixcls" in result.decisions[1]["skipped"]
+    assert server.root is None                   # current state restored
+    assert result.champion["adapt_root"] is None
+
+
+def test_classifier_without_adapt_ctl_skips(root, tmp_path, monkeypatch):
+    server = FakeAdapt()
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
+    cand_file = tmp_path / "candidates.yaml"
+    cand_file.write_text(
+        "- id: fixcls\n  axes: {crop_classifier: true}\n  rationale: correction\n")
+    result = run_rounds(root, out_dir=tmp_path / "run", planner="deterministic",
+                        rounds=1, candidates_file=cand_file, **_fakes())
+    assert "human_fixcls" in result.decisions[1]["skipped"]
+
+
+def _ONTO_FOR(root):
+    from agentic_detector_config.core.data import load_dataset
+    return load_dataset(root).ontology
+
+
+def test_arm_refits_rescorer_instead_of_dropping(root, tmp_path, monkeypatch):
+    """Upstream arms keep the rescorer and refit it on the new distribution — measuring without
+    it would make the gate's Δ a compound "+upstream, −rescorer", so the upstream axis would fight
+    handicapped by the rescorer's gain. If the refit is identity, only the label is corrected."""
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop import rescore
+    from agentic_detector_config.loop.runner import Loop
+
+    loop = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "run")
+    setting, materials = {"per_class": {}, "configs": []}, object()
+
+    class _Active:
+        active = True
+
+    calls = []
+    monkeypatch.setattr(rescore, "fit_for_setting",
+                        lambda *a, **k: (_Active(), {}, {"p": 1}))
+    monkeypatch.setattr(rescore, "rescored_screen",
+                        lambda *a, **k: calls.append(a) or {"rescored": True})
+
+    entry = {"id": "c1", "axes": {"lora": True, "rescorer": True}}
+    out = loop._arm_rescorer(entry, setting, materials, tmp_path / "m")
+    assert out == {"rescored": True} and calls, "rescoring must be applied on top of the arm setting"
+    assert entry["axes"]["rescorer"] is True          # label kept
+    assert entry["rescorer_path"].endswith("rescorer.json")
+
+    # if the refit is identity (α=0 for every class), axes are corrected
+    class _Identity:
+        active = False
+
+    monkeypatch.setattr(rescore, "fit_for_setting",
+                        lambda *a, **k: (_Identity(), {}, {}))
+    entry2 = {"id": "c2", "axes": {"lora": True, "rescorer": True}}
+    assert loop._arm_rescorer(entry2, setting, materials, tmp_path / "m") is setting
+    assert entry2["axes"]["rescorer"] is False
+    assert "rescorer_path" not in entry2
+
+    # no rescorer on the champion -> do nothing
+    entry3 = {"id": "c3", "axes": {"lora": True, "rescorer": False}}
+    assert loop._arm_rescorer(entry3, setting, materials, tmp_path / "m") is setting
+
+
+def test_resume_restores_server_state(root, tmp_path, monkeypatch):
+    """resume must reapply the champion's server state — champion.json only records paths, and
+    a fresh process starts with the base model and reclassification off. Without reapplying, that
+    round's candidates are scored by a different detector than the champion, while the gate compares
+    paired against the champion's recorded records, so Δ is silently contaminated."""
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop.runner import Loop
+
+    seen = {"w": [], "a": []}
+    loop = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "run",
+                detector_hooks={"weights_ctl": lambda w: seen["w"].append(w),
+                           "adapt_ctl": lambda p: seen["a"].append(p),
+                           "repo_root": tmp_path, "base_weights": tmp_path / "b"})
+
+    loop._restore_detector_state({"weights": "/w/merged.safetensors",
+                                "adapt_root": "/a/artifact"})
+    assert [str(x) for x in seen["w"]] == ["/w/merged.safetensors"]
+    assert [str(x) for x in seen["a"]] == ["/a/artifact"]
+
+    # champion without server state -> reapply nothing (avoid needless restarts)
+    seen["w"].clear(); seen["a"].clear()
+    loop._restore_detector_state({"weights": None, "adapt_root": None})
+    assert seen["w"] == [] and seen["a"] == []
+
+    # a run that does not own the server (no detector_hooks) skips silently
+    bare = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "r2")
+    bare._restore_detector_state({"weights": "/w", "adapt_root": "/a"})

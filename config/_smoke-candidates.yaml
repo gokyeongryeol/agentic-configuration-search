@@ -1,0 +1,9 @@
+- id: tail
+  axes: {lora: true}
+  rationale: tail smoke
+- id: cls
+  axes: {crop_classifier: true}
+  rationale: reclassify smoke
+- id: rsc
+  axes: {rescorer: true}
+  rationale: emb rescorer smoke

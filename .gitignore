@@ -1,0 +1,19 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.key
+
+# experiment outputs and local data (never committed)
+runs/
+runs_*/
+config/generated/
+config/generated_seed*/
+demo_data
+checkpoints/
+weights_yoloe/
+*.pt
+*.ts
+archives*/

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-detector-config"
+version = "0.1.0"
+description = "Loop that searches YOLOE detector inference settings on train and confirms them on holdout micro F(β) until saturation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0" }   # follows the runtime dependency ultralytics (AGPL-3.0)
+authors = [{ name = "Superb AI", email = "contact@superb-ai.com" }]
+
+# GPU dependencies (torch, ultralytics, ...) are not declared — install them
+# separately in the worker venv and the run venv. The declared dependencies
+# below are MIT / Apache-2.0 / BSD. The package as a whole is AGPL-3.0 because
+# it imports ultralytics (AGPL-3.0) in-process — research baseline only, not to
+# be merged into product code.
+dependencies = [
+    "pyyaml>=6.0",       # MIT
+    "requests>=2.31",    # Apache-2.0
+    "numpy>=1.24",       # BSD-3
+    "pillow>=10.0",      # MIT-CMU
+    "scikit-learn>=1.3", # BSD-3 — rescorer discriminator
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+adc = "agentic_detector_config.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agentic_detector_config*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
