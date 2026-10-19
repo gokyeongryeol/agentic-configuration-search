@@ -82,9 +82,11 @@ search:                                   # value space of the screen (fit_dev) 
   max_threshold_candidates: 50
   tau_tolerance: 0.005                    # τ_c tie tolerance — within it, pick the point with the most margin
   neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # negative suppression IoU threshold sweep
-  tiling_configs:                         # tile grids — tiling is the zoom (relative to 640px)
-    - {slice: [416, 416], overlap: 0.25, merge: nmm}   # 4 tiles, 1.5× — cheap, gentle
-    - {slice: [320, 320], overlap: 0.25, merge: nmm}   # 9 tiles, 2.0× — for tiny objects
+  tiling_configs:                         # tile grids — tiling is the zoom (image-relative g×g)
+    - {grid: 2, overlap: 0.5, merge: nmm}  # 4 tiles, 1.5× — cheap, gentle
+    - {grid: 3, overlap: 0.5, merge: nmm}  # 9 tiles, 2.0× — for tiny objects
+    # tile count and zoom ((g-1)(1-overlap)+1) do not depend on resolution.
+    # Absolute px slice is not accepted — tuned for 640px, 320px became 221 tiles at 4000×3000
   modalities: [semantic, text]
   disabled_axes: []                       # axes the planner may not propose in this run (e.g. [crop_classifier])
   disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}

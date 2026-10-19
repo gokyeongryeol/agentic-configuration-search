@@ -1,23 +1,10 @@
 """tiling.py: grid coverage, offsets, merging of boundary boxes."""
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from agentic_detector_config.core import tiling
-
-
-def test_slice_grid_covers_every_pixel():
-    w, h = 100, 80
-    tiles = tiling.slice_grid(w, h, (64, 64), 0.25)
-    mask = np.zeros((h, w), dtype=bool)
-    for x1, y1, x2, y2 in tiles:
-        assert 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h
-        mask[y1:y2, x1:x2] = True
-    assert mask.all(), "every pixel must be covered by at least one tile"
-
-
-def test_slice_grid_small_image_single_tile():
-    assert tiling.slice_grid(50, 40, (64, 64), 0.25) == [(0, 0, 50, 40)]
 
 
 def test_offset_detections():
@@ -112,8 +99,8 @@ def test_run_tiled_offsets_and_merges():
                 out.append([{"box": [0, 0, 10, 10], "score": 0.5, "label": 2}])
         return out
 
-    merged = tiling.run_tiled(predict_fn, im, {"slice": [64, 64], "overlap": 0.25, "merge": "nmm"})
-    assert sum(calls) == 1 + len(tiling.slice_grid(100, 80, (64, 64), 0.25))
+    merged = tiling.run_tiled(predict_fn, im, {"grid": 2, "overlap": 0.25, "merge": "nmm"})
+    assert sum(calls) == 1 + 4
     label1 = [d for d in merged if d["label"] == 1]
     assert label1 and label1[0]["sources"] == ["full"]
     # tile detections are offset into global coordinates
@@ -122,12 +109,11 @@ def test_run_tiled_offsets_and_merges():
 
 
 def test_run_tiled_degenerate_tile_is_identity():
-    """If slice ≥ image size, the tile equals the full image — inference must not be duplicated
-    and results must match tiling-off."""
-    im = Image.new("RGB", (640, 640))
-    dets = [{"box": [0, 0, 600, 600], "score": 0.9, "label": 1},
-            {"box": [100, 100, 120, 120], "score": 0.8, "label": 1},
-            {"box": [300, 300, 320, 320], "score": 0.7, "label": 1}]
+    """For a tiny image (1px) the tile equals the full image — inference must not be
+    duplicated and results must match tiling-off."""
+    im = Image.new("RGB", (1, 1))
+    dets = [{"box": [0, 0, 1, 1], "score": 0.9, "label": 1},
+            {"box": [0, 0, 1, 1], "score": 0.8, "label": 2}]
     calls = []
 
     def predict_fn(images):
@@ -135,7 +121,87 @@ def test_run_tiled_degenerate_tile_is_identity():
         return [list(dets) for _ in images]
 
     merged = tiling.run_tiled(predict_fn, im,
-                              {"slice": [640, 640], "overlap": 0.25, "merge": "nmm"})
+                              {"grid": 2, "overlap": 0.5, "merge": "nmm"})
     assert calls == [1]                       # only 1 full pass — no duplicate inference
-    assert len(merged) == len(dets)           # nested detections preserved
+    assert len(merged) == len(dets)
     assert all(d["sources"] == ["full"] for d in merged)
+
+
+# --- grid: image-relative tiles -------------------------------------------------
+# Absolute px slices grew the tile count quadratically with resolution (320 at
+# 640px → 9 tiles, at 4000×3000 → 221 tiles). A grid is g×g at any resolution —
+# fixed cost and zoom.
+
+def _covers(tiles, w, h):
+    mask = np.zeros((h, w), dtype=bool)
+    for x1, y1, x2, y2 in tiles:
+        assert 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h
+        mask[y1:y2, x1:x2] = True
+    return mask.all()
+
+
+def test_grid_tile_count_is_resolution_independent():
+    for w, h in [(325, 325), (640, 640), (640, 480), (1920, 1080),
+                 (1700, 2200), (4000, 3000), (1001, 997)]:
+        for g in (2, 3):
+            for overlap in (0.25, 0.5):
+                tiles, degenerate = tiling.tile_plan(
+                    w, h, {"grid": g, "overlap": overlap, "merge": "nmm"})
+                assert not degenerate
+                assert len(tiles) == g * g, (w, h, g, overlap)
+                assert _covers(tiles, w, h)
+
+
+def test_grid_zoom_and_overlap_hold_per_axis():
+    """tile side = side/((g-1)(1-o)+1) (rounded up) — the zoom does not depend on
+    resolution and the actual overlap is at least the requested one. Non-square
+    images are split per axis."""
+    w, h, g, o = 1920, 1080, 3, 0.5
+    tiles, _ = tiling.tile_plan(w, h, {"grid": g, "overlap": o, "merge": "nmm"})
+    xs = sorted({t[0] for t in tiles})
+    ys = sorted({t[1] for t in tiles})
+    sw, sh = tiles[0][2] - tiles[0][0], tiles[0][3] - tiles[0][1]
+    assert sw == 960 and sh == 540           # 2.0x zoom
+    for pos, s in ((xs, sw), (ys, sh)):
+        for a, b in zip(pos, pos[1:]):
+            assert (a + s - b) / s >= o       # adjacent tiles overlap >= overlap
+
+
+def test_default_grids_match_old_640_slices():
+    """The default grids (grid 2 and 3, overlap 0.5) match the old slice 416 / 320 at
+    640px in tile count (4 / 9) and zoom (1.5x / 2.0x)."""
+    t2, _ = tiling.tile_plan(640, 640, {"grid": 2, "overlap": 0.5})
+    t3, _ = tiling.tile_plan(640, 640, {"grid": 3, "overlap": 0.5})
+    assert len(t2) == 4 and len(t3) == 9
+    assert t3[0] == (0, 0, 320, 320)
+    assert abs((t2[0][2] - t2[0][0]) - 416) <= 16
+
+
+def test_yoloe_grid_matches_old_384_slice():
+    """The yoloe configs' grid 2 / overlap 0.33 keeps the old 384px 2×2 tiles at 640px."""
+    tiles, _ = tiling.tile_plan(640, 640, {"grid": 2, "overlap": 0.33})
+    assert len(tiles) == 4 and tiles[0] == (0, 0, 384, 384)
+
+
+def test_slice_form_rejected():
+    with pytest.raises(ValueError, match="grid"):
+        tiling.tile_plan(640, 640, {"slice": [320, 320], "overlap": 0.25})
+
+
+def test_tile_count_helper():
+    assert tiling.tile_count(4000, 3000, {"grid": 3, "overlap": 0.5}) == 9
+    assert tiling.tile_count(500, 400, {"grid": 2, "overlap": 0.25}) == 4
+
+
+def test_run_tiled_grid_calls_full_plus_g_squared():
+    calls = []
+
+    def predict_fn(images):
+        calls.append([im.size for im in images])
+        return [[] for _ in images]
+
+    tiling.run_tiled(predict_fn, Image.new("RGB", (4000, 3000)),
+                     {"grid": 3, "overlap": 0.5, "merge": "nmm"})
+    assert len(calls) == 1 and len(calls[0]) == 1 + 9
+    assert calls[0][0] == (4000, 3000)
+    assert set(calls[0][1:]) == {(2000, 1500)}

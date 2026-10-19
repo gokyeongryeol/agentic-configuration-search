@@ -1,4 +1,4 @@
-"""In-house SAHI: slice / offset / merge.
+"""In-house SAHI: tile split / offset / merge.
 
 The detector has no tiled inference, so we build it here.
 Internal detection representation is a dict:
@@ -8,32 +8,13 @@ Internal detection representation is a dict:
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 NMS_IOU = 0.5
 # tolerance (px) for a box edge to count as "touching" a tile seam
 EDGE_EPS = 2.0
-
-
-def slice_grid(width: int, height: int, slice_wh, overlap_ratio: float) -> list[tuple[int, int, int, int]]:
-    """List of tiles (x1,y1,x2,y2). The last tile is clamped inward so every pixel
-    is covered by at least one tile."""
-    sw, sh = int(slice_wh[0]), int(slice_wh[1])
-    step_x = max(1, int(sw * (1 - overlap_ratio)))
-    step_y = max(1, int(sh * (1 - overlap_ratio)))
-
-    def _positions(size: int, slice_size: int, step: int) -> list[int]:
-        if size <= slice_size:
-            return [0]
-        pos = list(range(0, size - slice_size, step))
-        pos.append(size - slice_size)  # clamp the border tile
-        return sorted(set(pos))
-
-    return [
-        (x, y, min(x + sw, width), min(y + sh, height))
-        for y in _positions(height, sh, step_y)
-        for x in _positions(width, sw, step_x)
-    ]
 
 
 def offset_detections(dets: list[dict], dx: float, dy: float) -> list[dict]:
@@ -144,11 +125,47 @@ def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
     return kept
 
 
+def _grid_positions(size: int, n: int, overlap_ratio: float) -> tuple[int, list[int]]:
+    """(tile side, start positions) covering one axis with n tiles.
+
+    side = ceil(size / ((n-1)(1-o)+1)) — the zoom is resolution-independent, and
+    positions are spread evenly between both ends, so the actual overlap is at
+    least o (the ceiling leaves slack)."""
+    side = min(size, math.ceil(size / ((n - 1) * (1 - overlap_ratio) + 1)))
+    span = size - side
+    return side, sorted({round(i * span / (n - 1)) for i in range(n)})
+
+
+def grid_tiles(width: int, height: int, grid: int,
+               overlap_ratio: float) -> list[tuple[int, int, int, int]]:
+    """Image-relative g×g tiles — tile count (= inference cost) and zoom are fixed
+    regardless of resolution. Each axis is split separately, so non-square images
+    are g×g too."""
+    sw, xs = _grid_positions(width, grid, overlap_ratio)
+    sh, ys = _grid_positions(height, grid, overlap_ratio)
+    return [(x, y, x + sw, y + sh) for y in ys for x in xs]
+
+
 def tile_plan(width: int, height: int, tile_cfg: dict):
-    """(tiles, degenerate) — the tiles run_tiled will cut (deterministic)."""
-    tiles = slice_grid(width, height, tile_cfg["slice"], tile_cfg["overlap"])
+    """(tiles, degenerate) — the tiles run_tiled will cut (deterministic).
+
+    tile_cfg is an image-relative g×g grid (`grid`) — cost and zoom do not depend
+    on resolution. Absolute px (`slice`) is not accepted: values tuned for 640px
+    made the tile count grow quadratically at high resolution (320px at 4000×3000
+    is 221 tiles).
+    """
+    if "grid" not in tile_cfg:
+        raise ValueError(f"tiling config has no grid ({tile_cfg!r}) — the absolute "
+                         "px slice form is not supported")
+    tiles = grid_tiles(width, height, int(tile_cfg["grid"]), tile_cfg["overlap"])
     degenerate = len(tiles) == 1 and tiles[0] == (0, 0, width, height)
     return tiles, degenerate
+
+
+def tile_count(width: int, height: int, tile_cfg: dict) -> int:
+    """Tile inferences per image (excluding the full pass; 0 if degenerate)."""
+    tiles, degenerate = tile_plan(width, height, tile_cfg)
+    return 0 if degenerate else len(tiles)
 
 
 def merge_from_results(results: list[list[dict]], tiles, degenerate: bool,
@@ -167,7 +184,7 @@ def run_tiled(predict_fn, image, tile_cfg: dict) -> list[dict]:
 
     predict_fn(images: list[PIL.Image]) -> list[list[dict]] — detections per image.
     image: PIL.Image (loaded by the caller).
-    tile_cfg: {"slice": [w,h], "overlap": float, "merge": "nmm"|"nms"}
+    tile_cfg: {"grid": int, "overlap": float, "merge": "nmm"|"nms"}
     """
     tiles, degenerate = tile_plan(image.width, image.height, tile_cfg)
     crops = [] if degenerate else [image.crop(t) for t in tiles]

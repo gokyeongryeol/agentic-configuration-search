@@ -73,7 +73,7 @@ the baseline behavior.
 | visual exemplar | text only / GT-crop exemplars (`base`, `fn_arm`) |
 | visual_negatives, neg_eta | negative crops emulated by IoU suppression × threshold grid |
 | text_negatives | off / `fp_crop` / `gt_crop` / `background` |
-| tiling | off / slice grid |
+| tiling | off / image-relative g×g grid (`search.tiling_configs`) |
 | rescorer | per-class score calibration α_c (α=0 is off) |
 | lora | YOLOE tail fine-tune with λ interpolation (λ=0 is the base) |
 | crop_classifier | SigLIP2+LoRA re-classification of detections |

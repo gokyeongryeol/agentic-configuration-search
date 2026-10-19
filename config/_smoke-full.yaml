@@ -28,7 +28,7 @@ mine:
 search:
   neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # suppression IoU threshold sweep
   tiling_configs:
-    - {slice: [384, 384], overlap: 0.25, merge: nmm}   # 2×2 tiles over a 640² image
+    - {grid: 2, overlap: 0.33, merge: nmm}   # 2×2 tiles, 384px each on a 640² image
 lora:                      # tail fine-tune + λ-interpolation arms
   epochs: 4
   batch_size: 8

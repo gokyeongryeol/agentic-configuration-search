@@ -74,7 +74,7 @@ for d in dets[0][:5]:
 
 # ---- tiling path (PIL crop input) ----
 tile_cfg = {"config_id": 2, "negative": False, "neg_eta": None,
-            "tiling": {"slice": [320, 320], "overlap": 0.2, "merge": "nmm"}}
+            "tiling": {"grid": 3, "overlap": 0.5, "merge": "nmm"}}
 q2, o2, _ = build_config_queries(cfg.query, tile_cfg, ex, None)
 t0 = time.time()
 dets = gateway.infer_config(Ctx(cfg), client, tile_cfg, q2, onto, paths[:2])

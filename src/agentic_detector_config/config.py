@@ -132,15 +132,17 @@ class SearchCfg:
     tau_tolerance: float = 0.005
     # Grid of suppression IoU thresholds for emulated negatives (neg_eta)
     neg_eta_grid: list = field(default_factory=lambda: [0.25, 0.35, 0.5, 0.65, 0.75])
-    # Tiling grid — demo_data images are all 640x640 (water-meter is 325) with
-    # median object side 16–93px, so tiling is effectively upscaling. Two levels
-    # only: 416 (4 tiles, 1.5x) is a cheap mild option, 320 (9 tiles, 2x) targets
-    # tiny objects (e.g. 16px). overlap 0.25 covers objects cut at tile borders;
-    # merge=nmm unions only fragments touching a seam (containment union would
-    # swallow instances).
+    # Tiling grid — tiling is effectively upscaling. Written as an
+    # **image-relative g×g** (`grid`): tile count (= inference cost) and zoom
+    # (g-1)(1-o)+1 do not depend on resolution. Two levels only: grid 2 (4 tiles,
+    # 1.5x) is a cheap mild option, grid 3 (9 tiles, 2x) targets tiny objects —
+    # at 640px they match the old slice 416 / 320 in tile count and zoom.
+    # Absolute px `slice` is not accepted — tuned for 640px, 320 became 221 tiles
+    # at 4000×3000. merge=nmm unions only fragments touching a seam (containment
+    # union would swallow instances).
     tiling_configs: list = field(default_factory=lambda: [
-        {"slice": [416, 416], "overlap": 0.25, "merge": "nmm"},
-        {"slice": [320, 320], "overlap": 0.25, "merge": "nmm"},
+        {"grid": 2, "overlap": 0.5, "merge": "nmm"},
+        {"grid": 3, "overlap": 0.5, "merge": "nmm"},
     ])
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be proposed in this run — unwireable axes are blocked at
@@ -306,6 +308,8 @@ def _validate(cfg: Config) -> None:
     if 0.0 not in cfg.rescorer.alphas:
         raise ConfigError("rescorer.alphas must include 0.0 — adoption is structurally safe "
                           "only if the search space includes the baseline (identity)")
+    for i, t in enumerate(cfg.search.tiling_configs):
+        _validate_tiling(t, f"search.tiling_configs[{i}]")
     if cfg.rescorer.margin < 0:
         raise ConfigError(f"rescorer.margin cannot be negative ({cfg.rescorer.margin})")
     if cfg.rescorer.ensemble_members < 1:
@@ -316,6 +320,32 @@ def _validate(cfg: Config) -> None:
                           "grid so that non-adoption is exactly the status quo")
     if cfg.lora.margin < 0:
         raise ConfigError(f"lora.margin cannot be negative ({cfg.lora.margin})")
+
+
+TILING_MERGES = ("nmm", "nms")
+_TILING_KEYS = {"grid", "overlap", "merge"}
+
+
+def _validate_tiling(t, where: str) -> None:
+    """One tiling grid entry — image-relative g×g (`grid`). Format errors are
+    raised at load time, not in the middle of screening."""
+    if not isinstance(t, dict):
+        raise ConfigError(f"{where}: must be a mapping (got {type(t).__name__})")
+    if "slice" in t:
+        raise ConfigError(f"{where}: absolute px slice is not supported — the tile "
+                          "count grows quadratically with resolution. Use an "
+                          "image-relative grid (an integer >= 2)")
+    unknown = sorted(set(t) - _TILING_KEYS)
+    if unknown:
+        raise ConfigError(f"{where}: unknown key {unknown} — allowed keys: {sorted(_TILING_KEYS)}")
+    g = t.get("grid")
+    if not isinstance(g, int) or isinstance(g, bool) or g < 2:
+        raise ConfigError(f"{where}.grid: must be an integer >= 2 ({g!r})")
+    o = t.get("overlap")
+    if not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
+        raise ConfigError(f"{where}.overlap: outside [0,1) ({o!r})")
+    if t.get("merge", "nmm") not in TILING_MERGES:
+        raise ConfigError(f"{where}.merge: {t['merge']!r} must be one of {TILING_MERGES}")
 
 
 def load_config(path: str | Path) -> Config:
