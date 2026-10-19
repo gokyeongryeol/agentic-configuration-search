@@ -200,20 +200,8 @@ class Rescorer:
                 "fit per dataset; applied to another dataset, its within-class "
                 "ranking is worse than the raw score alone")
         with open(path.parent / d["model_file"], "rb") as fh:
-            disc = _RenamingUnpickler(fh).load()
+            disc = pickle.load(fh)
         return cls(disc, d["alphas"], d.get("meta"), got)
-
-
-_OLD_PACKAGE = "zero_agent"          # package name before the rename — module path recorded in old runs' pickles
-
-
-class _RenamingUnpickler(pickle.Unpickler):
-    """Remap class paths recorded under the old package name (zero_agent.*) to the current package."""
-
-    def find_class(self, module, name):
-        if module == _OLD_PACKAGE or module.startswith(_OLD_PACKAGE + "."):
-            module = __name__.split(".")[0] + module[len(_OLD_PACKAGE):]
-        return super().find_class(module, name)
 
 
 def fit_discriminator(feature_names: list[str], X_hand: np.ndarray,

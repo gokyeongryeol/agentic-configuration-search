@@ -100,17 +100,16 @@ def test_unknown_text_dropped(tmp_path):
     assert [d["category_id"] for d in out[0]] == [1]
 
 
-def test_tiling_degenerate_single_call(tmp_path):
-    """slice ≥ image size → a single full pass; output has the same shape as tiling-off."""
+def test_tiling_grid_single_batched_call(tmp_path):
+    """grid g → full + g² tiles sent in one batched call."""
     p = tmp_path / "i.png"
     Image.new("RGB", (100, 80)).save(p)
     cfg = {"visual_negatives": False, "neg_eta": None,
-           "tiling": {"slice": [640, 640], "overlap": 0.25, "merge": "nmm"}}
+           "tiling": {"grid": 2, "overlap": 0.5, "merge": "nmm"}}
     client = StubClient()
     out = gateway.infer_config(_ctx(), client, cfg, [], ONTO, [p])
-    assert [c["n"] for c in client.calls] == [1]
-    assert out[0][0]["sources"] == ["full"]
-    assert out[0][0]["category_id"] == 1
+    assert [c["n"] for c in client.calls] == [1 + 4]
+    assert out[0] and all(d["category_id"] == 1 for d in out[0])
 
 
 def test_dedup_is_deterministic():

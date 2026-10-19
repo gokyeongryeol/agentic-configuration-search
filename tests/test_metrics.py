@@ -262,3 +262,40 @@ def test_threshold_is_deterministic():
     b = metrics.estimate_f_beta_threshold(recs, 1, floor=0.03, max_candidates=37,
                                           iou_thr=IOU, tol=0.03)
     assert a == b
+
+
+# --- missed_small = object size relative to the image ---------------------------
+# A relative cut (lower quartile of a class's GT areas) ranked objects within the
+# dataset, so even a dataset of only large objects got missed_small every round and
+# tiling kept coming back as a remedy. The cut is now the object's **size relative to
+# the image**, r = √(box area / image area) — the detector sees the image resized by
+# its preprocessor, so the ratio, not the original px, sets how large an object looks.
+
+def _miss_kinds(gts, w, h, **kw):
+    per_image = [_rec([], gts, w=w, h=h)]
+    return [r["kind"] for r in
+            metrics.classify_errors(per_image, {1: 0.5}, iou_thr=IOU, **kw)["fn"]]
+
+
+def test_missed_small_is_absolute_not_relative():
+    """If every object is large, even the smallest is not small (a relative cut made
+    the bottom 25% small)."""
+    gts = [{"box": [0, 0, s, s], "category_id": 1} for s in (40, 50, 60, 70)]
+    assert _miss_kinds(gts, 640, 640) == ["missed"] * 4      # r = 0.06–0.11
+
+
+def test_missed_small_is_relative_to_image_size():
+    """The same 40px box is r=0.012 (small) at 4000×3000 and r=0.0625 (missed) at
+    640×640. The cut is an argument (config: diagnose.small_object_ratio)."""
+    gt = [{"box": [0, 0, 40, 40], "category_id": 1}]
+    assert _miss_kinds(gt, 4000, 3000) == ["missed_small"]
+    assert _miss_kinds(gt, 640, 640) == ["missed"]
+    assert _miss_kinds(gt, 640, 640, small_ratio=0.1) == ["missed_small"]
+
+
+def test_fn_records_carry_size_ratio():
+    """FN records carry the size ratio so the planner can judge how much zoom is needed."""
+    per_image = [_rec([], [{"box": [0, 0, 40, 40], "category_id": 1}],
+                      w=4000, h=3000)]
+    fn = metrics.classify_errors(per_image, {1: 0.5}, iou_thr=IOU)["fn"][0]
+    assert fn["size_ratio"] == pytest.approx(0.0115, abs=1e-4)

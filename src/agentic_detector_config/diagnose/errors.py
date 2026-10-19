@@ -14,16 +14,19 @@ from ..core import metrics
 
 def diagnose(records: list[dict], floor_records: list[dict] | None,
              thresholds: dict[int, float], ontology, *, iou_thr: float,
-             anonymize: bool) -> dict:
+             anonymize: bool,
+             small_ratio: float = metrics.SMALL_OBJECT_RATIO) -> dict:
     """records/floor_records use the metrics.per_image_records schema (as
     produced by evaluate_on_holdout / screen). thresholds = the applied τ_c.
+    small_ratio = the missed_small cut (object size relative to the image).
 
     Returns: {"n_images", "summary": {fp, fn}, "per_class": {name: {...}},
               plus "fp"/"fn" detail lists (with filenames) only when
               anonymize=False}.
     """
     raw = metrics.classify_errors(records, thresholds, iou_thr=iou_thr,
-                                  floor_detections=floor_records)
+                                  floor_detections=floor_records,
+                                  small_ratio=small_ratio)
     per_class: dict[str, dict] = {}
     gt_counts: dict[int, int] = {}
     for rec in records:

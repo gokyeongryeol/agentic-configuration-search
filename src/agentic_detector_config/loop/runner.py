@@ -38,7 +38,7 @@ from ..eval.screen import screen_candidate
 from ..fitting.materials import Materials
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
-from ..planner.axes import AXES, BASELINE, sanitize_candidates
+from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import LLMPlanner
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
@@ -73,20 +73,26 @@ def _setting_load(lite: dict) -> dict:
             "per_class": {int(k): v for k, v in lite["per_class"].items()}}
 
 
-def _load_candidates_file(path, disabled_axes=(), disabled_values=None) -> list[dict]:
+def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
+                          facts: DatasetFacts | None = None
+                          ) -> tuple[list[dict], list[dict]]:
+    """Human-injected candidates — (kept, dropped). Drops are recorded by the same
+    rules as planner candidates (no silent drops — sanitize_candidates)."""
     if not path:
-        return []
+        return [], []
     p = Path(path)
     if not p.exists():
-        return []
+        return [], []
     raw = yaml.safe_load(p.read_text()) or []
-    cands = sanitize_candidates(raw, max_candidates=64,
+    dropped: list[dict] = []
+    cands = sanitize_candidates(raw, max_candidates=64, dropped=dropped,
                                 disabled_axes=disabled_axes,
-                                disabled_values=disabled_values)
-    for c in cands:
+                                disabled_values=disabled_values,
+                                facts=facts)
+    for c in cands + dropped:
         c["id"] = f"human_{c['id']}"
         c["source"] = "human"
-    return cands
+    return cands, dropped
 
 
 class Loop:
@@ -234,7 +240,7 @@ class Loop:
             neg_eta_grid=(s.neg_eta_grid
                           if (axes.get("visual_negatives") or text_neg_sweep)
                           else ()),
-            tiling_variants=(s.tiling_configs if axes.get("tiling") else ()))
+            tiling_variants=_tiling_variants(s, axes))
 
     def _diagnosis(self, champion: dict, round_dir: Path) -> dict:
         """Diagnosis on train (detailed) + holdout (anonymized aggregates) — the
@@ -268,11 +274,13 @@ class Loop:
             passes = infer_for_groups(self.cfg, self.client, groups, grid,
                                       self.ds.ontology, paths, materials)
             floor_recs, recs = setting_records(train, paths, passes, groups, tau)
+        small = dict(small_ratio=self.cfg.diagnose.small_object_ratio)
         d_train = diagnose(recs, floor_recs, tau, self.ds.ontology,
-                             iou_thr=self.iou, anonymize=False)
+                           iou_thr=self.iou, anonymize=False, **small)
         d_test = diagnose(champion["eval"]["records"],
                           champion["eval"]["floor_records"], tau,
-                          self.ds.ontology, iou_thr=self.iou, anonymize=True)
+                          self.ds.ontology, iou_thr=self.iou, anonymize=True,
+                          **small)
         _write(round_dir / "diagnosis_train.json", d_train)
         _write(round_dir / "diagnosis_test.json", d_test)
         return {"train": d_train, "test": d_test}
@@ -316,16 +324,19 @@ class Loop:
                                   notes=self.cfg.dataset_notes,
                                   char_budget=_char_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
-                                  disabled_values=self.disabled_values).propose(
+                                  disabled_values=self.disabled_values,
+                                  facts=self._facts()).propose(
                 history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              disabled_axes=self.disabled_axes,
-                                             disabled_values=self.disabled_values)
+                                             disabled_values=self.disabled_values,
+                                             facts=self._facts())
             _write(round_dir / "proposal.json", proposal)
         # merge human-injected candidates (hybrid loop)
-        humans = _load_candidates_file(self.candidates_file, self.disabled_axes,
-                                       self.disabled_values)
+        humans, human_dropped = _load_candidates_file(
+            self.candidates_file, self.disabled_axes, self.disabled_values,
+            facts=self._facts())
         merged = proposal["candidates"] + humans
 
         # Common combo filter: regardless of source (LLM, deterministic, human),
@@ -352,8 +363,15 @@ class Loop:
         # merge with planner-stage drops (invalid_axes etc.) — overwriting would
         # erase candidates discarded by sanitization from history.
         return {**proposal, "candidates": fresh,
-                "dropped": list(proposal.get("dropped") or []) + dropped,
+                "dropped": (list(proposal.get("dropped") or [])
+                            + human_dropped + dropped),
                 "stop": proposal["stop"] and not fresh}
+
+    def _facts(self) -> DatasetFacts:
+        """Facts that let sanitization block candidates whose outcome the data already decides."""
+        return DatasetFacts(n_classes=len(self.cat_ids),
+                            n_fit_train=len(self.ds.fit_train.images),
+                            lora_min_images=self.cfg.lora.min_images)
 
     def _guard_material(self, c: dict, materials, skipped: list) -> bool:
         """If materials are empty, record in skipped and return True — the caller drops the candidate."""
@@ -566,8 +584,11 @@ class Loop:
         # distribution (its only detector dependence is that background crops
         # were mined from old FPs). Removing it would make lora fight carrying a
         # handicap equal to the classifier's gain.
-        adapt_dirty = False
-        lora_dirty = False
+        # What the detector has loaded right now — updated whenever a candidate
+        # swaps it. A dirty flag cannot tell whether a later candidate restored
+        # the current state, so it loses an earlier winner's state.
+        served_w = champion.get("weights")
+        served_a = champion.get("adapt_root")
         for c in lora_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
@@ -592,9 +613,12 @@ class Loop:
                     base_weights=self.detector_hooks["base_weights"],
                     restore_weights=champion.get("weights"),
                     seed=self.cfg.run_seed)
+                # adopted: the winning arm stays loaded; otherwise restore_weights (current)
+                served_w = res["weights"] or champion.get("weights")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("lora candidate %s failed — restored current weights and rejected", c["id"])
                 self.detector_hooks["weights_ctl"](champion.get("weights"))
+                served_w = champion.get("weights")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
                 continue
@@ -610,7 +634,6 @@ class Loop:
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", "")})
                 continue
-            lora_dirty = True            # client is on the winning arm
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
@@ -627,6 +650,13 @@ class Loop:
                 for c in evaluated])
 
         # --- crop classifier candidates — detector-state candidates, same discipline as lora ---
+        # Measure them on the champion's weights. If a winning lora arm stayed
+        # loaded and the classifier then won, the champion would be served without
+        # that arm while its τ and holdout F came from on top of it — they would
+        # not match the serving state (adapt_round restores only the artifact).
+        if classifier_cands and not _same_state(served_w, champion.get("weights")):
+            self.detector_hooks["weights_ctl"](champion.get("weights"))
+            served_w = champion.get("weights")
         for c in classifier_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "crop_classifier": False}
@@ -643,9 +673,12 @@ class Loop:
                     repo_root=self.detector_hooks["repo_root"],
                     restore_root=champion.get("adapt_root"),
                     seed=self.cfg.run_seed, client=self.client)
+                # adopted: its own artifact stays loaded; otherwise restore_root (current)
+                served_a = res["adapt_root"] or champion.get("adapt_root")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("classifier candidate %s failed — restored current state and rejected", c["id"])
                 self._adapt_ctl(champion.get("adapt_root"))
+                served_a = champion.get("adapt_root")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
                 continue
@@ -659,10 +692,15 @@ class Loop:
                               "fit_dev_micro_f_beta")}
                             | {"crop_classifier": res["decision"]})
             if not res["decision"].get("adopted"):
-                skipped.append({**c, "skipped": "classifier_gate",
+                # The tripwire (too few training crops) keeps the same material
+                # until the champion changes — record the axis as empty so it reaches
+                # the planner's dead-axis list. It cannot be blocked up front because
+                # the background FP count is an inference result.
+                dead = ({"empty_axis": "crop_classifier"}
+                        if res["decision"].get("tripwire") else {})
+                skipped.append({**c, "skipped": "classifier_gate", **dead,
                                 "note": res["decision"].get("reason", "")})
                 continue
-            adapt_dirty = True           # client has the artifact loaded
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             ev = self._evaluate_candidate(entry, setting, materials)
@@ -711,10 +749,13 @@ class Loop:
                         "rescorer_path": winner.get("rescorer_path")}
             self._save_champion(champion)
             decision["micro_f_beta"] = winner["eval"]["micro_f_beta"]
-        if lora_dirty and not (winner and "_weights" in winner):
-            # the lora arm failed the gate (or another candidate won) — restore current
+        # Bring the detector to the final champion's state. Detector-state
+        # candidates swap it in turn, so the last candidate's state is not
+        # necessarily the winner's — a lora winner may have been unloaded before
+        # the classifier candidates.
+        if not _same_state(served_w, champion.get("weights")):
             self.detector_hooks["weights_ctl"](champion.get("weights"))
-        if adapt_dirty and not (winner and "_adapt_root" in winner):
+        if not _same_state(served_a, champion.get("adapt_root")):
             self._adapt_ctl(champion.get("adapt_root"))
         _write(rd / "decision.json", decision)
         self._append_history({
@@ -725,6 +766,7 @@ class Loop:
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
+                            | _tiling_record(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -803,6 +845,32 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
     result.history = history
     result.champion = champion
     return result
+
+
+def _tiling_variants(search, axes: dict) -> tuple:
+    """The one grid the candidate chose — screen compares only it against tiling off.
+
+    Why not the whole grid list: the zoom is a planner-chosen axis value (when it
+    falls short the next round raises it a step), and one candidate's screen cost
+    should be a predictable 1 + (1+g²) passes."""
+    g = axes.get("tiling")
+    if not g:
+        return ()
+    return ({"grid": int(g), "overlap": search.tiling_overlap,
+             "merge": search.tiling_merge},)
+
+
+def _tiling_record(c: dict) -> dict:
+    """For a tiling candidate, whether screen actually assigned a tile config — the
+    signal the planner reads to raise or drop the zoom. False means that grid helped
+    no class on fit_dev, and the candidate's setting equals tiling off despite its axes."""
+    if not c["axes"].get("tiling") or not c.get("setting"):
+        return {}
+    setting = c["setting"]
+    configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
+    used = any(configs.get(e["config_id"], {}).get("tiling")
+               for e in setting.get("per_class", {}).values())
+    return {"tiling_used": bool(used)}
 
 
 def _stagnant(decision: dict, epsilon: float) -> bool:
@@ -902,6 +970,11 @@ def _missing_hook(axes: dict, hooks: dict) -> str | None:
         if hooks.get(name) is None:
             return name
     return None
+
+
+def _same_state(a, b) -> bool:
+    """Compare detector-state paths (weights, artifact) — str and Path mix, None is the base state."""
+    return (a is None) == (b is None) and (a is None or Path(a) == Path(b))
 
 
 def _route_detector_state(axes: dict, champion_axes: dict) -> str:

@@ -7,7 +7,7 @@ matches the README's FP/FN diagnosis section.
 
 from __future__ import annotations
 
-from .axes import BASELINE, validate_axes
+from .axes import BASELINE, TILING_GRIDS, DatasetFacts, validate_axes
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -23,7 +23,9 @@ REMEDY: dict[str, tuple] = {
     # first, lora gets pushed out, and alias is often rejected for empty material.
     "missed": (("exemplar", "base"), ("exemplar", "fn_arm"), ("lora", True),
                ("alias", "vlm")),
-    "missed_small": (("tiling", True),),
+    # tiling raises grid g one step at a time — a g at or below the champion's is
+    # not a remedy (propose's step-up rule). The first value is the cheapest zoom.
+    "missed_small": tuple(("tiling", g) for g in TILING_GRIDS),
     # below_threshold = detected but did not clear τ_c. Scores can be raised not
     # only by calibration (rescorer) but also by better prompts (exemplar), a
     # better detector (lora), and re-classification (crop_classifier). rescorer
@@ -32,8 +34,14 @@ REMEDY: dict[str, tuple] = {
     "below_threshold": (("rescorer", True), ("exemplar", "base"),
                         ("exemplar", "fn_arm"), ("lora", True),
                         ("crop_classifier", True)),
+    # The crop classifier drops detections it reclassifies as background (0) — it
+    # is a background-FP filter too. On a single-class dataset class_confusion is
+    # zero by definition, so without this entry the diagnosis reaches the axis only
+    # through below_threshold. Training costs the most (classifier fit + detector
+    # state swap), so it goes last.
     "background": (("visual_negatives", True),
-                   ("text_negatives", "background"), ("rescorer", True)),
+                   ("text_negatives", "background"), ("rescorer", True),
+                   ("crop_classifier", True)),
     "class_confusion": (("alias", "vlm"),
                         ("crop_classifier", True),
                         ("text_negatives", "gt_crop"),
@@ -82,7 +90,7 @@ def tried_combos(history: list[dict]) -> set[tuple]:
 
 def propose(history: list[dict], diagnosis: dict, *,
             max_candidates: int = 3, disabled_axes=(),
-            disabled_values=None) -> dict:
+            disabled_values=None, facts: DatasetFacts | None = None) -> dict:
     """Candidates that each raise one axis from the champion's axes — single
     increments with clean attribution.
 
@@ -107,10 +115,16 @@ def propose(history: list[dict], diagnosis: dict, *,
             if axis == "exemplar" and value == "fn_arm" \
                     and champion["exemplar"] == "none":
                 continue
+            # tiling step-up rule: only grids larger than the adopted one
+            if axis == "tiling" and champion["tiling"] and value <= champion["tiling"]:
+                continue
             try:
-                axes = validate_axes({**champion, axis: value})
+                axes = validate_axes({**champion, axis: value},
+                                     facts=facts)
             except ValueError:
-                continue                      # dependency rule violated (e.g. negatives without exemplars)
+                continue                      # dependency rule violated (e.g. negatives without
+                                              # exemplars, gt_crop on a single class, lora whose
+                                              # training would be skipped — DatasetFacts)
             if tuple(sorted(axes.items())) in tried:
                 continue                      # block only exact retries of the same combination
             out.append({"id": f"{kind}:{axis}={value}", "axes": axes,

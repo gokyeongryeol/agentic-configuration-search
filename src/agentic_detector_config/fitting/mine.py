@@ -107,7 +107,8 @@ def gt_exemplars(train: Split, ontology: Ontology, cache: CropCache, params,
         else:
             emb = encode_fn(cid, cache.paths[cid])
             idx = embedder.select_indices(params.exemplar_selection, k, len(anns),
-                                          embeddings=emb, trim=params.kcenter_trim)
+                                          embeddings=emb,
+                                          outlier_mad=params.kcenter_outlier_mad)
         exemplars[name] = [
             PromptBox(class_name=name,
                       image=str(train.image_path(img_by_id[anns[j].image_id])),
@@ -295,12 +296,12 @@ def fn_exemplar_candidates(train: Split, ontology: Ontology, fn_anns: dict,
             else:
                 # kcenter to cover the missed appearances as widely as possible.
                 # The FN set concentrates truncation, occlusion, and label errors,
-                # so it is noisier than base; trim lightly (fn_kcenter_trim) —
+                # so it is noisier than base; trim lightly (fn_kcenter_outlier_mad) —
                 # keep diversity but drop extremes that cannot serve as prompts.
                 emb = encode_fn(cid, cache.paths[cid])
                 cand_emb = emb[[cache.row_of[cid][a.id] for a in cand]]
                 pick = embedder.kcenter_greedy(cand_emb, k,
-                                               trim=params.fn_kcenter_trim)
+                                               outlier_mad=params.fn_kcenter_outlier_mad)
         else:
             pick = list(range(len(cand)))
         fn_boxes[name] = [

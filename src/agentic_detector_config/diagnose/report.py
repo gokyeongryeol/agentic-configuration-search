@@ -208,7 +208,7 @@ def _sourcing_section(run_dir: Path, t: dict) -> list[str]:
             "missed": "no detection candidates at all — beyond reach of prompts/detector, so "
                       "collecting data for these conditions is the most direct fix.",
             "missed_small": "small objects are missed — needs higher-resolution or close-up captures, "
-                            "or a human should tune the tiling settings.",
+                            "or, if the tiling grid has not reached its cap (6), raising it further.",
             "below_threshold": "detected but scored low — closer to a calibration/threshold "
                                "problem than a data problem.",
             "class_confusion": "classes are confused — needs examples that separate the confused pairs.",

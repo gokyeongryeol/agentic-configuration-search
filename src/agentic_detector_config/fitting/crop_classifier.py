@@ -2,12 +2,16 @@
 
 Serving: the detector client (clients.yoloe) loads the artifact directory
 (classifier.pt / classifier_config.json) and **reclassifies predicted boxes**
-client-side — replacing the category or judging background (0). It cannot
-create new detections, so its lever is correcting class_confusion.
+client-side — replacing the category or judging background (0), which the
+client drops. It cannot create new detections, so it has two levers:
+correcting class_confusion and removing background FPs. On a single-class
+dataset only the latter remains, and it acts as a binary verifier (object vs
+background).
 
-Training data:
-  positive   = train GT crops (label = class idx+1, ascending category id)
-  background = FPs from the train pass that pass the threshold but match no GT (label = 0)
+Training data (from the split the caller passes — the loop uses fit_train, see
+loop.adapt_round):
+  positive   = GT crops (label = class idx+1, ascending category id)
+  background = FPs from that split's pass that pass the threshold but match no GT (label = 0)
 
 **Purity requirement**: the background-mining thresholds must be the **screen
 thresholds estimated on fit_dev** — using tau_test (a legacy name; it is

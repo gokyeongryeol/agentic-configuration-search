@@ -142,3 +142,161 @@ def test_arm_candidate_with_rescorer_is_gated_on_calibrated_channel(
     assert after and after[0] == "rescored", (
         "arm candidate was evaluated on the raw-score channel with the rescorer on — it reaches the "
         f"gate on a different channel than the champion (observed: {events})")
+
+
+# --- guard: baseline state of detector-state candidates ------------------------
+# lora (tail arms) and the crop classifier both swap **detector state** (weights,
+# artifact). When both arrive in one round, the winning lora arm can still be
+# loaded while the classifier is trained, has its τ estimated and is evaluated on
+# holdout. If that classifier wins, the champion is served without the lora arm
+# (on the current weights), so the recorded τ and holdout F do not match the
+# serving state.
+
+class _FakeDetectorState:
+    """Fake that records weights and adapt_root together."""
+
+    def __init__(self):
+        self.weights = None
+        self.adapt = None
+
+    def ctl(self, weights):
+        self.weights = weights
+
+    def adapt_ctl(self, root):
+        self.adapt = root
+
+
+def _human_candidates_only(monkeypatch):
+    """The detector-state scenarios only hold if the human-injected candidates are
+    what gets evaluated — when a deterministic proposal carries the same axes
+    combination, combo dedup keeps the planner's (earlier) candidate and folds the
+    human_* one. With the fixture's FNs classified as missed, deterministic proposes
+    lora=True and exactly that happens. These scenarios measure detector state, not
+    the planner, so planner proposals are emptied (the judgment assertions are unchanged)."""
+    from agentic_detector_config.planner import deterministic
+    monkeypatch.setattr(deterministic, "propose",
+                        lambda history, diagnosis, **kw: {
+                            "planner": "deterministic", "candidates": [],
+                            "stop": False})
+
+
+def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by):
+    """One round with the given candidates. The base detector misclassifies class 2
+    as class 1; `fixed_by(state)` decides whether the loaded state corrects it."""
+    from pathlib import Path
+
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.core.coco import Split
+    from agentic_detector_config.infer import gateway
+    from agentic_detector_config.loop import adapt_round, tail_round
+    from agentic_detector_config.loop.runner import run_rounds
+
+    state = _FakeDetectorState()
+    splits = {n: Split.load(root / n) for n in ("train", "valid")}
+    by_path = {str(s.image_path(e)): e for s in splits.values() for e in s.images}
+
+    def fake_infer(ctx, client, config, queries, ontology, image_paths,
+                   alias_to_name=None, **kw):
+        fixed = fixed_by(state)
+        return [[{"box": list(a.bbox_xyxy), "score": 0.9,
+                  "category_id": a.category_id if fixed or a.category_id == 1 else 1,
+                  "sources": ["full"]}
+                 for a in by_path[str(p)].annotations] for p in image_paths]
+
+    def fake_train_tail(cfg, *, out_dir, **kw):
+        p = Path(out_dir) / "tuned_tail.pt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"stub")
+        return p
+
+    def fake_train_cls(repo_root, *, manifest, ontology, out_dir, device, log_path):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "classifier.pt").write_bytes(b"fake")
+        return out_dir
+
+    weights_at_classifier: list = []
+    real_cls = adapt_round.run_classifier_candidate
+
+    def spy_cls(*a, **kw):
+        weights_at_classifier.append(state.weights)
+        return real_cls(*a, **kw)
+
+    monkeypatch.setattr(gateway, "infer_config", fake_infer)
+    monkeypatch.setattr(tail_round, "train_tail", fake_train_tail)
+    monkeypatch.setattr(adapt_round, "train_crop_classifier", fake_train_cls)
+    monkeypatch.setattr(adapt_round, "run_classifier_candidate", spy_cls)
+    _human_candidates_only(monkeypatch)
+
+    cfg = config_from_dict({
+        "dataset": str(root),
+        "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4},
+        "crop_classifier": {"min_samples": 4, "min_background": 0, "margin": 0.01},
+    })
+    cand_file = tmp_path / "candidates.yaml"
+    cand_file.write_text(candidates)
+    result = run_rounds(
+        root, out_dir=tmp_path / "run", planner="deterministic", rounds=1,
+        cfg=cfg, candidates_file=cand_file,
+        detector_hooks={"weights_ctl": state.ctl, "adapt_ctl": state.adapt_ctl,
+                        "repo_root": tmp_path, "base_weights": tmp_path / "yoloe.pt"},
+        **_fakes())
+    return state, result, weights_at_classifier
+
+
+def _assert_state_is_champion(state, champion):
+    from pathlib import Path
+    norm = lambda p: None if p is None else str(Path(p))  # noqa: E731
+    assert norm(state.weights) == norm(champion.get("weights")), (
+        f"detector weights {state.weights} != champion {champion.get('weights')}")
+    assert norm(state.adapt) == norm(champion.get("adapt_root")), (
+        f"detector artifact {state.adapt} != champion {champion.get('adapt_root')}")
+
+
+_LORA_AND_CLS = ("- id: adapt\n  axes: {lora: true}\n  rationale: adapt\n"
+                 "- id: fixcls\n  axes: {crop_classifier: true}\n  rationale: fix\n")
+
+
+def _either_fixes(s):
+    return (s.weights is not None and "arm_lam" in str(s.weights)) or s.adapt is not None
+
+
+def test_classifier_candidate_runs_on_champion_weights(root, tmp_path, monkeypatch):
+    """A classifier candidate must be trained and evaluated on the **champion's
+    weights** — the winning arm of an earlier lora candidate must not stay loaded."""
+    _, result, seen = _detector_state_round(root, tmp_path, monkeypatch,
+                                            _LORA_AND_CLS, _either_fixes)
+    assert "human_adapt" in result.decisions[1]["evaluated"], \
+        "lora candidate did not pass its arm gate — scenario invalid"
+    assert seen, "classifier candidate did not run — scenario invalid"
+    assert all(w is None for w in seen), (
+        "classifier candidate ran on a lora arm — if adopted, its τ and holdout F "
+        f"do not match the serving state (champion weights) (observed: {seen})")
+
+
+def test_detector_ends_round_in_champion_state(root, tmp_path, monkeypatch):
+    """At the end of the round the detector must hold the **final champion's**
+    weights and artifact — the next round's diagnosis runs on top of it."""
+    state, result, _ = _detector_state_round(root, tmp_path, monkeypatch,
+                                             _LORA_AND_CLS, _either_fixes)
+    _assert_state_is_champion(state, result.champion)
+
+
+@pytest.mark.parametrize("axis", ["crop_classifier", "lora"])
+def test_detector_keeps_winner_state_when_later_candidate_restores(
+        axis, root, tmp_path, monkeypatch):
+    """Two detector-state candidates on the same axis where **the first one wins**:
+    the later one fails its arm gate and restores the current state itself, yet
+    the detector must end in the winner's state."""
+    def fixed_by(s):
+        loaded = s.adapt if axis == "crop_classifier" else s.weights
+        return "human_good" in str(loaded)
+
+    cands = (f"- id: good\n  axes: {{{axis}: true}}\n  rationale: fix\n"
+             f"- id: bad\n  axes: {{{axis}: true, alias: vlm}}\n"
+             f"  rationale: no effect\n")
+    state, result, _ = _detector_state_round(root, tmp_path, monkeypatch, cands, fixed_by)
+    dec = result.decisions[1]
+    assert dec["id"] == "human_good", f"scenario invalid — good did not win: {dec}"
+    assert "human_bad" in dec["skipped"], f"scenario invalid — bad was not rejected: {dec}"
+    _assert_state_is_champion(state, result.champion)

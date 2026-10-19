@@ -68,7 +68,7 @@ def _spread_encode(cache):
 
 def test_gt_exemplars_kcenter_and_chosen_ids(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplars_per_class=2, kcenter_trim=0.0)
+    params = _params(exemplars_per_class=2, kcenter_outlier_mad=0.0)
     ex, chosen = mine.gt_exemplars(train, onto, cache, params,
                                    _spread_encode(cache), random.Random(0))
     for cid in cache.prompt_pool:
@@ -259,14 +259,14 @@ def test_text_negative_candidates_keep_flow():
 def test_fn_arm_uses_weaker_trim():
     """The FN arm must also trim outliers — the FN set concentrates truncation, occlusion and label
     errors, so it is noisier than base. But since its purpose is to broadly cover missed
-    appearances, it uses a weaker trim than base (0.2): fn_kcenter_trim=0.1."""
+    appearances, it trims less than base (a larger MAD multiple)."""
     from agentic_detector_config.config import config_from_dict
 
     cfg = config_from_dict({"dataset": "x"})
-    assert cfg.mine.fn_kcenter_trim == 0.1
-    assert cfg.mine.fn_kcenter_trim < cfg.mine.kcenter_trim
+    assert (cfg.mine.kcenter_outlier_mad, cfg.mine.fn_kcenter_outlier_mad) == (3.0, 3.5)
+    assert cfg.mine.fn_kcenter_outlier_mad > cfg.mine.kcenter_outlier_mad
     import inspect
 
     from agentic_detector_config.fitting import mine
     src = inspect.getsource(mine.fn_exemplar_candidates)
-    assert "fn_kcenter_trim" in src, "fn arm kcenter does not receive trim"
+    assert "fn_kcenter_outlier_mad" in src, "fn arm kcenter does not receive the trim criterion"

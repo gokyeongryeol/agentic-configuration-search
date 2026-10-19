@@ -22,8 +22,9 @@ def big_root(tmp_path: Path) -> Path:
     """train 12 + holdout (valid) 8 (class 1: 4, class 2: 4) — with the default n=2 fixture
     the bootstrap CI lower bound sticks to 0 and no gate scenario can be built."""
     ds = tmp_path / "big"
-    # Mix GT sizes — with uniform sizes every FN is classified missed_small (bottom quartile =
-    # its own area) and the planner only proposes tiling (see the caveat in test_diagnose)
+    # Mix GT sizes (r≈0.22–0.45 relative to the image — no missed_small at the
+    # default cut 0.04). The sizes date from a relative (lower-quartile) cut, under
+    # which uniform sizes made every FN missed_small and the planner only proposed tiling.
     size = lambda i: 20 + (i % 3) * 10  # noqa: E731
     make_split(ds / "train", [
         {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
@@ -386,7 +387,7 @@ def test_empty_material_candidate_is_skipped():
                        text_negatives={"cat": ["dog"]})
     assert _empty_material({"alias": "vlm"}, filled, {}) is None
     assert _empty_material({"text_negatives": "gt_crop"}, filled, {}) is None
-    assert _empty_material({"rescorer": True, "tiling": True}, empty, {}) is None
+    assert _empty_material({"rescorer": True, "tiling": 2}, empty, {}) is None
 
 
 def test_missing_llm_hooks_skip_dependent_axes():
@@ -408,7 +409,7 @@ def test_missing_llm_hooks_skip_dependent_axes():
     assert _missing_hook({"text_negatives": "gt_crop"}, {}) == "caption_fn"
     assert _missing_hook({"alias": "vlm"}, full) is None
     # axes needing no hook always pass
-    assert _missing_hook({"rescorer": True, "tiling": True}, {}) is None
+    assert _missing_hook({"rescorer": True, "tiling": 2}, {}) is None
 
 
 def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatch):
@@ -425,7 +426,7 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
         return {"candidates": [
             {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
              "rationale": "fn_k is exemplar=fn_arm only — caught by validation"},
-            {"id": "ok_tiling", "axes": {"tiling": True}, "rationale": "valid"}],
+            {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -450,7 +451,7 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
         return {"candidates": [
             {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
              "rationale": "invalid"},
-            {"id": "ok_tiling", "axes": {"tiling": True}, "rationale": "valid"}],
+            {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -461,3 +462,127 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     assert len(planner_prompts) >= 2
     assert "invalid_axes" in planner_prompts[1]
     assert "fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
+
+
+def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
+    """Single-class dataset: gt_crop from the LLM or a human is recorded as
+    invalid_axes at sanitization, and is absent from the prompt's value list."""
+    import json as _json
+
+    from tests import conftest
+
+    monkeypatch.setattr(conftest, "CATS", [
+        {"id": 0, "name": "stuff", "supercategory": "none"},
+        {"id": 1, "name": "cat a", "supercategory": "stuff"}])
+    root = tmp_path / "one"
+    size = lambda i: 20 + (i % 3) * 10  # noqa: E731
+    make_split(root / "train", [
+        {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
+         "anns": [(1, 10, 10, size(i), size(i))]} for i in range(12)])
+    make_split(root / "valid", [
+        {"name": f"t{i}.png", "w": 100, "h": 80,
+         "anns": [(1, 10, 10, size(i), size(i))]} for i in range(8)])
+    make_split(root / "test", [
+        {"name": "v.png", "w": 100, "h": 80, "anns": [(1, 10, 10, 20, 20)]}])
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(root)))
+    human = tmp_path / "candidates.yaml"
+    human.write_text("- {id: hg, axes: {text_negatives: gt_crop}}\n")
+    prompts: list = []
+
+    def llm(messages, **kw):
+        prompts.append(messages[-1]["content"])
+        return {"candidates": [
+            {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
+
+    run_rounds(root, out_dir=tmp_path / "run", planner="llm", llm_chat=llm,
+               rounds=1, candidates_file=human, **_fakes())
+
+    planner_prompts = [p for p in prompts if "Round history" in p]
+    assert planner_prompts and "gt_crop" not in planner_prompts[0]
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert rec["g"]["skipped"] == "invalid_axes"
+    assert rec["human_hg"]["skipped"] == "invalid_axes"
+    assert rec["t"].get("skipped") is None
+
+
+def test_tiling_variants_follow_axis_grid():
+    """screen compares only the grid the candidate chose against tiling off — it no
+    longer runs every grid from config (1 + (1+g²) passes per candidate)."""
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop.runner import _tiling_variants
+
+    s = config_from_dict({"dataset": "x"}).search
+    assert _tiling_variants(s, {"tiling": False}) == ()
+    assert _tiling_variants(s, {"tiling": 3}) == (
+        {"grid": 3, "overlap": 0.5, "merge": "nmm"},)
+
+
+def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch):
+    """A tiling candidate records whether screen actually assigned a tile config
+    (tiling_used) — the signal the planner reads to raise or drop the zoom."""
+    import json as _json
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "t3", "axes": {"tiling": 3},
+                                "rationale": "small objects"}], "stop": False}
+
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+               llm_chat=llm, rounds=1, **_fakes())
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert isinstance(rec["t3"]["tiling_used"], bool)
+
+
+def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypatch):
+    """The runner passes the config cut to the diagnosis. Fixture GTs are r≈0.22–0.45
+    relative to the image: missed at the default cut (0.04), missed_small at a large cut."""
+    import json as _json
+
+    from agentic_detector_config.config import config_from_dict
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+
+    def kinds(out, cut):
+        cfg = config_from_dict({"dataset": str(big_root),
+                                "diagnose": {"small_object_ratio": cut}})
+        run_rounds(big_root, out_dir=out, planner="deterministic", rounds=1,
+                   cfg=cfg, **_fakes())
+        d = _json.loads((out / "rounds" / "round_001" / "diagnosis_train.json")
+                        .read_text())
+        return {r["kind"] for r in d["fn"]}
+
+    assert "missed_small" not in kinds(tmp_path / "a", 0.04)
+    assert "missed_small" in kinds(tmp_path / "b", 0.9)
+
+
+def test_untrainable_lora_never_reaches_tail_round(big_root, tmp_path, monkeypatch):
+    """If fit_train has fewer than lora.min_images images, a lora candidate is recorded
+    as invalid_axes at sanitization and never reaches the tail round (training wiring)."""
+    import json as _json
+
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop import tail_round
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    monkeypatch.setattr(tail_round, "run_tail_candidate", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("reached the tail round")))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "l", "axes": {"lora": True}, "rationale": "x"},
+                               {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}],
+                "stop": False}
+
+    cfg = config_from_dict({"dataset": str(big_root), "planner": {"kind": "llm"},
+                            "lora": {"min_images": 50}})
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=llm,
+               rounds=1, cfg=cfg, **_fakes())
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert rec["l"]["skipped"] == "invalid_axes" and "min_images" in rec["l"]["note"]

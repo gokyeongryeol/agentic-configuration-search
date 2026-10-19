@@ -124,30 +124,6 @@ def test_fingerprint_mismatch_is_explicit_error(tmp_path):
             "ds-a", _Ont([(1, "a"), (2, "b")])))
 
 
-def test_pickle_from_old_package_name_loads(tmp_path):
-    """rescorer.pkl files from runs before the package rename (zero_agent -> agentic_detector_config)
-    still load — pickle records classes by module path, so failing to read them would kill resume
-    and predict replay of old runs with ModuleNotFoundError."""
-    import pickle
-
-    hand, E, y = _sep()
-    disc = fit_discriminator(FEATS, hand, E, y, members=2)
-    ad = Rescorer(disc, {1: 0.5})
-    path = tmp_path / "rescorer.json"
-    ad.save(path)
-    # reproduce a pickle written under the old package name (protocol 0 stores the module path as text)
-    legacy = pickle.dumps(disc, protocol=0).replace(
-        b"agentic_detector_config.", b"zero_agent.")
-    assert b"zero_agent.fitting.verifier" in legacy
-    (tmp_path / "rescorer.pkl").write_bytes(legacy)
-
-    ad2 = Rescorer.load(path)
-    feats = [dict(zip(disc.features, row)) for row in hand[:5]]
-    assert np.allclose(
-        ad2.rescore(feats, [E[i] for i in range(5)], list(hand[:5, 0]), [1] * 5),
-        ad.rescore(feats, [E[i] for i in range(5)], list(hand[:5, 0]), [1] * 5))
-
-
 def test_legacy_scalar_alpha_artifact_rejected(tmp_path):
     import json
     p = tmp_path / "rescorer.json"

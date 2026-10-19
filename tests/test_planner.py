@@ -243,7 +243,7 @@ def test_dead_axes_survive_the_history_window(tmp_path):
         return {"candidates": [], "stop": True}
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history, {})
-    assert "came out empty on this dataset" in seen["prompt"]
+    assert "came out empty, or too small to train on, on this" in seen["prompt"]
     assert "- alias (values tried: vlm)" in seen["prompt"]
 
 
@@ -304,6 +304,24 @@ def test_class_confusion_proposes_crop_classifier():
     out = deterministic.propose([], _diag(fp={"class_confusion": 9}))
     axes_list = [c["axes"] for c in out["candidates"]]
     assert any(a["crop_classifier"] for a in axes_list)
+
+
+def test_background_proposes_crop_classifier():
+    """The client drops detections reclassified as background (0) — the classifier
+    is a background-FP filter, not only a class fixer. On a single-class dataset
+    class_confusion is zero by definition, so without the background remedy the
+    diagnosis could not reach this axis."""
+    assert ("crop_classifier", True) in deterministic.REMEDY["background"]
+    out = deterministic.propose([], _diag(fp={"background": 9}))
+    assert any(c["axes"]["crop_classifier"] for c in out["candidates"])
+
+
+def test_leverage_counts_background_for_crop_classifier():
+    from agentic_detector_config.planner.llm import _leverage_lines
+
+    lines = _leverage_lines({"train": {"summary": {"fp": {"background": 7}}}})
+    cc = next(l for l in lines if l.startswith("- crop_classifier:"))
+    assert "background 7" in cc
 
 
 # ------------------------------------------------------- llm dataset notes
@@ -509,7 +527,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
     history = [
         {"round": 1, "champion": {"axes": dict(BASELINE), "micro_f_beta": 0.5},
          "candidates": [{"id": "a", "axes": validate_axes({"rescorer": True})},
-                        {"id": "b", "axes": validate_axes({"tiling": True})}],
+                        {"id": "b", "axes": validate_axes({"tiling": 2})}],
          "decision": {"adopted": True, "id": "a"}},
         {"round": 2, "champion": {"axes": champ, "micro_f_beta": 0.6},
          "candidates": [{"id": "c", "axes": validate_axes(
@@ -518,7 +536,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
     ]
     lines = _tried_lines(history, champ)
     joined = " ".join(lines)
-    assert "tiling=True" in joined and "alias=vlm" in joined
+    assert "tiling=2" in joined and "alias=vlm" in joined
     assert "baseline" in joined or "rescorer" in joined
     assert all(len(l) < 200 for l in lines)
 
@@ -562,7 +580,7 @@ def test_sanitize_records_duplicate_and_overflow_drops():
     raw = [{"id": "a", "axes": {"alias": "vlm"}},
            {"id": "a_dup", "axes": {"alias": "vlm"}},
            {"id": "b", "axes": {"rescorer": True}},
-           {"id": "c", "axes": {"tiling": True}}]
+           {"id": "c", "axes": {"tiling": 2}}]
     dropped: list = []
     out = sanitize_candidates(raw, max_candidates=2, dropped=dropped)
 
@@ -607,3 +625,163 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
 
     replayed = LLMPlanner(chat=boom, artifact_dir=tmp_path).propose([], {})
     assert [d["id"] for d in replayed["dropped"]] == ["bad"]
+
+
+# ------------------------------------------------- single class — gt_crop
+
+from agentic_detector_config.planner.axes import DatasetFacts  # noqa: E402
+
+ONE_CLASS = DatasetFacts(n_classes=1)
+
+def test_gt_crop_invalid_for_single_class():
+    """gt_crop is sourced from **other classes'** GT crops — on a single class the
+    pool is empty by definition and the candidate only uses up a slot."""
+    axes = {"text_negatives": "gt_crop"}
+    with pytest.raises(ValueError, match="gt_crop"):
+        validate_axes(axes, facts=ONE_CLASS)
+    assert validate_axes(axes, facts=DatasetFacts(n_classes=2))["text_negatives"] == "gt_crop"
+    assert validate_axes(axes)["text_negatives"] == "gt_crop"   # unspecified = no constraint
+    # the other sources stay valid on a single class
+    for src in ("fp_crop", "background"):
+        validate_axes({"text_negatives": src}, facts=ONE_CLASS)
+
+
+def test_sanitize_records_gt_crop_drop_for_single_class():
+    dropped: list = []
+    out = sanitize_candidates(
+        [{"id": "g", "axes": {"text_negatives": "gt_crop"}},
+         {"id": "f", "axes": {"text_negatives": "fp_crop"}}],
+        max_candidates=3, dropped=dropped, facts=ONE_CLASS)
+    assert [c["id"] for c in out] == ["f"]
+    assert dropped[0]["id"] == "g" and dropped[0]["skipped"] == "invalid_axes"
+    assert "gt_crop" in dropped[0]["note"]
+
+
+def test_deterministic_skips_gt_crop_for_single_class():
+    diag = _diag(fp={"class_confusion": 9})
+    multi = deterministic.propose([], diag, max_candidates=10)
+    assert any(c["axes"]["text_negatives"] == "gt_crop" for c in multi["candidates"])
+    single = deterministic.propose([], diag, max_candidates=10, facts=ONE_CLASS)
+    assert single["candidates"]
+    assert all(c["axes"]["text_negatives"] != "gt_crop"
+               for c in single["candidates"])
+
+
+def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [
+            {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path / "one",
+                     facts=ONE_CLASS).propose([], {})
+    assert "gt_crop" not in seen["prompt"]
+    assert [c["id"] for c in out["candidates"]] == ["t"]
+    assert out["dropped"][0]["skipped"] == "invalid_axes"
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path / "two",
+               facts=DatasetFacts(n_classes=2)).propose([], {})
+    assert "gt_crop" in seen["prompt"]     # the multi-class prompt is unchanged
+
+
+# ------------------------------------------------- tiling = grid g axis
+
+def test_tiling_axis_is_grid_value():
+    """The tiling value is grid g (g×g tiles, zoom (g-1)(1-o)+1, 1+g² passes) — the
+    planner picks the zoom directly and raises it when it falls short. The code sets the range."""
+    from agentic_detector_config.planner.axes import AXES, TILING_GRIDS
+    assert AXES["tiling"] == (False, *TILING_GRIDS)
+    for g in TILING_GRIDS:
+        assert validate_axes({"tiling": g})["tiling"] == g
+    for bad in (True, 1, 7, 2.0, "2"):
+        with pytest.raises(ValueError, match="tiling"):
+            validate_axes({"tiling": bad})
+
+
+def test_deterministic_tiling_steps_up_from_champion():
+    """The missed_small remedy only moves to grids larger than the champion's —
+    going down would undo an already-adopted zoom, so it is not a remedy."""
+    diag = _diag(fn={"missed_small": 9})
+    base = deterministic.propose([], diag, max_candidates=10)
+    assert [c["axes"]["tiling"] for c in base["candidates"]][:1] == [2]
+
+    champ = validate_axes({"tiling": 3})
+    history = [{"round": 1, "champion": {"axes": champ}, "candidates": []}]
+    out = deterministic.propose(history, diag, max_candidates=10)
+    grids = [c["axes"]["tiling"] for c in out["candidates"]]
+    assert grids and grids[0] == 4
+    assert all(g > 3 for g in grids)
+
+
+def test_llm_prompt_explains_tiling_grid(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [], "stop": True}
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], {})
+    assert "tiling: one of [False, 2, 3, 4, 5, 6]" in seen["prompt"]
+    assert "1 + g^2" in seen["prompt"]          # cost
+    assert "tiling_used" in seen["prompt"]      # how to read the shortfall signal
+
+
+def test_compact_history_carries_tiling_used():
+    from agentic_detector_config.planner.llm import _compact_history
+
+    champ = validate_axes({})
+    hist = [{"round": 1, "champion": {"axes": champ, "micro_f_beta": 0.5},
+             "candidates": [{"id": "t", "axes": validate_axes({"tiling": 3}),
+                             "adopted": False, "tiling_used": False}],
+             "decision": {"adopted": False}}]
+    row = _compact_history(hist)[0]["candidates"][0]
+    assert row["tiling_used"] is False
+
+
+# ------------------------------------------------- lora tripwire, decided up front
+# If fit_train has fewer than lora.min_images images, a lora candidate is rejected by
+# lora_gate without training — an outcome the data already decides, so it is
+# blocked before it uses a candidate slot.
+
+SMALL = DatasetFacts(n_classes=3, n_fit_train=8, lora_min_images=20)
+
+
+def test_lora_invalid_when_fit_train_below_min_images():
+    with pytest.raises(ValueError, match="lora.*8.*20"):
+        validate_axes({"lora": True}, facts=SMALL)
+    ok = DatasetFacts(n_classes=3, n_fit_train=20, lora_min_images=20)
+    assert validate_axes({"lora": True}, facts=ok)["lora"] is True
+    assert validate_axes({"lora": True})["lora"] is True       # no facts = no constraint
+
+
+def test_axis_values_hide_untrainable_lora():
+    from agentic_detector_config.planner.axes import axis_values
+    assert axis_values(SMALL)["lora"] == (False,)
+    assert axis_values(DatasetFacts())["lora"] == (False, True)
+
+
+def test_deterministic_skips_untrainable_lora():
+    diag = _diag(fn={"missed": 9})
+    assert any(c["axes"]["lora"] for c in
+               deterministic.propose([], diag, max_candidates=10)["candidates"])
+    out = deterministic.propose([], diag, max_candidates=10, facts=SMALL)
+    assert out["candidates"] and not any(c["axes"]["lora"] for c in out["candidates"])
+
+
+def test_llm_prompt_and_response_drop_untrainable_lora(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [
+            {"id": "l", "axes": {"lora": True}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path, facts=SMALL).propose([], {})
+    assert "- lora: one of [False]" in seen["prompt"]
+    assert [c["id"] for c in out["candidates"]] == ["t"]
+    assert out["dropped"][0]["id"] == "l"
+    assert out["dropped"][0]["skipped"] == "invalid_axes"

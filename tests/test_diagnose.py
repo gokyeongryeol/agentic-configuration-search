@@ -1,8 +1,8 @@
 """diagnose/errors — per-class aggregation and holdout (`test` key) anonymization.
 
-Note: classify_errors' missed_small cut is the lower quartile of the class's GT
-areas — for a class with a single GT the cut equals its own area, so it is always
-classified missed_small (pinned as current behavior). The fixture reflects this.
+The missed_small cut is the object's size relative to the image — small if
+r = √(box area / image area) is below 0.04. In the fixture the class-2 GT (3px in a
+100×100 image → r=0.03) is small; the rest are missed.
 """
 
 import pytest
@@ -14,8 +14,8 @@ from tests.conftest import CATS
 ONTO = Ontology.from_categories(CATS)
 IOU = 0.5
 
-GT_SMALL = ([10, 10, 30, 30], 1)      # 400px² — class 1 lower quartile
-GT_BIG = ([10, 10, 50, 50], 1)        # 1600px² — above the cut
+GT_SMALL = ([10, 10, 30, 30], 1)      # r=0.2 (matched as a TP)
+GT_BIG = ([10, 10, 50, 50], 1)        # r=0.4 — above the cut
 
 
 def _rec(file, dets, gts):
@@ -26,12 +26,12 @@ def _rec(file, dets, gts):
 
 
 def _records():
-    """3 images: TP+background FP / below_threshold FN (large GT) / single-GT-class FN."""
+    """3 images: TP+background FP / below_threshold FN (large GT) / small-GT FN (class 2)."""
     recs = [
         _rec("a.png", [([10, 10, 30, 30], 0.9, 1), ([60, 60, 80, 80], 0.7, 1)],
              [GT_SMALL]),
         _rec("b.png", [], [GT_BIG]),
-        _rec("c.png", [], [([40, 40, 70, 70], 2)]),
+        _rec("c.png", [], [([40, 40, 43, 43], 2)]),    # r=0.03 — small
     ]
     floor = [
         _rec("a.png", [], [GT_SMALL]),

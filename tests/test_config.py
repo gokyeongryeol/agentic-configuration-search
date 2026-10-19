@@ -90,3 +90,39 @@ def test_dataset_notes_default_and_roundtrip():
 def test_dataset_notes_must_be_string():
     with pytest.raises(ConfigError, match="dataset_notes"):
         config_from_dict({**BASE, "dataset_notes": ["list", "forbidden"]})
+
+
+def test_tiling_grid_comes_from_axis_not_config():
+    """The tile grid (grid g) is a planner-chosen axis value — config keeps only the
+    overlap and merge shared by every grid. The old tiling_configs list is an unknown key."""
+    s = config_from_dict(BASE).search
+    assert s.tiling_overlap == 0.5 and s.tiling_merge == "nmm"
+    with pytest.raises(ConfigError, match="tiling_configs"):
+        config_from_dict({**BASE, "search": {"tiling_configs": [
+            {"grid": 2, "overlap": 0.5, "merge": "nmm"}]}})
+
+
+@pytest.mark.parametrize("key,value", [
+    ("tiling_overlap", 1.0), ("tiling_overlap", -0.1), ("tiling_overlap", "0.5"),
+    ("tiling_merge", "union"),
+])
+def test_bad_tiling_params_error(key, value):
+    with pytest.raises(ConfigError, match=f"search.{key}"):
+        config_from_dict({**BASE, "search": {key: value}})
+
+
+def test_small_object_ratio_default_and_validation():
+    assert config_from_dict(BASE).diagnose.small_object_ratio == 0.04
+    for bad in (0, -0.1, 1.0, 1.5):
+        with pytest.raises(ConfigError, match="diagnose.small_object_ratio"):
+            config_from_dict({**BASE, "diagnose": {"small_object_ratio": bad}})
+
+
+def test_kcenter_outlier_mad_validation_and_old_keys():
+    """The outlier trim is distribution-based (median + k·MAD) — the fraction keys are unknown keys."""
+    for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
+        with pytest.raises(ConfigError, match=f"mine.{key}"):
+            config_from_dict({**BASE, "mine": {key: -1.0}})
+    for old in ("kcenter_trim", "fn_kcenter_trim"):
+        with pytest.raises(ConfigError, match=old):
+            config_from_dict({**BASE, "mine": {old: 0.2}})

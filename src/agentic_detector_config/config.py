@@ -111,9 +111,9 @@ class RescorerCfg:
 @dataclass(frozen=True)
 class CropClassifierCfg:
     """crop classifier axis — the client reclassifies predicted boxes (category
-    swap or background). The lever is correcting class_confusion. Training
-    hyperparameters are the worker's universal-best constants (not knobs); only
-    tripwires and the gate live here."""
+    swap or background). The levers are correcting class_confusion and removing
+    background FPs. Training hyperparameters are the worker's universal-best
+    constants (not knobs); only tripwires and the gate live here."""
     min_samples: int = 32            # total-crop tripwire — skip training below this
     min_background: int = 4          # minimum background crops — reclassification is pointless without them
     margin: float = 0.01             # adopt the arm only if fit_dev ΔF(β) exceeds this
@@ -132,16 +132,14 @@ class SearchCfg:
     tau_tolerance: float = 0.005
     # Grid of suppression IoU thresholds for emulated negatives (neg_eta)
     neg_eta_grid: list = field(default_factory=lambda: [0.25, 0.35, 0.5, 0.65, 0.75])
-    # Tiling grid — demo_data images are all 640x640 (water-meter is 325) with
-    # median object side 16–93px, so tiling is effectively upscaling. Two levels
-    # only: 416 (4 tiles, 1.5x) is a cheap mild option, 320 (9 tiles, 2x) targets
-    # tiny objects (e.g. 16px). overlap 0.25 covers objects cut at tile borders;
-    # merge=nmm unions only fragments touching a seam (containment union would
-    # swallow instances).
-    tiling_configs: list = field(default_factory=lambda: [
-        {"slice": [416, 416], "overlap": 0.25, "merge": "nmm"},
-        {"slice": [320, 320], "overlap": 0.25, "merge": "nmm"},
-    ])
+    # Parameters shared by every tiling grid — the grid g itself is the value of
+    # the planner-chosen tiling axis (planner.axes.TILING_GRIDS). Tiles are an
+    # image-relative g×g, so tile count (= cost) and zoom (g-1)(1-overlap)+1 do
+    # not depend on resolution. At overlap 0.5, grid 2 and 3 match the old 640px
+    # slice 416 / 320 in tile count and zoom (1.5x / 2.0x). merge=nmm unions only
+    # fragments touching a seam (containment union would swallow instances).
+    tiling_overlap: float = 0.5
+    tiling_merge: str = "nmm"
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be proposed in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -160,11 +158,15 @@ class MineCfg:
     """
     exemplars_per_class: int = 4          # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
-    kcenter_trim: float = 0.2             # outlier fraction dropped before kcenter, [0, 1)
-    # The FN arm trims less than base — the FN set is noisy (truncation,
-    # occlusion, label errors cluster there), but its purpose is broad coverage
-    # of missed appearances, so over-trimming diversity defeats the axis.
-    fn_kcenter_trim: float = 0.1
+    # Outlier trim before kcenter — drop only candidates whose centroid distance
+    # exceeds median + k·MAD (0 = off). A fixed-fraction trim (top 20%) always
+    # dropped candidates even with no outliers, 2 of ~10 per class on few-shot
+    # datasets. 3.0 is about 3σ under a normal distribution.
+    kcenter_outlier_mad: float = 3.0
+    # The FN arm trims less than base (a larger multiple) — the FN set is noisy
+    # (truncation, occlusion, label errors cluster there), but its purpose is broad
+    # coverage of missed appearances, so over-trimming diversity defeats the axis.
+    fn_kcenter_outlier_mad: float = 3.5
     fn_exemplars_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
     fn_min_miss_rate: float = 0.02
@@ -185,6 +187,19 @@ class DetectorCfg:
     device: str = "cuda:0"
     apply_topk: int = 300
     iou_threshold: float = 0.5           # IoU criterion shared by matching, τ and diagnosis
+
+
+@dataclass(frozen=True)
+class DiagnoseCfg:
+    """Classification criteria for the FP/FN diagnosis."""
+    # missed_small cut — an object is small if its size relative to the image,
+    # √(box area / image area), is below this. The detector sees a resized image,
+    # so the ratio, not the original px, sets how large an object looks. 0.04
+    # (4% of a side, 0.16% of the area) is about 26px on a square image at YOLOE's
+    # 640px input, within COCO's small. A relative cut (lower quartile of a class's
+    # GT areas) produced "small" misses even on datasets of only large objects, so
+    # the tiling remedy kept repeating.
+    small_object_ratio: float = 0.04
 
 
 @dataclass(frozen=True)
@@ -229,13 +244,14 @@ class Config:
     rescorer: RescorerCfg = field(default_factory=RescorerCfg)
     lora: LoraCfg = field(default_factory=LoraCfg)
     crop_classifier: CropClassifierCfg = field(default_factory=CropClassifierCfg)
+    diagnose: DiagnoseCfg = field(default_factory=DiagnoseCfg)
 
 
 _SECTIONS = {"planner": PlannerCfg, "gate": GateCfg, "saturation": SaturationCfg,
              "screen": ScreenCfg, "split": SplitCfg, "detector": DetectorCfg,
              "query": QueryCfg, "mine": MineCfg, "search": SearchCfg,
              "rescorer": RescorerCfg, "lora": LoraCfg,
-             "crop_classifier": CropClassifierCfg}
+             "crop_classifier": CropClassifierCfg, "diagnose": DiagnoseCfg}
 
 
 def _build(cls, d: dict, where: str):
@@ -295,17 +311,25 @@ def _validate(cfg: Config) -> None:
     if cfg.mine.exemplar_selection not in EXEMPLAR_SELECTIONS:
         raise ConfigError(f"mine.exemplar_selection: {cfg.mine.exemplar_selection!r} must be "
                           f"one of {EXEMPLAR_SELECTIONS}")
-    if not (0.0 <= cfg.mine.kcenter_trim < 1.0):
-        raise ConfigError(f"mine.kcenter_trim: outside [0,1) ({cfg.mine.kcenter_trim})")
-    if not (0.0 <= cfg.mine.fn_kcenter_trim < 1.0):
-        raise ConfigError("mine.fn_kcenter_trim: outside [0,1) "
-                          f"({cfg.mine.fn_kcenter_trim})")
+    for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
+        if getattr(cfg.mine, key) < 0:
+            raise ConfigError(f"mine.{key}: must be >= 0 — 0 is off "
+                              f"({getattr(cfg.mine, key)})")
     if cfg.mine.fn_min_candidates < 0:
         raise ConfigError("mine.fn_min_candidates cannot be negative — 0 means off "
                           f"(got {cfg.mine.fn_min_candidates})")
     if 0.0 not in cfg.rescorer.alphas:
         raise ConfigError("rescorer.alphas must include 0.0 — adoption is structurally safe "
                           "only if the search space includes the baseline (identity)")
+    if not (0.0 < cfg.diagnose.small_object_ratio < 1.0):
+        raise ConfigError("diagnose.small_object_ratio: outside (0,1) "
+                          f"({cfg.diagnose.small_object_ratio})")
+    o = cfg.search.tiling_overlap
+    if isinstance(o, bool) or not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
+        raise ConfigError(f"search.tiling_overlap: outside [0,1) ({o!r})")
+    if cfg.search.tiling_merge not in TILING_MERGES:
+        raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
+                          f"one of {TILING_MERGES}")
     if cfg.rescorer.margin < 0:
         raise ConfigError(f"rescorer.margin cannot be negative ({cfg.rescorer.margin})")
     if cfg.rescorer.ensemble_members < 1:
@@ -316,6 +340,9 @@ def _validate(cfg: Config) -> None:
                           "grid so that non-adoption is exactly the status quo")
     if cfg.lora.margin < 0:
         raise ConfigError(f"lora.margin cannot be negative ({cfg.lora.margin})")
+
+
+TILING_MERGES = ("nmm", "nms")
 
 
 def load_config(path: str | Path) -> Config:

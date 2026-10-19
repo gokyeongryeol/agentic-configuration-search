@@ -21,7 +21,7 @@ from tests.conftest import make_split
 
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
-    size = lambda i: 20 + (i % 3) * 10  # noqa: E731 — avoid skew toward missed_small
+    size = lambda i: 20 + (i % 3) * 10  # noqa: E731 — size variety (see test_loop)
     ds = tmp_path / "ds"
     # 45 images -> fit_train 36 × 2 detections = 72 rows ≥ 64 — below that, HistGradientBoosting's
     # min_samples_leaf=20 degenerates P̂ to a constant (see the RescorerCfg.min_samples
