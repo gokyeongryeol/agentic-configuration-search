@@ -44,8 +44,24 @@ BASELINE: dict = {"exemplar": "none", "alias": False, "text_negatives": False,
                   "visual_negative_k": None, "text_negative_k": None}
 
 
-def validate_axes(axes: dict) -> dict:
-    """Unknown keys/values raise. Unspecified axes are filled from BASELINE (safe point)."""
+def axis_values(n_classes: int | None = None) -> dict[str, tuple]:
+    """The value space that is meaningful for the dataset — the axis list the
+    planner prompt carries.
+
+    For a single-class dataset text_negatives=gt_crop is removed (see
+    validate_axes). Without n_classes this is AXES unchanged."""
+    if n_classes != 1:
+        return dict(AXES)
+    return {**AXES, "text_negatives": tuple(
+        v for v in AXES["text_negatives"] if v != "gt_crop")}
+
+
+def validate_axes(axes: dict, *, n_classes: int | None = None) -> dict:
+    """Unknown keys/values raise. Unspecified axes are filled from BASELINE (safe point).
+
+    With n_classes, combinations whose material is empty by definition on this
+    dataset are rejected too. Callers that re-key old records (tried_combos)
+    do not pass it."""
     unknown = sorted(set(axes) - set(AXES))
     if unknown:
         raise ValueError(f"axes: unknown key {unknown} — allowed: {sorted(AXES)}")
@@ -68,6 +84,14 @@ def validate_axes(axes: dict) -> dict:
         if full[key] is not None and not ok:
             raise ValueError(f"axes.{key} is only meaningful when {need} "
                              f"(got {full[key]})")
+    # gt_crop is sourced from **other classes'** GT crops — with a single class
+    # the pool is empty by definition, so the candidate would be rejected as
+    # no_material and only use up a round slot. fp_crop and background cover the
+    # same "suppress look-alikes" role.
+    if n_classes == 1 and full["text_negatives"] == "gt_crop":
+        raise ValueError("axes.text_negatives=gt_crop is only meaningful with 2+ "
+                         "classes (sourced from other classes' GT) — on a "
+                         "single-class dataset use fp_crop or background")
     return full
 
 
@@ -86,7 +110,8 @@ def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None) -> bool:
 
 def sanitize_candidates(raw, *, max_candidates: int,
                         dropped: list | None = None,
-                        disabled_axes=(), disabled_values=None) -> list[dict]:
+                        disabled_axes=(), disabled_values=None,
+                        n_classes: int | None = None) -> list[dict]:
     """Filter the planner's (especially the LLM's) candidate list against the contract.
 
     Invalid candidates are removed — the planner only proposes and the gate
@@ -120,7 +145,7 @@ def sanitize_candidates(raw, *, max_candidates: int,
             _drop(i, c, "invalid_axes", "not a candidate — an axes dict is required")
             continue
         try:
-            axes = validate_axes(c["axes"])
+            axes = validate_axes(c["axes"], n_classes=n_classes)
         except ValueError as exc:
             # Carry the ValueError message verbatim — it goes back into the next
             # round's prompt and is the only signal that stops the same violation.

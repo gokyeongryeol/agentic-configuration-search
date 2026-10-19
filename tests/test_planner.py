@@ -625,3 +625,58 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
 
     replayed = LLMPlanner(chat=boom, artifact_dir=tmp_path).propose([], {})
     assert [d["id"] for d in replayed["dropped"]] == ["bad"]
+
+
+# ------------------------------------------------- single class — gt_crop
+
+def test_gt_crop_invalid_for_single_class():
+    """gt_crop is sourced from **other classes'** GT crops — on a single class the
+    pool is empty by definition and the candidate only uses up a slot."""
+    axes = {"text_negatives": "gt_crop"}
+    with pytest.raises(ValueError, match="gt_crop"):
+        validate_axes(axes, n_classes=1)
+    assert validate_axes(axes, n_classes=2)["text_negatives"] == "gt_crop"
+    assert validate_axes(axes)["text_negatives"] == "gt_crop"   # unspecified = no constraint
+    # the other sources stay valid on a single class
+    for src in ("fp_crop", "background"):
+        validate_axes({"text_negatives": src}, n_classes=1)
+
+
+def test_sanitize_records_gt_crop_drop_for_single_class():
+    dropped: list = []
+    out = sanitize_candidates(
+        [{"id": "g", "axes": {"text_negatives": "gt_crop"}},
+         {"id": "f", "axes": {"text_negatives": "fp_crop"}}],
+        max_candidates=3, dropped=dropped, n_classes=1)
+    assert [c["id"] for c in out] == ["f"]
+    assert dropped[0]["id"] == "g" and dropped[0]["skipped"] == "invalid_axes"
+    assert "gt_crop" in dropped[0]["note"]
+
+
+def test_deterministic_skips_gt_crop_for_single_class():
+    diag = _diag(fp={"class_confusion": 9})
+    multi = deterministic.propose([], diag, max_candidates=10)
+    assert any(c["axes"]["text_negatives"] == "gt_crop" for c in multi["candidates"])
+    single = deterministic.propose([], diag, max_candidates=10, n_classes=1)
+    assert single["candidates"]
+    assert all(c["axes"]["text_negatives"] != "gt_crop"
+               for c in single["candidates"])
+
+
+def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [
+            {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": True}, "rationale": "y"}], "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path / "one",
+                     n_classes=1).propose([], {})
+    assert "gt_crop" not in seen["prompt"]
+    assert [c["id"] for c in out["candidates"]] == ["t"]
+    assert out["dropped"][0]["skipped"] == "invalid_axes"
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path / "two", n_classes=2).propose([], {})
+    assert "gt_crop" in seen["prompt"]     # the multi-class prompt is unchanged

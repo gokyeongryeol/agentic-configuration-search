@@ -88,7 +88,7 @@ def tried_combos(history: list[dict]) -> set[tuple]:
 
 def propose(history: list[dict], diagnosis: dict, *,
             max_candidates: int = 3, disabled_axes=(),
-            disabled_values=None) -> dict:
+            disabled_values=None, n_classes: int | None = None) -> dict:
     """Candidates that each raise one axis from the champion's axes — single
     increments with clean attribution.
 
@@ -114,9 +114,11 @@ def propose(history: list[dict], diagnosis: dict, *,
                     and champion["exemplar"] == "none":
                 continue
             try:
-                axes = validate_axes({**champion, axis: value})
+                axes = validate_axes({**champion, axis: value},
+                                     n_classes=n_classes)
             except ValueError:
-                continue                      # dependency rule violated (e.g. negatives without exemplars)
+                continue                      # dependency rule violated (e.g. negatives without
+                                              # exemplars, gt_crop on a single class)
             if tuple(sorted(axes.items())) in tried:
                 continue                      # block only exact retries of the same combination
             out.append({"id": f"{kind}:{axis}={value}", "axes": axes,

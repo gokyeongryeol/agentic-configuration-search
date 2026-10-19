@@ -73,20 +73,26 @@ def _setting_load(lite: dict) -> dict:
             "per_class": {int(k): v for k, v in lite["per_class"].items()}}
 
 
-def _load_candidates_file(path, disabled_axes=(), disabled_values=None) -> list[dict]:
+def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
+                          n_classes: int | None = None
+                          ) -> tuple[list[dict], list[dict]]:
+    """Human-injected candidates — (kept, dropped). Drops are recorded by the same
+    rules as planner candidates (no silent drops — sanitize_candidates)."""
     if not path:
-        return []
+        return [], []
     p = Path(path)
     if not p.exists():
-        return []
+        return [], []
     raw = yaml.safe_load(p.read_text()) or []
-    cands = sanitize_candidates(raw, max_candidates=64,
+    dropped: list[dict] = []
+    cands = sanitize_candidates(raw, max_candidates=64, dropped=dropped,
                                 disabled_axes=disabled_axes,
-                                disabled_values=disabled_values)
-    for c in cands:
+                                disabled_values=disabled_values,
+                                n_classes=n_classes)
+    for c in cands + dropped:
         c["id"] = f"human_{c['id']}"
         c["source"] = "human"
-    return cands
+    return cands, dropped
 
 
 class Loop:
@@ -316,16 +322,19 @@ class Loop:
                                   notes=self.cfg.dataset_notes,
                                   char_budget=_char_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
-                                  disabled_values=self.disabled_values).propose(
+                                  disabled_values=self.disabled_values,
+                                  n_classes=len(self.cat_ids)).propose(
                 history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              disabled_axes=self.disabled_axes,
-                                             disabled_values=self.disabled_values)
+                                             disabled_values=self.disabled_values,
+                                             n_classes=len(self.cat_ids))
             _write(round_dir / "proposal.json", proposal)
         # merge human-injected candidates (hybrid loop)
-        humans = _load_candidates_file(self.candidates_file, self.disabled_axes,
-                                       self.disabled_values)
+        humans, human_dropped = _load_candidates_file(
+            self.candidates_file, self.disabled_axes, self.disabled_values,
+            n_classes=len(self.cat_ids))
         merged = proposal["candidates"] + humans
 
         # Common combo filter: regardless of source (LLM, deterministic, human),
@@ -352,7 +361,8 @@ class Loop:
         # merge with planner-stage drops (invalid_axes etc.) — overwriting would
         # erase candidates discarded by sanitization from history.
         return {**proposal, "candidates": fresh,
-                "dropped": list(proposal.get("dropped") or []) + dropped,
+                "dropped": (list(proposal.get("dropped") or [])
+                            + human_dropped + dropped),
                 "stop": proposal["stop"] and not fresh}
 
     def _guard_material(self, c: dict, materials, skipped: list) -> bool:

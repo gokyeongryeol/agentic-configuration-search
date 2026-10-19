@@ -461,3 +461,47 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     assert len(planner_prompts) >= 2
     assert "invalid_axes" in planner_prompts[1]
     assert "fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
+
+
+def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
+    """Single-class dataset: gt_crop from the LLM or a human is recorded as
+    invalid_axes at sanitization, and is absent from the prompt's value list."""
+    import json as _json
+
+    from tests import conftest
+
+    monkeypatch.setattr(conftest, "CATS", [
+        {"id": 0, "name": "stuff", "supercategory": "none"},
+        {"id": 1, "name": "cat a", "supercategory": "stuff"}])
+    root = tmp_path / "one"
+    size = lambda i: 20 + (i % 3) * 10  # noqa: E731
+    make_split(root / "train", [
+        {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
+         "anns": [(1, 10, 10, size(i), size(i))]} for i in range(12)])
+    make_split(root / "valid", [
+        {"name": f"t{i}.png", "w": 100, "h": 80,
+         "anns": [(1, 10, 10, size(i), size(i))]} for i in range(8)])
+    make_split(root / "test", [
+        {"name": "v.png", "w": 100, "h": 80, "anns": [(1, 10, 10, 20, 20)]}])
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(root)))
+    human = tmp_path / "candidates.yaml"
+    human.write_text("- {id: hg, axes: {text_negatives: gt_crop}}\n")
+    prompts: list = []
+
+    def llm(messages, **kw):
+        prompts.append(messages[-1]["content"])
+        return {"candidates": [
+            {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": True}, "rationale": "y"}], "stop": False}
+
+    run_rounds(root, out_dir=tmp_path / "run", planner="llm", llm_chat=llm,
+               rounds=1, candidates_file=human, **_fakes())
+
+    planner_prompts = [p for p in prompts if "Round history" in p]
+    assert planner_prompts and "gt_crop" not in planner_prompts[0]
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert rec["g"]["skipped"] == "invalid_axes"
+    assert rec["human_hg"]["skipped"] == "invalid_axes"
+    assert rec["t"].get("skipped") is None
