@@ -111,9 +111,9 @@ class RescorerCfg:
 @dataclass(frozen=True)
 class CropClassifierCfg:
     """crop classifier axis — the client reclassifies predicted boxes (category
-    swap or background). The lever is correcting class_confusion. Training
-    hyperparameters are the worker's universal-best constants (not knobs); only
-    tripwires and the gate live here."""
+    swap or background). The levers are correcting class_confusion and removing
+    background FPs. Training hyperparameters are the worker's universal-best
+    constants (not knobs); only tripwires and the gate live here."""
     min_samples: int = 32            # total-crop tripwire — skip training below this
     min_background: int = 4          # minimum background crops — reclassification is pointless without them
     margin: float = 0.01             # adopt the arm only if fit_dev ΔF(β) exceeds this

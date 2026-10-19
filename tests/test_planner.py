@@ -306,6 +306,24 @@ def test_class_confusion_proposes_crop_classifier():
     assert any(a["crop_classifier"] for a in axes_list)
 
 
+def test_background_proposes_crop_classifier():
+    """The client drops detections reclassified as background (0) — the classifier
+    is a background-FP filter, not only a class fixer. On a single-class dataset
+    class_confusion is zero by definition, so without the background remedy the
+    diagnosis could not reach this axis."""
+    assert ("crop_classifier", True) in deterministic.REMEDY["background"]
+    out = deterministic.propose([], _diag(fp={"background": 9}))
+    assert any(c["axes"]["crop_classifier"] for c in out["candidates"])
+
+
+def test_leverage_counts_background_for_crop_classifier():
+    from agentic_detector_config.planner.llm import _leverage_lines
+
+    lines = _leverage_lines({"train": {"summary": {"fp": {"background": 7}}}})
+    cc = next(l for l in lines if l.startswith("- crop_classifier:"))
+    assert "background 7" in cc
+
+
 # ------------------------------------------------------- llm dataset notes
 
 def test_llm_prompt_includes_dataset_notes(tmp_path):

@@ -99,7 +99,7 @@ rescorer:                                 # discriminator on fit_train + α grid
   ensemble_members: 5
   inner_folds: 5                          # for the oof_phat diagnostic
 
-crop_classifier:                          # detection reclassification axis — corrects class_confusion (off by default, the planner turns it on)
+crop_classifier:                          # detection reclassification axis — corrects class_confusion, removes background FPs (off by default, the planner turns it on)
   min_samples: 32                         # total crop tripwire — skip training below this
   min_background: 4                       # minimum background crops — without them reclassification is meaningless
   margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this

@@ -24,7 +24,7 @@ AXES: dict[str, tuple] = {
     "tiling": (False, True),                  # tiling grid (search.tiling_configs)
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
-    "crop_classifier": (False, True),         # re-classify detections (fixes class_confusion)
+    "crop_classifier": (False, True),         # re-classify detections (fixes class_confusion, drops background FPs)
     # --- count axes (grid 1·2·4; exemplar up to 8) ---
     # None = the config's default quota (MineCfg's *_per_class), which is the
     # count axes' safe point. Meaningful only when the matching feature axis is

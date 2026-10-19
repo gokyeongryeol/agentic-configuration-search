@@ -32,8 +32,14 @@ REMEDY: dict[str, tuple] = {
     "below_threshold": (("rescorer", True), ("exemplar", "base"),
                         ("exemplar", "fn_arm"), ("lora", True),
                         ("crop_classifier", True)),
+    # The crop classifier drops detections it reclassifies as background (0) — it
+    # is a background-FP filter too. On a single-class dataset class_confusion is
+    # zero by definition, so without this entry the diagnosis reaches the axis only
+    # through below_threshold. Training costs the most (classifier fit + detector
+    # state swap), so it goes last.
     "background": (("visual_negatives", True),
-                   ("text_negatives", "background"), ("rescorer", True)),
+                   ("text_negatives", "background"), ("rescorer", True),
+                   ("crop_classifier", True)),
     "class_confusion": (("alias", "vlm"),
                         ("crop_classifier", True),
                         ("text_negatives", "gt_crop"),
