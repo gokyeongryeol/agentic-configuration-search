@@ -566,8 +566,11 @@ class Loop:
         # distribution (its only detector dependence is that background crops
         # were mined from old FPs). Removing it would make lora fight carrying a
         # handicap equal to the classifier's gain.
-        adapt_dirty = False
-        lora_dirty = False
+        # What the detector has loaded right now — updated whenever a candidate
+        # swaps it. A dirty flag cannot tell whether a later candidate restored
+        # the current state, so it loses an earlier winner's state.
+        served_w = champion.get("weights")
+        served_a = champion.get("adapt_root")
         for c in lora_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
@@ -592,9 +595,12 @@ class Loop:
                     base_weights=self.detector_hooks["base_weights"],
                     restore_weights=champion.get("weights"),
                     seed=self.cfg.run_seed)
+                # adopted: the winning arm stays loaded; otherwise restore_weights (current)
+                served_w = res["weights"] or champion.get("weights")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("lora candidate %s failed — restored current weights and rejected", c["id"])
                 self.detector_hooks["weights_ctl"](champion.get("weights"))
+                served_w = champion.get("weights")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
                 continue
@@ -610,7 +616,6 @@ class Loop:
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", "")})
                 continue
-            lora_dirty = True            # client is on the winning arm
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
@@ -627,6 +632,13 @@ class Loop:
                 for c in evaluated])
 
         # --- crop classifier candidates — detector-state candidates, same discipline as lora ---
+        # Measure them on the champion's weights. If a winning lora arm stayed
+        # loaded and the classifier then won, the champion would be served without
+        # that arm while its τ and holdout F came from on top of it — they would
+        # not match the serving state (adapt_round restores only the artifact).
+        if classifier_cands and not _same_state(served_w, champion.get("weights")):
+            self.detector_hooks["weights_ctl"](champion.get("weights"))
+            served_w = champion.get("weights")
         for c in classifier_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "crop_classifier": False}
@@ -643,9 +655,12 @@ class Loop:
                     repo_root=self.detector_hooks["repo_root"],
                     restore_root=champion.get("adapt_root"),
                     seed=self.cfg.run_seed, client=self.client)
+                # adopted: its own artifact stays loaded; otherwise restore_root (current)
+                served_a = res["adapt_root"] or champion.get("adapt_root")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("classifier candidate %s failed — restored current state and rejected", c["id"])
                 self._adapt_ctl(champion.get("adapt_root"))
+                served_a = champion.get("adapt_root")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
                 continue
@@ -662,7 +677,6 @@ class Loop:
                 skipped.append({**c, "skipped": "classifier_gate",
                                 "note": res["decision"].get("reason", "")})
                 continue
-            adapt_dirty = True           # client has the artifact loaded
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             ev = self._evaluate_candidate(entry, setting, materials)
@@ -711,10 +725,13 @@ class Loop:
                         "rescorer_path": winner.get("rescorer_path")}
             self._save_champion(champion)
             decision["micro_f_beta"] = winner["eval"]["micro_f_beta"]
-        if lora_dirty and not (winner and "_weights" in winner):
-            # the lora arm failed the gate (or another candidate won) — restore current
+        # Bring the detector to the final champion's state. Detector-state
+        # candidates swap it in turn, so the last candidate's state is not
+        # necessarily the winner's — a lora winner may have been unloaded before
+        # the classifier candidates.
+        if not _same_state(served_w, champion.get("weights")):
             self.detector_hooks["weights_ctl"](champion.get("weights"))
-        if adapt_dirty and not (winner and "_adapt_root" in winner):
+        if not _same_state(served_a, champion.get("adapt_root")):
             self._adapt_ctl(champion.get("adapt_root"))
         _write(rd / "decision.json", decision)
         self._append_history({
@@ -902,6 +919,11 @@ def _missing_hook(axes: dict, hooks: dict) -> str | None:
         if hooks.get(name) is None:
             return name
     return None
+
+
+def _same_state(a, b) -> bool:
+    """Compare detector-state paths (weights, artifact) — str and Path mix, None is the base state."""
+    return (a is None) == (b is None) and (a is None or Path(a) == Path(b))
 
 
 def _route_detector_state(axes: dict, champion_axes: dict) -> str:
