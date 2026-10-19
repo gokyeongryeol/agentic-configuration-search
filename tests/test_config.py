@@ -109,3 +109,10 @@ def test_tiling_grid_comes_from_axis_not_config():
 def test_bad_tiling_params_error(key, value):
     with pytest.raises(ConfigError, match=f"search.{key}"):
         config_from_dict({**BASE, "search": {key: value}})
+
+
+def test_small_object_ratio_default_and_validation():
+    assert config_from_dict(BASE).diagnose.small_object_ratio == 0.04
+    for bad in (0, -0.1, 1.0, 1.5):
+        with pytest.raises(ConfigError, match="diagnose.small_object_ratio"):
+            config_from_dict({**BASE, "diagnose": {"small_object_ratio": bad}})

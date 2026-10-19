@@ -22,8 +22,9 @@ def big_root(tmp_path: Path) -> Path:
     """train 12 + holdout (valid) 8 (class 1: 4, class 2: 4) — with the default n=2 fixture
     the bootstrap CI lower bound sticks to 0 and no gate scenario can be built."""
     ds = tmp_path / "big"
-    # Mix GT sizes — with uniform sizes every FN is classified missed_small (bottom quartile =
-    # its own area) and the planner only proposes tiling (see the caveat in test_diagnose)
+    # Mix GT sizes (r≈0.22–0.45 relative to the image — no missed_small at the
+    # default cut 0.04). The sizes date from a relative (lower-quartile) cut, under
+    # which uniform sizes made every FN missed_small and the planner only proposed tiling.
     size = lambda i: 20 + (i % 3) * 10  # noqa: E731
     make_split(ds / "train", [
         {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
@@ -536,3 +537,25 @@ def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert isinstance(rec["t3"]["tiling_used"], bool)
+
+
+def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypatch):
+    """The runner passes the config cut to the diagnosis. Fixture GTs are r≈0.22–0.45
+    relative to the image: missed at the default cut (0.04), missed_small at a large cut."""
+    import json as _json
+
+    from agentic_detector_config.config import config_from_dict
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+
+    def kinds(out, cut):
+        cfg = config_from_dict({"dataset": str(big_root),
+                                "diagnose": {"small_object_ratio": cut}})
+        run_rounds(big_root, out_dir=out, planner="deterministic", rounds=1,
+                   cfg=cfg, **_fakes())
+        d = _json.loads((out / "rounds" / "round_001" / "diagnosis_train.json")
+                        .read_text())
+        return {r["kind"] for r in d["fn"]}
+
+    assert "missed_small" not in kinds(tmp_path / "a", 0.04)
+    assert "missed_small" in kinds(tmp_path / "b", 0.9)

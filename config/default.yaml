@@ -112,3 +112,7 @@ lora:                                     # tail fine-tune + λ-interpolation ar
   batch_size: 8
   lr: 0.001                               # AdamW lr0 (the worker pins optimizer=AdamW)
   device: "cuda:0"                        # keep off the shared vLLM planner GPU (planner.launch.gpu)
+
+diagnose:                                 # FP/FN diagnosis criteria
+  small_object_ratio: 0.04                # missed_small cut — object size relative to the image, √(box area/image area).
+                                          #   0.04 = 4% of a side (0.16% of the area), about 26px at YOLOE's 640px input

@@ -186,6 +186,19 @@ class DetectorCfg:
 
 
 @dataclass(frozen=True)
+class DiagnoseCfg:
+    """Classification criteria for the FP/FN diagnosis."""
+    # missed_small cut — an object is small if its size relative to the image,
+    # √(box area / image area), is below this. The detector sees a resized image,
+    # so the ratio, not the original px, sets how large an object looks. 0.04
+    # (4% of a side, 0.16% of the area) is about 26px on a square image at YOLOE's
+    # 640px input, within COCO's small. A relative cut (lower quartile of a class's
+    # GT areas) produced "small" misses even on datasets of only large objects, so
+    # the tiling remedy kept repeating.
+    small_object_ratio: float = 0.04
+
+
+@dataclass(frozen=True)
 class QueryCfg:
     """Fixed query-construction parameters — search axes (negatives, neg_eta,
     ...) travel with the candidate setting; this only holds the detector call
@@ -227,13 +240,14 @@ class Config:
     rescorer: RescorerCfg = field(default_factory=RescorerCfg)
     lora: LoraCfg = field(default_factory=LoraCfg)
     crop_classifier: CropClassifierCfg = field(default_factory=CropClassifierCfg)
+    diagnose: DiagnoseCfg = field(default_factory=DiagnoseCfg)
 
 
 _SECTIONS = {"planner": PlannerCfg, "gate": GateCfg, "saturation": SaturationCfg,
              "screen": ScreenCfg, "split": SplitCfg, "detector": DetectorCfg,
              "query": QueryCfg, "mine": MineCfg, "search": SearchCfg,
              "rescorer": RescorerCfg, "lora": LoraCfg,
-             "crop_classifier": CropClassifierCfg}
+             "crop_classifier": CropClassifierCfg, "diagnose": DiagnoseCfg}
 
 
 def _build(cls, d: dict, where: str):
@@ -304,6 +318,9 @@ def _validate(cfg: Config) -> None:
     if 0.0 not in cfg.rescorer.alphas:
         raise ConfigError("rescorer.alphas must include 0.0 — adoption is structurally safe "
                           "only if the search space includes the baseline (identity)")
+    if not (0.0 < cfg.diagnose.small_object_ratio < 1.0):
+        raise ConfigError("diagnose.small_object_ratio: outside (0,1) "
+                          f"({cfg.diagnose.small_object_ratio})")
     o = cfg.search.tiling_overlap
     if isinstance(o, bool) or not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
         raise ConfigError(f"search.tiling_overlap: outside [0,1) ({o!r})")

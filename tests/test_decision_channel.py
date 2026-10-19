@@ -166,6 +166,20 @@ class _FakeDetectorState:
         self.adapt = root
 
 
+def _human_candidates_only(monkeypatch):
+    """The detector-state scenarios only hold if the human-injected candidates are
+    what gets evaluated — when a deterministic proposal carries the same axes
+    combination, combo dedup keeps the planner's (earlier) candidate and folds the
+    human_* one. With the fixture's FNs classified as missed, deterministic proposes
+    lora=True and exactly that happens. These scenarios measure detector state, not
+    the planner, so planner proposals are emptied (the judgment assertions are unchanged)."""
+    from agentic_detector_config.planner import deterministic
+    monkeypatch.setattr(deterministic, "propose",
+                        lambda history, diagnosis, **kw: {
+                            "planner": "deterministic", "candidates": [],
+                            "stop": False})
+
+
 def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by):
     """One round with the given candidates. The base detector misclassifies class 2
     as class 1; `fixed_by(state)` decides whether the loaded state corrects it."""
@@ -212,6 +226,7 @@ def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by
     monkeypatch.setattr(tail_round, "train_tail", fake_train_tail)
     monkeypatch.setattr(adapt_round, "train_crop_classifier", fake_train_cls)
     monkeypatch.setattr(adapt_round, "run_classifier_candidate", spy_cls)
+    _human_candidates_only(monkeypatch)
 
     cfg = config_from_dict({
         "dataset": str(root),

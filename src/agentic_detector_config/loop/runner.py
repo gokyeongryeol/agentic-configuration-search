@@ -274,11 +274,13 @@ class Loop:
             passes = infer_for_groups(self.cfg, self.client, groups, grid,
                                       self.ds.ontology, paths, materials)
             floor_recs, recs = setting_records(train, paths, passes, groups, tau)
+        small = dict(small_ratio=self.cfg.diagnose.small_object_ratio)
         d_train = diagnose(recs, floor_recs, tau, self.ds.ontology,
-                             iou_thr=self.iou, anonymize=False)
+                           iou_thr=self.iou, anonymize=False, **small)
         d_test = diagnose(champion["eval"]["records"],
                           champion["eval"]["floor_records"], tau,
-                          self.ds.ontology, iou_thr=self.iou, anonymize=True)
+                          self.ds.ontology, iou_thr=self.iou, anonymize=True,
+                          **small)
         _write(round_dir / "diagnosis_train.json", d_train)
         _write(round_dir / "diagnosis_test.json", d_test)
         return {"train": d_train, "test": d_test}

@@ -396,10 +396,18 @@ def rank_auc(scores, labels) -> float:
 FP_KINDS = ["localization", "duplicate", "class_confusion", "background", "tiling_artifact"]
 FN_KINDS = ["below_threshold", "missed_small", "missed"]
 
+# missed_small cut — the object's size relative to the image,
+# r = √(box area / image area); below this it is "small". The detector sees the
+# image resized by its preprocessor, so this ratio, not the original px, sets how
+# large an object looks. 0.04 = 4% of a side (0.16% of the area) — about 26px on a
+# square image at YOLOE's 640px input, within COCO's small (< 32²).
+# config: diagnose.small_object_ratio.
+SMALL_OBJECT_RATIO = 0.04
+
 
 def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float], *,
                     iou_thr: float, floor_detections: list[dict] | None = None,
-                    small_quantile: float = 0.25) -> dict:
+                    small_ratio: float = SMALL_OBJECT_RATIO) -> dict:
     """Classify FPs among thresholded detections and FNs among GTs.
 
     per_image detections must be **already thresholded**. Distinguishing
@@ -410,16 +418,15 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
     FP classification uses an IoM axis besides IoU — small duplicate/partial
     detections on a large GT have IoU<0.1 and would be miscounted as background,
     but boxes on a real object (IoM>=0.7) are localization/class_confusion.
+
+    missed_small is cut by **the object's size relative to the image** — small if
+    r = √(box area / image area) is below small_ratio. A relative cut (lower
+    quartile of a class's GT areas) would rank objects within the dataset, so a
+    dataset of only large objects would still get "small" misses every round and
+    tiling would keep coming back as a remedy. An FN record's size_ratio is that
+    r — material for judging how much zoom is needed.
     """
     fp_records, fn_records = [], []
-    small_cut: dict[int, float] = {}
-    all_areas: dict[int, list[float]] = {}
-    for rec in per_image:
-        for g in rec["gts"]:
-            x1, y1, x2, y2 = g["box"]
-            all_areas.setdefault(g["category_id"], []).append((x2 - x1) * (y2 - y1))
-    for cid, areas in all_areas.items():
-        small_cut[cid] = float(np.quantile(np.array(areas), small_quantile)) if areas else 0.0
 
     for img_idx, rec in enumerate(per_image):
         dets = rec["detections"]
@@ -481,15 +488,17 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
                      and d["score"] < per_class_threshold.get(cid, float("inf"))
                      and iou_matrix(np.array([d["box"]], dtype=float), gt_box)[0, 0] >= iou_thr]
             x1, y1, x2, y2 = g["box"]
-            area = (x2 - x1) * (y2 - y1)
+            ratio = float(np.sqrt(max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+                                  / max(rec["width"] * rec["height"], 1e-9)))
             if below:
                 kind = "below_threshold"
-            elif area <= small_cut.get(cid, 0.0):
+            elif ratio < small_ratio:
                 kind = "missed_small"
             else:
                 kind = "missed"
             fn_records.append({"image_index": img_idx, "kind": kind,
-                               "box": g["box"], "category_id": cid})
+                               "box": g["box"], "category_id": cid,
+                               "size_ratio": round(ratio, 4)})
 
     def _summary(records, kinds):
         return {k: sum(1 for r in records if r["kind"] == k) for k in kinds}
