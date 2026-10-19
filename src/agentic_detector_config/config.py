@@ -158,11 +158,15 @@ class MineCfg:
     """
     exemplars_per_class: int = 4          # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
-    kcenter_trim: float = 0.2             # outlier fraction dropped before kcenter, [0, 1)
-    # The FN arm trims less than base — the FN set is noisy (truncation,
-    # occlusion, label errors cluster there), but its purpose is broad coverage
-    # of missed appearances, so over-trimming diversity defeats the axis.
-    fn_kcenter_trim: float = 0.1
+    # Outlier trim before kcenter — drop only candidates whose centroid distance
+    # exceeds median + k·MAD (0 = off). A fixed-fraction trim (top 20%) always
+    # dropped candidates even with no outliers, 2 of ~10 per class on few-shot
+    # datasets. 3.0 is about 3σ under a normal distribution.
+    kcenter_outlier_mad: float = 3.0
+    # The FN arm trims less than base (a larger multiple) — the FN set is noisy
+    # (truncation, occlusion, label errors cluster there), but its purpose is broad
+    # coverage of missed appearances, so over-trimming diversity defeats the axis.
+    fn_kcenter_outlier_mad: float = 3.5
     fn_exemplars_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
     fn_min_miss_rate: float = 0.02
@@ -307,11 +311,10 @@ def _validate(cfg: Config) -> None:
     if cfg.mine.exemplar_selection not in EXEMPLAR_SELECTIONS:
         raise ConfigError(f"mine.exemplar_selection: {cfg.mine.exemplar_selection!r} must be "
                           f"one of {EXEMPLAR_SELECTIONS}")
-    if not (0.0 <= cfg.mine.kcenter_trim < 1.0):
-        raise ConfigError(f"mine.kcenter_trim: outside [0,1) ({cfg.mine.kcenter_trim})")
-    if not (0.0 <= cfg.mine.fn_kcenter_trim < 1.0):
-        raise ConfigError("mine.fn_kcenter_trim: outside [0,1) "
-                          f"({cfg.mine.fn_kcenter_trim})")
+    for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
+        if getattr(cfg.mine, key) < 0:
+            raise ConfigError(f"mine.{key}: must be >= 0 — 0 is off "
+                              f"({getattr(cfg.mine, key)})")
     if cfg.mine.fn_min_candidates < 0:
         raise ConfigError("mine.fn_min_candidates cannot be negative — 0 means off "
                           f"(got {cfg.mine.fn_min_candidates})")

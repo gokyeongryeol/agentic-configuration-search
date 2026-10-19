@@ -72,30 +72,52 @@ def test_zero_k_selects_nothing():
     assert embedder.select_indices("mean", 0, 2, embeddings=emb) == []
 
 
-def test_trim_drops_farthest_from_centroid():
-    """Only the top fraction by centroid distance is trimmed; returns original indices ascending."""
-    emb = np.array([[0., 0.], [0.1, 0.], [0., 0.1], [10., 0.], [0., 10.]])
-    kept = embedder.trim_outliers(emb, 0.4, min_keep=1)   # drops 2 of 5
-    assert list(kept) == [0, 1, 2]                        # outliers 3, 4 are removed
+# --- outlier trim = distribution-based (median + k·MAD) --------------------------
+# A fixed-fraction trim (base 20%, FN 10%) **always** dropped the farthest share —
+# 2 of ~10 per class on few-shot data even with no outliers, and only part of them
+# when outliers were 30%. Only distances that stand out from the distribution are cut.
+
+def test_trim_keeps_everything_when_no_outliers():
+    """An even distribution loses nothing (a fixed-fraction trim dropped 20%)."""
+    emb = np.array([[np.cos(t), np.sin(t)] for t in np.linspace(0, 6.0, 10)])
+    assert list(embedder.trim_outliers(emb, 3.0)) == list(range(10))
 
 
-def test_trim_zero_keeps_everything():
-    emb = np.array([[0., 0.], [9., 9.]])
-    assert list(embedder.trim_outliers(emb, 0.0)) == [0, 1]
+def test_trim_drops_only_real_outliers():
+    """Only the outliers are cut; returns original indices ascending."""
+    rng = np.random.default_rng(0)
+    body = rng.normal(scale=1.0, size=(20, 4))
+    far = np.full((2, 4), 40.0)
+    emb = np.vstack([body[:10], far[:1], body[10:], far[1:]])   # 10 and 21 are outliers
+    kept = embedder.trim_outliers(emb, 3.0)
+    assert 10 not in kept and 21 not in kept
+    assert len(kept) == 20 and list(kept) == sorted(kept)
+
+
+def test_trim_zero_mad_spread():
+    """Even with a zero MAD (most distances equal) an extreme is cut; if all are equal, none are."""
+    same = np.zeros((9, 2))
+    emb = np.vstack([same, [[50.0, 0.0]]])
+    assert list(embedder.trim_outliers(emb, 3.0)) == list(range(9))
+    assert list(embedder.trim_outliers(np.zeros((5, 2)), 3.0)) == list(range(5))
+
+
+def test_trim_off_keeps_everything():
+    emb = np.array([[0., 0.], [0., 0.1], [9., 9.]])
+    assert list(embedder.trim_outliers(emb, 0.0)) == [0, 1, 2]
 
 
 def test_trim_never_goes_below_min_keep():
-    """Trimming below the pick count (k) is meaningless — always keep at least k."""
-    rng = np.random.default_rng(3)
-    emb = rng.normal(size=(10, 4))
-    assert len(embedder.trim_outliers(emb, 0.9, min_keep=5)) == 5
+    """Trimming below the pick count (k) is meaningless — the k candidates nearest the
+    centroid are always kept."""
+    emb = np.vstack([np.zeros((2, 2)), np.full((4, 2), 30.0) + np.arange(4)[:, None]])
+    kept = embedder.trim_outliers(emb, 0.5, min_keep=5)
+    assert len(kept) == 5
 
 
-def test_trim_rejects_out_of_range():
-    emb = np.zeros((4, 2))
-    for bad in (-0.1, 1.0, 1.5):
-        with pytest.raises(ValueError, match=r"\[0, 1\)"):
-            embedder.trim_outliers(emb, bad)
+def test_trim_rejects_negative():
+    with pytest.raises(ValueError, match=">= 0"):
+        embedder.trim_outliers(np.zeros((4, 2)), -1.0)
 
 
 def test_kcenter_trim_excludes_outliers_but_keeps_spread():
@@ -106,8 +128,8 @@ def test_kcenter_trim_excludes_outliers_but_keeps_spread():
     emb = np.vstack([dense, outliers])
     outlier_ids = set(range(40, 46))
 
-    pure = embedder.kcenter_greedy(emb, 5, trim=0.0)
-    trimmed = embedder.kcenter_greedy(emb, 5, trim=0.2)   # drops 9 of 46
+    pure = embedder.kcenter_greedy(emb, 5, outlier_mad=0.0)
+    trimmed = embedder.kcenter_greedy(emb, 5, outlier_mad=3.0)
 
     assert outlier_ids & set(pure)                        # plain k-center picks outliers
     assert not (outlier_ids & set(trimmed))               # trimmed does not
@@ -118,18 +140,10 @@ def test_kcenter_trim_excludes_outliers_but_keeps_spread():
 def test_kcenter_trim_returns_original_indices():
     """After picking from the trimmed subset, indices must map back to the original."""
     rng = np.random.default_rng(5)
-    emb = rng.normal(size=(20, 4))
-    idx = embedder.kcenter_greedy(emb, 4, trim=0.3)
+    emb = np.vstack([rng.normal(size=(20, 4)), np.full((1, 4), 50.0)])
+    idx = embedder.kcenter_greedy(emb, 4, outlier_mad=3.0)
     assert len(set(idx)) == 4
     assert all(0 <= i < 20 for i in idx)
-
-
-def test_kcenter_heavy_trim_converges_to_mean():
-    """If exactly k candidates remain after trimming, the result equals the k centroid-nearest."""
-    rng = np.random.default_rng(9)
-    emb = rng.normal(size=(12, 5))
-    # min_keep=k is the floor, so trim=0.99 leaves exactly k candidates
-    assert set(embedder.kcenter_greedy(emb, 4, trim=0.99)) == set(embedder.mean_nearest(emb, 4))
 
 
 def test_mean_nearest_picks_prototypical_not_outliers():
@@ -287,8 +301,8 @@ def test_select_indices_dispatch_matches_primitives():
     emb = np.array([[0.0], [0.1], [0.2], [5.0], [9.0]])
     assert embedder.select_indices("mean", 2, 5, embeddings=emb) \
         == embedder.mean_nearest(emb, 2)
-    assert embedder.select_indices("kcenter", 2, 5, embeddings=emb, trim=0.2) \
-        == embedder.kcenter_greedy(emb, 2, trim=0.2)
+    assert embedder.select_indices("kcenter", 2, 5, embeddings=emb, outlier_mad=3.0) \
+        == embedder.kcenter_greedy(emb, 2, outlier_mad=3.0)
     r1 = embedder.select_indices("random", 3, 5, rng=random.Random(7))
     r2 = embedder.select_indices("random", 3, 5, rng=random.Random(7))
     assert r1 == r2 and len(r1) == 3               # seed determinism + k cap

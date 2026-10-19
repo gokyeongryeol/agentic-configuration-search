@@ -116,3 +116,13 @@ def test_small_object_ratio_default_and_validation():
     for bad in (0, -0.1, 1.0, 1.5):
         with pytest.raises(ConfigError, match="diagnose.small_object_ratio"):
             config_from_dict({**BASE, "diagnose": {"small_object_ratio": bad}})
+
+
+def test_kcenter_outlier_mad_validation_and_old_keys():
+    """The outlier trim is distribution-based (median + k·MAD) — the fraction keys are unknown keys."""
+    for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
+        with pytest.raises(ConfigError, match=f"mine.{key}"):
+            config_from_dict({**BASE, "mine": {key: -1.0}})
+    for old in ("kcenter_trim", "fn_kcenter_trim"):
+        with pytest.raises(ConfigError, match=old):
+            config_from_dict({**BASE, "mine": {old: 0.2}})

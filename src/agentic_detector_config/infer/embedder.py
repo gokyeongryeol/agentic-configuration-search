@@ -67,28 +67,51 @@ def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: st
     return emb
 
 
-def trim_outliers(embeddings: np.ndarray, trim: float, min_keep: int = 1) -> np.ndarray:
-    """**Original indices** (ascending) of candidates left after trimming the
-    `trim` fraction farthest from the centroid.
+# MAD → normal σ conversion factor. If the MAD is 0 (more than half the distances
+# are equal), the mean absolute deviation × √(π/2) stands in — if both are 0 there
+# is no spread, so nothing is trimmed.
+_MAD_TO_SIGMA = 1.4826
+_MEANAD_TO_SIGMA = 1.2533
+
+
+def trim_outliers(embeddings: np.ndarray, outlier_mad: float,
+                  min_keep: int = 1) -> np.ndarray:
+    """**Original indices** (ascending) of candidates left after dropping those whose
+    centroid distance stands out from the distribution.
+
+    A distance d is an outlier if it exceeds `median(d) + outlier_mad × σ̂`
+    (σ̂ = MAD × 1.4826 — a spread estimate not pulled by extremes). A fixed-fraction
+    trim would always drop the farthest share even with no outliers (2 of ~10 GTs
+    per class on few-shot datasets), and would catch only part of them when
+    outliers exceed that share. 0 turns trimming off.
 
     The centroid is computed once on the **full, untrimmed set** — recomputing it
-    iteratively makes results vary strongly with the data at the same trim ratio,
-    hurting reproducibility. Never trims below `min_keep` (usually k) — trimming
-    is pointless if too few remain to pick from.
+    iteratively makes results vary strongly with the data, hurting
+    reproducibility. Never trims below `min_keep` (usually k) — then the min_keep
+    candidates nearest the centroid are kept.
     """
     n = len(embeddings)
     if n == 0:
         return np.zeros(0, dtype=int)
-    if not 0.0 <= trim < 1.0:
-        raise ValueError(f"trim must be in [0, 1) (got {trim})")
-    if trim == 0.0:
+    if outlier_mad < 0:
+        raise ValueError(f"outlier_mad must be >= 0 (got {outlier_mad})")
+    if outlier_mad == 0.0:
         return np.arange(n)
     d = np.linalg.norm(embeddings - embeddings.mean(axis=0, keepdims=True), axis=1)
-    keep_n = max(min(min_keep, n), n - int(n * trim))
-    kept = np.sort(np.argsort(d)[:keep_n])
-    if keep_n < n:
-        log.info("outlier trim=%.2f: kept %d/%d candidates (dropped the %d farthest from the centroid)",
-                 trim, keep_n, n, n - keep_n)
+    med = float(np.median(d))
+    dev = np.abs(d - med)
+    sigma = float(np.median(dev)) * _MAD_TO_SIGMA or float(dev.mean()) * _MEANAD_TO_SIGMA
+    if sigma == 0.0:
+        return np.arange(n)
+    keep = d <= med + outlier_mad * sigma
+    min_keep = min(min_keep, n)
+    if keep.sum() < min_keep:
+        keep = np.zeros(n, dtype=bool)
+        keep[np.argsort(d, kind="mergesort")[:min_keep]] = True
+    kept = np.flatnonzero(keep)
+    if len(kept) < n:
+        log.info("outlier trim (median + %.1f·MAD): kept %d/%d candidates", outlier_mad,
+                 len(kept), n)
     return kept
 
 
@@ -120,24 +143,24 @@ def _farthest_point_traversal(embeddings: np.ndarray, k: int) -> list[int]:
     return centers
 
 
-def kcenter_greedy(embeddings: np.ndarray, k: int, trim: float = 0.0) -> list[int]:
+def kcenter_greedy(embeddings: np.ndarray, k: int, outlier_mad: float = 0.0) -> list[int]:
     """Farthest-point traversal — k points covering the embedding space as widely
     as possible.
 
-    With `trim > 0`, **first drop the `trim` fraction farthest from the
-    centroid**, then traverse only the remainder. Pure k-center deliberately picks
+    With `outlier_mad > 0`, **first drop candidates whose centroid distance stands
+    out from the distribution** (trim_outliers), then traverse only the remainder. Pure k-center deliberately picks
     the most atypical instances to maximize coverage, but such outliers hurt as
     visual prompts. Trimming is the compromise: **keep diversity, exclude what
     cannot serve as a prompt**. Returned indices always refer to the original set.
 
-    Larger `trim` converges to `mean_nearest` — if exactly k candidates remain
-    after trimming, the result equals the k nearest to the centroid.
+    If exactly k candidates remain after trimming, the result equals the k nearest
+    to the centroid (`mean_nearest`).
     """
     n = len(embeddings)
     if n == 0 or k <= 0:
         return []
     k = min(k, n)
-    kept = trim_outliers(embeddings, trim, min_keep=k)
+    kept = trim_outliers(embeddings, outlier_mad, min_keep=k)
     local = _farthest_point_traversal(embeddings[kept], k)
     return [int(kept[i]) for i in local]
 
@@ -156,7 +179,7 @@ def mean_nearest(embeddings: np.ndarray, k: int) -> list[int]:
 
 
 def select_indices(selection: str, k: int, n: int, *, embeddings=None,
-                   trim: float = 0.0, rng=None) -> list[int]:
+                   outlier_mad: float = 0.0, rng=None) -> list[int]:
     """Per-class exemplar selection dispatch — the single point that makes select
     and tune_eval use **the same rule** (if they diverged, tune's adoption
     decision would be measured under a different prompt regime than serving).
@@ -167,7 +190,7 @@ def select_indices(selection: str, k: int, n: int, *, embeddings=None,
     if selection == "mean":
         return mean_nearest(embeddings, k)
     if selection == "kcenter":
-        return kcenter_greedy(embeddings, k, trim=trim)
+        return kcenter_greedy(embeddings, k, outlier_mad=outlier_mad)
     if selection == "random":
         return rng.sample(range(n), min(k, n))
     from ..config import EXEMPLAR_SELECTIONS  # noqa: PLC0415 — error message only

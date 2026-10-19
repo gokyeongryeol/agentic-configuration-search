@@ -67,8 +67,8 @@ mine:                                     # mining quotas and hygiene rules (the
   visual_negatives_per_class: 1
   text_negatives_max_per_class: 1
   exemplar_selection: kcenter             # kcenter | mean | random
-  kcenter_trim: 0.2                       # outlier fraction dropped before kcenter [0, 1)
-  fn_kcenter_trim: 0.1                    # lighter for the FN arm — filter noise but keep diversity
+  kcenter_outlier_mad: 3.0                # outlier trim before kcenter — only centroid distance > median + k·MAD (0=off)
+  fn_kcenter_outlier_mad: 3.5             # lighter for the FN arm (larger multiple) — filter noise but keep diversity
   fn_min_candidates: 5                    # FN-mining headroom pre-filter (0=off)
   fn_min_miss_rate: 0.02                  # minimum miss-rate pre-filter
   fn_min_area_ratio: 0.3                  # cut tiny candidates relative to median GT area
