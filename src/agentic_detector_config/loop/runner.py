@@ -38,7 +38,7 @@ from ..eval.screen import screen_candidate
 from ..fitting.materials import Materials
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
-from ..planner.axes import AXES, BASELINE, sanitize_candidates
+from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import LLMPlanner
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
@@ -74,7 +74,7 @@ def _setting_load(lite: dict) -> dict:
 
 
 def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
-                          n_classes: int | None = None
+                          facts: DatasetFacts | None = None
                           ) -> tuple[list[dict], list[dict]]:
     """Human-injected candidates — (kept, dropped). Drops are recorded by the same
     rules as planner candidates (no silent drops — sanitize_candidates)."""
@@ -88,7 +88,7 @@ def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
     cands = sanitize_candidates(raw, max_candidates=64, dropped=dropped,
                                 disabled_axes=disabled_axes,
                                 disabled_values=disabled_values,
-                                n_classes=n_classes)
+                                facts=facts)
     for c in cands + dropped:
         c["id"] = f"human_{c['id']}"
         c["source"] = "human"
@@ -325,18 +325,18 @@ class Loop:
                                   char_budget=_char_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
                                   disabled_values=self.disabled_values,
-                                  n_classes=len(self.cat_ids)).propose(
+                                  facts=self._facts()).propose(
                 history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              disabled_axes=self.disabled_axes,
                                              disabled_values=self.disabled_values,
-                                             n_classes=len(self.cat_ids))
+                                             facts=self._facts())
             _write(round_dir / "proposal.json", proposal)
         # merge human-injected candidates (hybrid loop)
         humans, human_dropped = _load_candidates_file(
             self.candidates_file, self.disabled_axes, self.disabled_values,
-            n_classes=len(self.cat_ids))
+            facts=self._facts())
         merged = proposal["candidates"] + humans
 
         # Common combo filter: regardless of source (LLM, deterministic, human),
@@ -366,6 +366,12 @@ class Loop:
                 "dropped": (list(proposal.get("dropped") or [])
                             + human_dropped + dropped),
                 "stop": proposal["stop"] and not fresh}
+
+    def _facts(self) -> DatasetFacts:
+        """Facts that let sanitization block candidates whose outcome the data already decides."""
+        return DatasetFacts(n_classes=len(self.cat_ids),
+                            n_fit_train=len(self.ds.fit_train.images),
+                            lora_min_images=self.cfg.lora.min_images)
 
     def _guard_material(self, c: dict, materials, skipped: list) -> bool:
         """If materials are empty, record in skipped and return True — the caller drops the candidate."""
@@ -686,7 +692,13 @@ class Loop:
                               "fit_dev_micro_f_beta")}
                             | {"crop_classifier": res["decision"]})
             if not res["decision"].get("adopted"):
-                skipped.append({**c, "skipped": "classifier_gate",
+                # The tripwire (too few training crops) keeps the same material
+                # until the champion changes — record the axis as empty so it reaches
+                # the planner's dead-axis list. It cannot be blocked up front because
+                # the background FP count is an inference result.
+                dead = ({"empty_axis": "crop_classifier"}
+                        if res["decision"].get("tripwire") else {})
+                skipped.append({**c, "skipped": "classifier_gate", **dead,
                                 "note": res["decision"].get("reason", "")})
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from ..diagnose.sample import pick_detail
 from . import deterministic
-from .axes import axis_values, sanitize_candidates
+from .axes import DatasetFacts, axis_values, sanitize_candidates
 
 log = logging.getLogger(__name__)
 
@@ -385,10 +385,10 @@ Propose up to {max_candidates} candidates."""
 
 # Inserted only when some axis had empty material — otherwise omitted.
 DEAD_BLOCK = """
-Axes whose mined material came out empty on this dataset (the candidate was
-rejected without evaluation, so it cost a slot for nothing). Their material pool
-is exhausted by safety rules here — re-propose one only with a different source
-value, or after the champion has changed:
+Axes whose mined material came out empty, or too small to train on, on this
+dataset (the candidate was rejected without evaluation, so it cost a slot for
+nothing). Their material pool is exhausted here — re-propose one only with a
+different source value, or after the champion has changed:
 {dead}
 """
 
@@ -426,7 +426,7 @@ class LLMPlanner:
     def __init__(self, chat, artifact_dir: Path, *, max_candidates: int = 3,
                  notes: str = "", char_budget: int = DEFAULT_CHAR_BUDGET,
                  disabled_axes=(), disabled_values=None,
-                 n_classes: int | None = None):
+                 facts: DatasetFacts | None = None):
         self.chat = chat
         self.artifact_dir = Path(artifact_dir)
         self.max_candidates = max_candidates
@@ -435,10 +435,10 @@ class LLMPlanner:
         self.disabled_axes = tuple(disabled_axes or ())
         self.disabled_values = {k: tuple(v) for k, v in
                                 (disabled_values or {}).items() if v}
-        # Values meaningless on this dataset by definition (gt_crop on a single
-        # class) are left out of the prompt and filtered from the response —
-        # None means the full value space (the previous behavior)
-        self.n_classes = n_classes
+        # Values whose outcome the data already decides (gt_crop on a single class,
+        # lora whose training would be skipped) are left out of the prompt and
+        # filtered from the response — None means the full value space
+        self.facts = facts
 
     @property
     def artifact_path(self) -> Path:
@@ -461,7 +461,7 @@ class LLMPlanner:
         axes_doc = "\n".join(
             f"- {k}: one of "
             f"{[x for x in v if x not in self.disabled_values.get(k, ())]}"
-            for k, v in axis_values(self.n_classes).items()
+            for k, v in axis_values(self.facts).items()
             if k not in self.disabled_axes)
         banned = list(self.disabled_axes) + [
             f"{k}={x!r}" for k, xs in sorted(self.disabled_values.items())
@@ -522,7 +522,7 @@ class LLMPlanner:
                                          dropped=dropped,
                                          disabled_axes=self.disabled_axes,
                                          disabled_values=self.disabled_values,
-                                         n_classes=self.n_classes)
+                                         facts=self.facts)
         if dropped:
             log.info("sanitizer dropped %d candidates: %s", len(dropped),
                      [(c["id"], c["skipped"]) for c in dropped])
@@ -534,7 +534,7 @@ class LLMPlanner:
                                         max_candidates=self.max_candidates,
                                         disabled_axes=self.disabled_axes,
                                         disabled_values=self.disabled_values,
-                                        n_classes=self.n_classes)
+                                        facts=self.facts)
             candidates, stop = det["candidates"], det["stop"]
             fallback = "deterministic"
 

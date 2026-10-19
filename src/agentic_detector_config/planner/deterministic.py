@@ -7,7 +7,7 @@ matches the README's FP/FN diagnosis section.
 
 from __future__ import annotations
 
-from .axes import BASELINE, TILING_GRIDS, validate_axes
+from .axes import BASELINE, TILING_GRIDS, DatasetFacts, validate_axes
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -90,7 +90,7 @@ def tried_combos(history: list[dict]) -> set[tuple]:
 
 def propose(history: list[dict], diagnosis: dict, *,
             max_candidates: int = 3, disabled_axes=(),
-            disabled_values=None, n_classes: int | None = None) -> dict:
+            disabled_values=None, facts: DatasetFacts | None = None) -> dict:
     """Candidates that each raise one axis from the champion's axes — single
     increments with clean attribution.
 
@@ -120,10 +120,11 @@ def propose(history: list[dict], diagnosis: dict, *,
                 continue
             try:
                 axes = validate_axes({**champion, axis: value},
-                                     n_classes=n_classes)
+                                     facts=facts)
             except ValueError:
                 continue                      # dependency rule violated (e.g. negatives without
-                                              # exemplars, gt_crop on a single class)
+                                              # exemplars, gt_crop on a single class, lora whose
+                                              # training would be skipped — DatasetFacts)
             if tuple(sorted(axes.items())) in tried:
                 continue                      # block only exact retries of the same combination
             out.append({"id": f"{kind}:{axis}={value}", "axes": axes,

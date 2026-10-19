@@ -8,6 +8,8 @@ a text prompt of the class name alone.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 # tiling axis value = grid g — each image is cut into g×g tiles
 # (core.tiling.grid_tiles). Zoom (g-1)(1-o)+1, 1+g² detector passes per image
 # (o = search.tiling_overlap). The cap 6 (37 passes) is set by cost — when a grid
@@ -50,24 +52,54 @@ BASELINE: dict = {"exemplar": "none", "alias": False, "text_negatives": False,
                   "visual_negative_k": None, "text_negative_k": None}
 
 
-def axis_values(n_classes: int | None = None) -> dict[str, tuple]:
+@dataclass(frozen=True)
+class DatasetFacts:
+    """Facts used to block, up front, candidates whose **outcome is already decided
+    by the data**.
+
+    Only values that follow directly from the dataset and config, without
+    inference — conditions whose outcome depends on inference (e.g. the background
+    FP count behind the crop classifier tripwire) do not belong here. A None
+    field means no constraint.
+    """
+    n_classes: int | None = None
+    n_fit_train: int | None = None        # number of fit_train images
+    lora_min_images: int | None = None    # config lora.min_images
+
+    def lora_block(self) -> str | None:
+        """The reason, if lora (tail fine-tune) training is certain to be skipped by its tripwire."""
+        if self.n_fit_train is None or self.lora_min_images is None:
+            return None
+        if self.n_fit_train >= self.lora_min_images:
+            return None
+        return (f"fit_train {self.n_fit_train} images < lora.min_images "
+                f"{self.lora_min_images} — training would be skipped, same as current")
+
+
+def axis_values(facts: DatasetFacts | None = None) -> dict[str, tuple]:
     """The value space that is meaningful for the dataset — the axis list the
     planner prompt carries.
 
-    For a single-class dataset text_negatives=gt_crop is removed (see
-    validate_axes). Without n_classes this is AXES unchanged."""
-    if n_classes != 1:
-        return dict(AXES)
-    return {**AXES, "text_negatives": tuple(
-        v for v in AXES["text_negatives"] if v != "gt_crop")}
+    Leaves out the values validate_axes blocks with facts — gt_crop on a single
+    class, lora whose training would be skipped. Without facts this is AXES
+    unchanged."""
+    out = dict(AXES)
+    if facts is None:
+        return out
+    if facts.n_classes == 1:
+        out["text_negatives"] = tuple(v for v in AXES["text_negatives"]
+                                      if v != "gt_crop")
+    if facts.lora_block():
+        out["lora"] = (False,)
+    return out
 
 
-def validate_axes(axes: dict, *, n_classes: int | None = None) -> dict:
+def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
     """Unknown keys/values raise. Unspecified axes are filled from BASELINE (safe point).
 
-    With n_classes, combinations whose material is empty by definition on this
-    dataset are rejected too. Callers that re-key old records (tried_combos)
-    do not pass it."""
+    With facts, combinations whose outcome is already decided on this dataset
+    (material empty by definition, training that would be skipped) are rejected
+    too. Callers that re-key old records (tried_combos) do not pass it."""
     unknown = sorted(set(axes) - set(AXES))
     if unknown:
         raise ValueError(f"axes: unknown key {unknown} — allowed: {sorted(AXES)}")
@@ -99,10 +131,17 @@ def validate_axes(axes: dict, *, n_classes: int | None = None) -> dict:
     # the pool is empty by definition, so the candidate would be rejected as
     # no_material and only use up a round slot. fp_crop and background cover the
     # same "suppress look-alikes" role.
-    if n_classes == 1 and full["text_negatives"] == "gt_crop":
+    if facts is None:
+        return full
+    if facts.n_classes == 1 and full["text_negatives"] == "gt_crop":
         raise ValueError("axes.text_negatives=gt_crop is only meaningful with 2+ "
                          "classes (sourced from other classes' GT) — on a "
                          "single-class dataset use fp_crop or background")
+    # lora (tail fine-tune) is rejected without training if fit_train has fewer
+    # than lora.min_images images — the outcome follows from the data, so block it
+    # before it uses a candidate slot
+    if full["lora"] and (why := facts.lora_block()):
+        raise ValueError(f"axes.lora=True: {why}")
     return full
 
 
@@ -122,7 +161,7 @@ def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None) -> bool:
 def sanitize_candidates(raw, *, max_candidates: int,
                         dropped: list | None = None,
                         disabled_axes=(), disabled_values=None,
-                        n_classes: int | None = None) -> list[dict]:
+                        facts: DatasetFacts | None = None) -> list[dict]:
     """Filter the planner's (especially the LLM's) candidate list against the contract.
 
     Invalid candidates are removed — the planner only proposes and the gate
@@ -156,7 +195,7 @@ def sanitize_candidates(raw, *, max_candidates: int,
             _drop(i, c, "invalid_axes", "not a candidate — an axes dict is required")
             continue
         try:
-            axes = validate_axes(c["axes"], n_classes=n_classes)
+            axes = validate_axes(c["axes"], facts=facts)
         except ValueError as exc:
             # Carry the ValueError message verbatim — it goes back into the next
             # round's prompt and is the only signal that stops the same violation.

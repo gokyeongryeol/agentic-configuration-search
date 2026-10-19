@@ -64,7 +64,10 @@ def run_classifier_candidate(cfg, ds, base_axes: dict, materials, out_dir: Path,
     cc = cfg.crop_classifier
     total = counts["train_gt"] + counts["train_fp"]
     if total < cc.min_samples or counts["train_fp"] < cc.min_background:
-        dec = {"adopted": False,
+        # tripwire=True — the runner records this axis as empty material
+        # (empty_axis). It must be told apart from a margin rejection (no effect)
+        # so the planner reads the two differently
+        dec = {"adopted": False, "tripwire": True,
                "reason": f"{total} crops (<{cc.min_samples}) or "
                          f"{counts['train_fp']} background crops (<{cc.min_background}) "
                          "— training skipped",

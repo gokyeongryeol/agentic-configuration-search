@@ -243,7 +243,7 @@ def test_dead_axes_survive_the_history_window(tmp_path):
         return {"candidates": [], "stop": True}
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history, {})
-    assert "came out empty on this dataset" in seen["prompt"]
+    assert "came out empty, or too small to train on, on this" in seen["prompt"]
     assert "- alias (values tried: vlm)" in seen["prompt"]
 
 
@@ -629,17 +629,21 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
 
 # ------------------------------------------------- single class — gt_crop
 
+from agentic_detector_config.planner.axes import DatasetFacts  # noqa: E402
+
+ONE_CLASS = DatasetFacts(n_classes=1)
+
 def test_gt_crop_invalid_for_single_class():
     """gt_crop is sourced from **other classes'** GT crops — on a single class the
     pool is empty by definition and the candidate only uses up a slot."""
     axes = {"text_negatives": "gt_crop"}
     with pytest.raises(ValueError, match="gt_crop"):
-        validate_axes(axes, n_classes=1)
-    assert validate_axes(axes, n_classes=2)["text_negatives"] == "gt_crop"
+        validate_axes(axes, facts=ONE_CLASS)
+    assert validate_axes(axes, facts=DatasetFacts(n_classes=2))["text_negatives"] == "gt_crop"
     assert validate_axes(axes)["text_negatives"] == "gt_crop"   # unspecified = no constraint
     # the other sources stay valid on a single class
     for src in ("fp_crop", "background"):
-        validate_axes({"text_negatives": src}, n_classes=1)
+        validate_axes({"text_negatives": src}, facts=ONE_CLASS)
 
 
 def test_sanitize_records_gt_crop_drop_for_single_class():
@@ -647,7 +651,7 @@ def test_sanitize_records_gt_crop_drop_for_single_class():
     out = sanitize_candidates(
         [{"id": "g", "axes": {"text_negatives": "gt_crop"}},
          {"id": "f", "axes": {"text_negatives": "fp_crop"}}],
-        max_candidates=3, dropped=dropped, n_classes=1)
+        max_candidates=3, dropped=dropped, facts=ONE_CLASS)
     assert [c["id"] for c in out] == ["f"]
     assert dropped[0]["id"] == "g" and dropped[0]["skipped"] == "invalid_axes"
     assert "gt_crop" in dropped[0]["note"]
@@ -657,7 +661,7 @@ def test_deterministic_skips_gt_crop_for_single_class():
     diag = _diag(fp={"class_confusion": 9})
     multi = deterministic.propose([], diag, max_candidates=10)
     assert any(c["axes"]["text_negatives"] == "gt_crop" for c in multi["candidates"])
-    single = deterministic.propose([], diag, max_candidates=10, n_classes=1)
+    single = deterministic.propose([], diag, max_candidates=10, facts=ONE_CLASS)
     assert single["candidates"]
     assert all(c["axes"]["text_negatives"] != "gt_crop"
                for c in single["candidates"])
@@ -673,12 +677,13 @@ def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
             {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
 
     out = LLMPlanner(chat=chat, artifact_dir=tmp_path / "one",
-                     n_classes=1).propose([], {})
+                     facts=ONE_CLASS).propose([], {})
     assert "gt_crop" not in seen["prompt"]
     assert [c["id"] for c in out["candidates"]] == ["t"]
     assert out["dropped"][0]["skipped"] == "invalid_axes"
 
-    LLMPlanner(chat=chat, artifact_dir=tmp_path / "two", n_classes=2).propose([], {})
+    LLMPlanner(chat=chat, artifact_dir=tmp_path / "two",
+               facts=DatasetFacts(n_classes=2)).propose([], {})
     assert "gt_crop" in seen["prompt"]     # the multi-class prompt is unchanged
 
 
@@ -734,3 +739,49 @@ def test_compact_history_carries_tiling_used():
              "decision": {"adopted": False}}]
     row = _compact_history(hist)[0]["candidates"][0]
     assert row["tiling_used"] is False
+
+
+# ------------------------------------------------- lora tripwire, decided up front
+# If fit_train has fewer than lora.min_images images, a lora candidate is rejected by
+# lora_gate without training — an outcome the data already decides, so it is
+# blocked before it uses a candidate slot.
+
+SMALL = DatasetFacts(n_classes=3, n_fit_train=8, lora_min_images=20)
+
+
+def test_lora_invalid_when_fit_train_below_min_images():
+    with pytest.raises(ValueError, match="lora.*8.*20"):
+        validate_axes({"lora": True}, facts=SMALL)
+    ok = DatasetFacts(n_classes=3, n_fit_train=20, lora_min_images=20)
+    assert validate_axes({"lora": True}, facts=ok)["lora"] is True
+    assert validate_axes({"lora": True})["lora"] is True       # no facts = no constraint
+
+
+def test_axis_values_hide_untrainable_lora():
+    from agentic_detector_config.planner.axes import axis_values
+    assert axis_values(SMALL)["lora"] == (False,)
+    assert axis_values(DatasetFacts())["lora"] == (False, True)
+
+
+def test_deterministic_skips_untrainable_lora():
+    diag = _diag(fn={"missed": 9})
+    assert any(c["axes"]["lora"] for c in
+               deterministic.propose([], diag, max_candidates=10)["candidates"])
+    out = deterministic.propose([], diag, max_candidates=10, facts=SMALL)
+    assert out["candidates"] and not any(c["axes"]["lora"] for c in out["candidates"])
+
+
+def test_llm_prompt_and_response_drop_untrainable_lora(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [
+            {"id": "l", "axes": {"lora": True}, "rationale": "x"},
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path, facts=SMALL).propose([], {})
+    assert "- lora: one of [False]" in seen["prompt"]
+    assert [c["id"] for c in out["candidates"]] == ["t"]
+    assert out["dropped"][0]["id"] == "l"
+    assert out["dropped"][0]["skipped"] == "invalid_axes"

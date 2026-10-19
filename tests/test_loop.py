@@ -559,3 +559,30 @@ def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypa
 
     assert "missed_small" not in kinds(tmp_path / "a", 0.04)
     assert "missed_small" in kinds(tmp_path / "b", 0.9)
+
+
+def test_untrainable_lora_never_reaches_tail_round(big_root, tmp_path, monkeypatch):
+    """If fit_train has fewer than lora.min_images images, a lora candidate is recorded
+    as invalid_axes at sanitization and never reaches the tail round (training wiring)."""
+    import json as _json
+
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop import tail_round
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    monkeypatch.setattr(tail_round, "run_tail_candidate", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("reached the tail round")))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "l", "axes": {"lora": True}, "rationale": "x"},
+                               {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}],
+                "stop": False}
+
+    cfg = config_from_dict({"dataset": str(big_root), "planner": {"kind": "llm"},
+                            "lora": {"min_images": 50}})
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=llm,
+               rounds=1, cfg=cfg, **_fakes())
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert rec["l"]["skipped"] == "invalid_axes" and "min_images" in rec["l"]["note"]
