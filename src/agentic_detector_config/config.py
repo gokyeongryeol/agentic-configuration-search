@@ -132,18 +132,14 @@ class SearchCfg:
     tau_tolerance: float = 0.005
     # Grid of suppression IoU thresholds for emulated negatives (neg_eta)
     neg_eta_grid: list = field(default_factory=lambda: [0.25, 0.35, 0.5, 0.65, 0.75])
-    # Tiling grid — tiling is effectively upscaling. Written as an
-    # **image-relative g×g** (`grid`): tile count (= inference cost) and zoom
-    # (g-1)(1-o)+1 do not depend on resolution. Two levels only: grid 2 (4 tiles,
-    # 1.5x) is a cheap mild option, grid 3 (9 tiles, 2x) targets tiny objects —
-    # at 640px they match the old slice 416 / 320 in tile count and zoom.
-    # Absolute px `slice` is not accepted — tuned for 640px, 320 became 221 tiles
-    # at 4000×3000. merge=nmm unions only fragments touching a seam (containment
-    # union would swallow instances).
-    tiling_configs: list = field(default_factory=lambda: [
-        {"grid": 2, "overlap": 0.5, "merge": "nmm"},
-        {"grid": 3, "overlap": 0.5, "merge": "nmm"},
-    ])
+    # Parameters shared by every tiling grid — the grid g itself is the value of
+    # the planner-chosen tiling axis (planner.axes.TILING_GRIDS). Tiles are an
+    # image-relative g×g, so tile count (= cost) and zoom (g-1)(1-overlap)+1 do
+    # not depend on resolution. At overlap 0.5, grid 2 and 3 match the old 640px
+    # slice 416 / 320 in tile count and zoom (1.5x / 2.0x). merge=nmm unions only
+    # fragments touching a seam (containment union would swallow instances).
+    tiling_overlap: float = 0.5
+    tiling_merge: str = "nmm"
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be proposed in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -308,8 +304,12 @@ def _validate(cfg: Config) -> None:
     if 0.0 not in cfg.rescorer.alphas:
         raise ConfigError("rescorer.alphas must include 0.0 — adoption is structurally safe "
                           "only if the search space includes the baseline (identity)")
-    for i, t in enumerate(cfg.search.tiling_configs):
-        _validate_tiling(t, f"search.tiling_configs[{i}]")
+    o = cfg.search.tiling_overlap
+    if isinstance(o, bool) or not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
+        raise ConfigError(f"search.tiling_overlap: outside [0,1) ({o!r})")
+    if cfg.search.tiling_merge not in TILING_MERGES:
+        raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
+                          f"one of {TILING_MERGES}")
     if cfg.rescorer.margin < 0:
         raise ConfigError(f"rescorer.margin cannot be negative ({cfg.rescorer.margin})")
     if cfg.rescorer.ensemble_members < 1:
@@ -323,29 +323,6 @@ def _validate(cfg: Config) -> None:
 
 
 TILING_MERGES = ("nmm", "nms")
-_TILING_KEYS = {"grid", "overlap", "merge"}
-
-
-def _validate_tiling(t, where: str) -> None:
-    """One tiling grid entry — image-relative g×g (`grid`). Format errors are
-    raised at load time, not in the middle of screening."""
-    if not isinstance(t, dict):
-        raise ConfigError(f"{where}: must be a mapping (got {type(t).__name__})")
-    if "slice" in t:
-        raise ConfigError(f"{where}: absolute px slice is not supported — the tile "
-                          "count grows quadratically with resolution. Use an "
-                          "image-relative grid (an integer >= 2)")
-    unknown = sorted(set(t) - _TILING_KEYS)
-    if unknown:
-        raise ConfigError(f"{where}: unknown key {unknown} — allowed keys: {sorted(_TILING_KEYS)}")
-    g = t.get("grid")
-    if not isinstance(g, int) or isinstance(g, bool) or g < 2:
-        raise ConfigError(f"{where}.grid: must be an integer >= 2 ({g!r})")
-    o = t.get("overlap")
-    if not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
-        raise ConfigError(f"{where}.overlap: outside [0,1) ({o!r})")
-    if t.get("merge", "nmm") not in TILING_MERGES:
-        raise ConfigError(f"{where}.merge: {t['merge']!r} must be one of {TILING_MERGES}")
 
 
 def load_config(path: str | Path) -> Config:

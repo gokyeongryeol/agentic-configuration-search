@@ -240,7 +240,7 @@ class Loop:
             neg_eta_grid=(s.neg_eta_grid
                           if (axes.get("visual_negatives") or text_neg_sweep)
                           else ()),
-            tiling_variants=(s.tiling_configs if axes.get("tiling") else ()))
+            tiling_variants=_tiling_variants(s, axes))
 
     def _diagnosis(self, champion: dict, round_dir: Path) -> dict:
         """Diagnosis on train (detailed) + holdout (anonymized aggregates) — the
@@ -752,6 +752,7 @@ class Loop:
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
+                            | _tiling_record(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -830,6 +831,32 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
     result.history = history
     result.champion = champion
     return result
+
+
+def _tiling_variants(search, axes: dict) -> tuple:
+    """The one grid the candidate chose — screen compares only it against tiling off.
+
+    Why not the whole grid list: the zoom is a planner-chosen axis value (when it
+    falls short the next round raises it a step), and one candidate's screen cost
+    should be a predictable 1 + (1+g²) passes."""
+    g = axes.get("tiling")
+    if not g:
+        return ()
+    return ({"grid": int(g), "overlap": search.tiling_overlap,
+             "merge": search.tiling_merge},)
+
+
+def _tiling_record(c: dict) -> dict:
+    """For a tiling candidate, whether screen actually assigned a tile config — the
+    signal the planner reads to raise or drop the zoom. False means that grid helped
+    no class on fit_dev, and the candidate's setting equals tiling off despite its axes."""
+    if not c["axes"].get("tiling") or not c.get("setting"):
+        return {}
+    setting = c["setting"]
+    configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
+    used = any(configs.get(e["config_id"], {}).get("tiling")
+               for e in setting.get("per_class", {}).values())
+    return {"tiling_used": bool(used)}
 
 
 def _stagnant(decision: dict, epsilon: float) -> bool:

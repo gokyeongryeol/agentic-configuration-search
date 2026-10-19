@@ -527,7 +527,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
     history = [
         {"round": 1, "champion": {"axes": dict(BASELINE), "micro_f_beta": 0.5},
          "candidates": [{"id": "a", "axes": validate_axes({"rescorer": True})},
-                        {"id": "b", "axes": validate_axes({"tiling": True})}],
+                        {"id": "b", "axes": validate_axes({"tiling": 2})}],
          "decision": {"adopted": True, "id": "a"}},
         {"round": 2, "champion": {"axes": champ, "micro_f_beta": 0.6},
          "candidates": [{"id": "c", "axes": validate_axes(
@@ -536,7 +536,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
     ]
     lines = _tried_lines(history, champ)
     joined = " ".join(lines)
-    assert "tiling=True" in joined and "alias=vlm" in joined
+    assert "tiling=2" in joined and "alias=vlm" in joined
     assert "baseline" in joined or "rescorer" in joined
     assert all(len(l) < 200 for l in lines)
 
@@ -580,7 +580,7 @@ def test_sanitize_records_duplicate_and_overflow_drops():
     raw = [{"id": "a", "axes": {"alias": "vlm"}},
            {"id": "a_dup", "axes": {"alias": "vlm"}},
            {"id": "b", "axes": {"rescorer": True}},
-           {"id": "c", "axes": {"tiling": True}}]
+           {"id": "c", "axes": {"tiling": 2}}]
     dropped: list = []
     out = sanitize_candidates(raw, max_candidates=2, dropped=dropped)
 
@@ -670,7 +670,7 @@ def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
         seen["prompt"] = messages[-1]["content"]
         return {"candidates": [
             {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
-            {"id": "t", "axes": {"tiling": True}, "rationale": "y"}], "stop": False}
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
 
     out = LLMPlanner(chat=chat, artifact_dir=tmp_path / "one",
                      n_classes=1).propose([], {})
@@ -680,3 +680,57 @@ def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path / "two", n_classes=2).propose([], {})
     assert "gt_crop" in seen["prompt"]     # the multi-class prompt is unchanged
+
+
+# ------------------------------------------------- tiling = grid g axis
+
+def test_tiling_axis_is_grid_value():
+    """The tiling value is grid g (g×g tiles, zoom (g-1)(1-o)+1, 1+g² passes) — the
+    planner picks the zoom directly and raises it when it falls short. The code sets the range."""
+    from agentic_detector_config.planner.axes import AXES, TILING_GRIDS
+    assert AXES["tiling"] == (False, *TILING_GRIDS)
+    for g in TILING_GRIDS:
+        assert validate_axes({"tiling": g})["tiling"] == g
+    for bad in (True, 1, 7, 2.0, "2"):
+        with pytest.raises(ValueError, match="tiling"):
+            validate_axes({"tiling": bad})
+
+
+def test_deterministic_tiling_steps_up_from_champion():
+    """The missed_small remedy only moves to grids larger than the champion's —
+    going down would undo an already-adopted zoom, so it is not a remedy."""
+    diag = _diag(fn={"missed_small": 9})
+    base = deterministic.propose([], diag, max_candidates=10)
+    assert [c["axes"]["tiling"] for c in base["candidates"]][:1] == [2]
+
+    champ = validate_axes({"tiling": 3})
+    history = [{"round": 1, "champion": {"axes": champ}, "candidates": []}]
+    out = deterministic.propose(history, diag, max_candidates=10)
+    grids = [c["axes"]["tiling"] for c in out["candidates"]]
+    assert grids and grids[0] == 4
+    assert all(g > 3 for g in grids)
+
+
+def test_llm_prompt_explains_tiling_grid(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [], "stop": True}
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], {})
+    assert "tiling: one of [False, 2, 3, 4, 5, 6]" in seen["prompt"]
+    assert "1 + g^2" in seen["prompt"]          # cost
+    assert "tiling_used" in seen["prompt"]      # how to read the shortfall signal
+
+
+def test_compact_history_carries_tiling_used():
+    from agentic_detector_config.planner.llm import _compact_history
+
+    champ = validate_axes({})
+    hist = [{"round": 1, "champion": {"axes": champ, "micro_f_beta": 0.5},
+             "candidates": [{"id": "t", "axes": validate_axes({"tiling": 3}),
+                             "adopted": False, "tiling_used": False}],
+             "decision": {"adopted": False}}]
+    row = _compact_history(hist)[0]["candidates"][0]
+    assert row["tiling_used"] is False

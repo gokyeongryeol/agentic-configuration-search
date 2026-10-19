@@ -386,7 +386,7 @@ def test_empty_material_candidate_is_skipped():
                        text_negatives={"cat": ["dog"]})
     assert _empty_material({"alias": "vlm"}, filled, {}) is None
     assert _empty_material({"text_negatives": "gt_crop"}, filled, {}) is None
-    assert _empty_material({"rescorer": True, "tiling": True}, empty, {}) is None
+    assert _empty_material({"rescorer": True, "tiling": 2}, empty, {}) is None
 
 
 def test_missing_llm_hooks_skip_dependent_axes():
@@ -408,7 +408,7 @@ def test_missing_llm_hooks_skip_dependent_axes():
     assert _missing_hook({"text_negatives": "gt_crop"}, {}) == "caption_fn"
     assert _missing_hook({"alias": "vlm"}, full) is None
     # axes needing no hook always pass
-    assert _missing_hook({"rescorer": True, "tiling": True}, {}) is None
+    assert _missing_hook({"rescorer": True, "tiling": 2}, {}) is None
 
 
 def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatch):
@@ -425,7 +425,7 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
         return {"candidates": [
             {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
              "rationale": "fn_k is exemplar=fn_arm only — caught by validation"},
-            {"id": "ok_tiling", "axes": {"tiling": True}, "rationale": "valid"}],
+            {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -450,7 +450,7 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
         return {"candidates": [
             {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
              "rationale": "invalid"},
-            {"id": "ok_tiling", "axes": {"tiling": True}, "rationale": "valid"}],
+            {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -492,7 +492,7 @@ def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
         prompts.append(messages[-1]["content"])
         return {"candidates": [
             {"id": "g", "axes": {"text_negatives": "gt_crop"}, "rationale": "x"},
-            {"id": "t", "axes": {"tiling": True}, "rationale": "y"}], "stop": False}
+            {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
 
     run_rounds(root, out_dir=tmp_path / "run", planner="llm", llm_chat=llm,
                rounds=1, candidates_file=human, **_fakes())
@@ -505,3 +505,34 @@ def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
     assert rec["g"]["skipped"] == "invalid_axes"
     assert rec["human_hg"]["skipped"] == "invalid_axes"
     assert rec["t"].get("skipped") is None
+
+
+def test_tiling_variants_follow_axis_grid():
+    """screen compares only the grid the candidate chose against tiling off — it no
+    longer runs every grid from config (1 + (1+g²) passes per candidate)."""
+    from agentic_detector_config.config import config_from_dict
+    from agentic_detector_config.loop.runner import _tiling_variants
+
+    s = config_from_dict({"dataset": "x"}).search
+    assert _tiling_variants(s, {"tiling": False}) == ()
+    assert _tiling_variants(s, {"tiling": 3}) == (
+        {"grid": 3, "overlap": 0.5, "merge": "nmm"},)
+
+
+def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch):
+    """A tiling candidate records whether screen actually assigned a tile config
+    (tiling_used) — the signal the planner reads to raise or drop the zoom."""
+    import json as _json
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "t3", "axes": {"tiling": 3},
+                                "rationale": "small objects"}], "stop": False}
+
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+               llm_chat=llm, rounds=1, **_fakes())
+    hist = [_json.loads(l) for l in
+            (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}
+    assert isinstance(rec["t3"]["tiling_used"], bool)

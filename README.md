@@ -73,7 +73,7 @@ the baseline behavior.
 | visual exemplar | text only / GT-crop exemplars (`base`, `fn_arm`) |
 | visual_negatives, neg_eta | negative crops emulated by IoU suppression × threshold grid |
 | text_negatives | off / `fp_crop` / `gt_crop` (other classes' GT — not on single-class datasets) / `background` |
-| tiling | off / image-relative g×g grid (`search.tiling_configs`) |
+| tiling | off / grid g ∈ 2–6 (image-relative g×g, zoom (g−1)(1−overlap)+1, 1+g² passes per image) — the planner raises it one step at a time |
 | rescorer | per-class score calibration α_c (α=0 is off) |
 | lora | YOLOE tail fine-tune with λ interpolation (λ=0 is the base) |
 | crop_classifier | SigLIP2+LoRA re-classification of detections |

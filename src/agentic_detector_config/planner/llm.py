@@ -301,6 +301,8 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                    "adopted": c.get("adopted"), "skipped": c.get("skipped")}
             if c.get("fit_dev_micro_f_beta") is not None:
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
+            if "tiling_used" in c:
+                row["tiling_used"] = c["tiling_used"]
             if c.get("note"):
                 row["note"] = str(c["note"])[:MAX_NOTE]
             ev = evaluated.get(c.get("id"))
@@ -336,6 +338,12 @@ Rules:
   higher on the holdout and still be rejected for being within noise: gate_delta > 0
   with gate_ci_lo < 0 means "close, but unproven" — a variant of that direction
   is often worth one more try, while a clearly negative gate_delta is not.
+- "tiling" is a grid g: every image is also cut into g x g tiles and each tile
+  is detected at magnification (g-1)(1-overlap)+1 (1.5x at g=2, 2x at g=3 with
+  overlap 0.5), costing 1 + g^2 detector passes per image. Raise g one step at a
+  time. A history row with tiling_used=false means no class benefited from that
+  grid on fit_dev (the setting fell back to no tiling); tiling_used=true on an
+  adopted grid while small-object misses remain suggests trying g+1.
 - If nothing promising remains, return stop=true with no candidates.
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that

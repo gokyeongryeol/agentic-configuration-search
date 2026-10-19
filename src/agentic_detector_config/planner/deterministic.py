@@ -7,7 +7,7 @@ matches the README's FP/FN diagnosis section.
 
 from __future__ import annotations
 
-from .axes import BASELINE, validate_axes
+from .axes import BASELINE, TILING_GRIDS, validate_axes
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -23,7 +23,9 @@ REMEDY: dict[str, tuple] = {
     # first, lora gets pushed out, and alias is often rejected for empty material.
     "missed": (("exemplar", "base"), ("exemplar", "fn_arm"), ("lora", True),
                ("alias", "vlm")),
-    "missed_small": (("tiling", True),),
+    # tiling raises grid g one step at a time — a g at or below the champion's is
+    # not a remedy (propose's step-up rule). The first value is the cheapest zoom.
+    "missed_small": tuple(("tiling", g) for g in TILING_GRIDS),
     # below_threshold = detected but did not clear τ_c. Scores can be raised not
     # only by calibration (rescorer) but also by better prompts (exemplar), a
     # better detector (lora), and re-classification (crop_classifier). rescorer
@@ -112,6 +114,9 @@ def propose(history: list[dict], diagnosis: dict, *,
             # exemplar step-up rule: fn_arm only after base
             if axis == "exemplar" and value == "fn_arm" \
                     and champion["exemplar"] == "none":
+                continue
+            # tiling step-up rule: only grids larger than the adopted one
+            if axis == "tiling" and champion["tiling"] and value <= champion["tiling"]:
                 continue
             try:
                 axes = validate_axes({**champion, axis: value},

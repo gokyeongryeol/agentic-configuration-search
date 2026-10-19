@@ -27,8 +27,8 @@ mine:
   visual_negative_min_score: 0.02   # FP pool score floor matched to YOLOE's score scale (default 0.05)
 search:
   neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # suppression IoU threshold sweep
-  tiling_configs:
-    - {grid: 2, overlap: 0.33, merge: nmm}   # 2×2 tiles, 384px each on a 640² image
+  tiling_overlap: 0.33     # grid 2 → 2×2 tiles of 384px on a 640² image
+  tiling_merge: nmm
 lora:                      # tail fine-tune + λ-interpolation arms
   epochs: 10
   batch_size: 8

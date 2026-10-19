@@ -8,6 +8,12 @@ a text prompt of the class name alone.
 
 from __future__ import annotations
 
+# tiling axis value = grid g — each image is cut into g×g tiles
+# (core.tiling.grid_tiles). Zoom (g-1)(1-o)+1, 1+g² detector passes per image
+# (o = search.tiling_overlap). The cap 6 (37 passes) is set by cost — when a grid
+# falls short the planner raises it one step at a time.
+TILING_GRIDS: tuple[int, ...] = (2, 3, 4, 5, 6)
+
 AXES: dict[str, tuple] = {
     "exemplar": ("none", "base", "fn_arm"),   # visual exemplar (fn_arm ⊃ base)
     # The value is the **crop→text converter** that produces alias phrases.
@@ -21,7 +27,7 @@ AXES: dict[str, tuple] = {
     #   background = captions of FPs not overlapping any GT (suppress background FPs)
     "text_negatives": (False, "fp_crop", "gt_crop", "background"),
     "visual_negatives": (False, True),                # visual negatives + neg_eta grid
-    "tiling": (False, True),                  # tiling grid (search.tiling_configs)
+    "tiling": (False, *TILING_GRIDS),         # grid g (see TILING_GRIDS above)
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
     "crop_classifier": (False, True),         # re-classify detections (fixes class_confusion, drops background FPs)
@@ -67,6 +73,11 @@ def validate_axes(axes: dict, *, n_classes: int | None = None) -> dict:
         raise ValueError(f"axes: unknown key {unknown} — allowed: {sorted(AXES)}")
     full = {**BASELINE, **axes}
     for k, v in full.items():
+        # 1 == True and 2.0 == 2, so `in` alone lets types leak in — tiling is an int grid
+        if k == "tiling" and v is not False and (
+                isinstance(v, bool) or not isinstance(v, int)):
+            raise ValueError(f"axes.tiling: {v!r} must be one of {AXES[k]} "
+                             "(grid g — an integer)")
         if v not in AXES[k]:
             raise ValueError(f"axes.{k}: {v!r} must be one of {AXES[k]}")
     # Visual negatives ride only on semantic queries — cannot be on without exemplars

@@ -92,24 +92,20 @@ def test_dataset_notes_must_be_string():
         config_from_dict({**BASE, "dataset_notes": ["list", "forbidden"]})
 
 
-def test_tiling_configs_default_is_resolution_relative():
-    """Default tile grids use the grid form — absolute px slices grew the tile count
-    quadratically at high resolution and made a round several times longer."""
-    for t in config_from_dict(BASE).search.tiling_configs:
-        assert "grid" in t and "slice" not in t
+def test_tiling_grid_comes_from_axis_not_config():
+    """The tile grid (grid g) is a planner-chosen axis value — config keeps only the
+    overlap and merge shared by every grid. The old tiling_configs list is an unknown key."""
+    s = config_from_dict(BASE).search
+    assert s.tiling_overlap == 0.5 and s.tiling_merge == "nmm"
+    with pytest.raises(ConfigError, match="tiling_configs"):
+        config_from_dict({**BASE, "search": {"tiling_configs": [
+            {"grid": 2, "overlap": 0.5, "merge": "nmm"}]}})
 
 
-@pytest.mark.parametrize("bad", [
-    {"overlap": 0.25},                                    # no grid
-    {"grid": 2, "slice": [320, 320], "overlap": 0.25},    # slice not supported
-    {"grid": 1, "overlap": 0.25},                         # 1 = no tiles
-    {"grid": 2.5, "overlap": 0.25},
-    {"grid": 2, "overlap": 1.0},
-    {"grid": 2, "overlap": -0.1},
-    {"slice": [416, 416], "overlap": 0.25, "merge": "nmm"},  # old form
-    {"grid": 2, "overlap": 0.25, "merge": "union"},
-    {"grid": 2, "overlap": 0.25, "zoom": 2},              # typo / unknown key
+@pytest.mark.parametrize("key,value", [
+    ("tiling_overlap", 1.0), ("tiling_overlap", -0.1), ("tiling_overlap", "0.5"),
+    ("tiling_merge", "union"),
 ])
-def test_bad_tiling_config_errors(bad):
-    with pytest.raises(ConfigError, match="search.tiling_configs"):
-        config_from_dict({"dataset": "x", "search": {"tiling_configs": [bad]}})
+def test_bad_tiling_params_error(key, value):
+    with pytest.raises(ConfigError, match=f"search.{key}"):
+        config_from_dict({**BASE, "search": {key: value}})
