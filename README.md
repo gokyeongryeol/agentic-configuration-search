@@ -55,7 +55,7 @@ Datasets use the Roboflow layout (`train/`, `valid/`, `test/`).
 
 | split | role |
 |---|---|
-| `train` (80% `fit_train` / 20% `fit_dev`) | builds all materials (prompts, fine-tunes, classifiers); `fit_dev` scores candidates |
+| `train` (80% `fit_train` / 20% `fit_dev`) | builds all materials — prompts from all of `train`, tail fine-tune / rescorer / crop classifier trained on `fit_train`; `fit_dev` scores candidates |
 | `valid` (holdout) | per-class thresholds τ_c, adoption decision, saturation |
 | `test` | never read by the loop — measures the final champion once |
 

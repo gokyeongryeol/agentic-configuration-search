@@ -1,4 +1,4 @@
-"""Round wiring for the crop classifier axis — trained on train, scored on fit_dev.
+"""Round wiring for the crop classifier axis — trained on fit_train, scored on fit_dev.
 
 Like lora, this is a "detector-state candidate": it loads an
 artifact into the in-process detector client, so the runner handles it after
@@ -9,6 +9,12 @@ champion's artifact, or None) when not adopted.
 threshold — **estimated on fit_dev**. Using tau_test (the holdout estimate)
 would let the holdout pick training material and break material purity. This
 module never receives the holdout split.
+
+**Training uses fit_train only** — the arm is scored by its fit_dev Δ. If fit_dev
+crops were in the training material (previously all of train), scoring would be
+an in-sample comparison on crops the classifier had already seen and the margin
+would filter nothing. Same discipline as lora (trained on fit_train, scored on
+fit_dev).
 """
 
 from __future__ import annotations
@@ -42,8 +48,8 @@ def run_classifier_candidate(cfg, ds, base_axes: dict, materials, out_dir: Path,
     base_setting = screen_fn(materials, base_axes)
     base_f = base_setting["fit_dev_micro_f_beta"]
 
-    # train pass (base_setting configs as-is) -> mine with fit_dev thresholds
-    train = ds.train
+    # fit_train pass (base_setting configs as-is) -> mine with fit_dev thresholds
+    train = ds.fit_train
     paths = [train.image_path(e) for e in train.images]
     grid = {c["config_id"]: c for c in base_setting["configs"]}
     groups = chosen_groups(base_setting["per_class"])

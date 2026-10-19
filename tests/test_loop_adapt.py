@@ -239,3 +239,49 @@ def test_resume_restores_server_state(root, tmp_path, monkeypatch):
     # a run that does not own the server (no detector_hooks) skips silently
     bare = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "r2")
     bare._restore_detector_state({"weights": "/w", "adapt_root": "/a"})
+
+
+def test_classifier_trains_on_fit_train_only(root, tmp_path, monkeypatch):
+    """The arm is scored by its fit_dev Δ — if fit_dev crops are in the training
+    material, scoring becomes an in-sample comparison on crops the classifier has
+    already seen, and the margin filters nothing. Training uses fit_train only."""
+    from agentic_detector_config.core.data import load_dataset
+    import agentic_detector_config.loop.adapt_round as ar
+
+    server = FakeAdapt()
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
+    seen: dict = {}
+    real_mine = ar.mine_classifier_crops
+
+    def spy_mine(split, ontology, dets_by_image, thresholds, out_dir):
+        seen["images"] = {e.file_name for e in split.images}
+        seen["n_dets"] = len(dets_by_image)
+        return real_mine(split, ontology, dets_by_image, thresholds, out_dir)
+
+    def train_fn(repo_root, *, manifest, **kw):
+        seen["manifest"] = [json.loads(l) for l in
+                            Path(manifest).read_text().splitlines()]
+        return _fake_train(tmp_path)(repo_root, manifest=manifest, **kw)
+
+    monkeypatch.setattr(ar, "mine_classifier_crops", spy_mine)
+    monkeypatch.setattr(ar, "train_crop_classifier", train_fn)
+    cfg = config_from_dict({
+        "dataset": str(root),
+        "crop_classifier": {"min_samples": 1, "min_background": 0, "margin": 0.01},
+    })
+    cand_file = tmp_path / "candidates.yaml"
+    cand_file.write_text("- id: fixcls\n  axes: {crop_classifier: true}\n")
+    run_rounds(root, out_dir=tmp_path / "run", planner="deterministic", rounds=1,
+               cfg=cfg, candidates_file=cand_file,
+               detector_hooks={"weights_ctl": lambda w: None, "adapt_ctl": server.ctl,
+                               "repo_root": tmp_path, "base_weights": tmp_path / "b"},
+               **_fakes())
+
+    ds = load_dataset(root, seed=0, fit_train_ratio=0.8)
+    fit_train = {e.file_name for e in ds.fit_train.images}
+    fit_dev_anns = {a.id for e in ds.fit_dev.images for a in e.annotations}
+    assert seen["images"] == fit_train
+    assert seen["n_dets"] == len(fit_train)          # the inference pass is fit_train only too
+    gt_ids = {int(Path(r["crop_path"]).stem.split("_")[1])
+              for r in seen["manifest"] if r["source"] == "train_gt"}
+    assert gt_ids and not (gt_ids & fit_dev_anns)
