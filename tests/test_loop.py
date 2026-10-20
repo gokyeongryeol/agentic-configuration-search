@@ -438,7 +438,8 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["bad_fn_k"]["skipped"] == "invalid_axes"
     assert "fn_k" in rec["bad_fn_k"].get("note", "")
-    assert "ok_tiling" in rec and rec["ok_tiling"].get("skipped") is None
+    # a valid candidate passes sanitization — it may still be rejected later (tiling_unused etc.)
+    assert "ok_tiling" in rec and rec["ok_tiling"].get("skipped") != "invalid_axes"
 
 
 def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
@@ -505,7 +506,7 @@ def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["g"]["skipped"] == "invalid_axes"
     assert rec["human_hg"]["skipped"] == "invalid_axes"
-    assert rec["t"].get("skipped") is None
+    assert rec["t"].get("skipped") != "invalid_axes"     # passes sanitization
 
 
 def test_tiling_variants_follow_axis_grid():
@@ -586,3 +587,82 @@ def test_untrainable_lora_never_reaches_tail_round(big_root, tmp_path, monkeypat
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["l"]["skipped"] == "invalid_axes" and "min_images" in rec["l"]["note"]
+
+
+# --- text-only tiling: measure whether tiles are actually used, align the label ---
+
+def _tile_helps_infer(by_path):
+    """Like _fake_infer, but the text pass finds class 2 only on a tile config."""
+    def fake(ctx, client, config, queries, ontology, image_paths,
+             alias_to_name=None, **kw):
+        semantic = bool(queries) and any("prompt_image" in q for q in queries)
+        tiled = config.get("tiling") is not None
+        return [[{"box": list(a.bbox_xyxy), "score": 0.9,
+                  "category_id": a.category_id, "sources": ["full"]}
+                 for a in by_path[str(p)].annotations
+                 if semantic or tiled or a.category_id == 1]
+                for p in image_paths]
+    return fake
+
+
+def _llm_tiling(messages, **kw):
+    return {"candidates": [{"id": "t2", "axes": {"tiling": 2},
+                            "rationale": "small objects"}], "stop": False}
+
+
+def _hist(run_dir):
+    return [json.loads(l) for l in (run_dir / "history.jsonl").read_text().splitlines()]
+
+
+def test_text_only_tiling_that_does_not_help_is_not_evaluated(big_root, tmp_path,
+                                                              monkeypatch):
+    """If screen picks an untiled config the candidate equals the champion —
+    reject it as tiling_unused without holdout evaluation, but keep it as tried."""
+    from agentic_detector_config.planner.axes import validate_axes
+    from agentic_detector_config.planner.deterministic import tried_combos
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+                     llm_chat=_llm_tiling, rounds=1, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    assert rec["skipped"] == "tiling_unused" and rec["tiling_used"] is False
+    assert "t2" not in (out.decisions[1].get("evaluated") or {})
+    key = tuple(sorted(validate_axes({"tiling": 2}).items()))
+    assert key in tried_combos(_hist(tmp_path / "run"))
+
+
+def test_text_only_tiling_that_helps_keeps_its_label(big_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway, "infer_config", _tile_helps_infer(_gt_lookup(big_root)))
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+                     llm_chat=_llm_tiling, rounds=1, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    assert rec.get("skipped") is None and rec["tiling_used"] is True
+    assert rec["axes"]["tiling"] == 2 and "requested_axes" not in rec
+    assert "t2" in out.decisions[1]["evaluated"]
+
+
+def test_untiled_setting_is_relabelled_with_request_kept():
+    """A candidate that requested tiling but differs from the champion through
+    other axes is evaluated, with its label corrected to the measured state (no
+    tiling) and the request kept in requested_axes — so the champion never
+    carries tiling it does not run, and the same request stays blocked."""
+    from agentic_detector_config.loop.runner import _relabel_untiled, _tiling_record
+    from agentic_detector_config.planner.axes import validate_axes
+    from agentic_detector_config.planner.deterministic import tried_combos
+    from agentic_detector_config.planner.llm import _tried_lines
+
+    setting = {"configs": [{"config_id": 0, "tiling": None},
+                           {"config_id": 1, "tiling": {"grid": 2}}],
+               "per_class": {1: {"config_id": 0}}}
+    entry = {"id": "x", "axes": validate_axes({"tiling": 2, "alias": "vlm"}),
+             "setting": setting}
+    _relabel_untiled(entry)
+    assert entry["axes"]["tiling"] is False and entry["axes"]["alias"] == "vlm"
+    assert entry["requested_axes"]["tiling"] == 2
+    assert _tiling_record(entry) == {"tiling_used": False}
+
+    hist = [{"round": 1, "champion": {"axes": validate_axes({})},
+             "candidates": [{"id": "x", "axes": entry["axes"],
+                             "requested_axes": entry["requested_axes"]}]}]
+    assert tuple(sorted(entry["requested_axes"].items())) in tried_combos(hist)
+    assert any("tiling=2" in l for l in _tried_lines(hist, validate_axes({})))

@@ -49,7 +49,9 @@ def select_shared_config(rows: list[dict], grid: list[dict]) -> dict[int, dict]:
         raise ValueError(
             "no common config evaluated for every class — grid evaluation is incomplete "
             f"(evaluated configs per class: { {cid: sorted(m) for cid, m in by_class.items()} })")
-    pick = max(common, key=lambda i: sum(m[i]["f_beta"] for m in by_class.values()))
+    # ties go to the smaller id — config 0 is untiled with negatives off, the cheapest
+    pick = max(sorted(common),
+               key=lambda i: sum(m[i]["f_beta"] for m in by_class.values()))
     return {cid: m[pick] for cid, m in by_class.items()}
 
 

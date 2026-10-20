@@ -77,14 +77,17 @@ def tried_combos(history: list[dict]) -> set[tuple]:
     out: set[tuple] = set()
     for entry in history:
         for c in entry.get("candidates", []):
-            axes = c.get("axes")
-            if not isinstance(axes, dict):
-                continue
-            try:
-                axes = validate_axes(axes)
-            except ValueError:
-                pass                      # old-format record — key it as-is
-            out.add(tuple(sorted(axes.items())))
+            # requested_axes: the original request of a candidate relabelled
+            # after measurement — the requested combination was tried too
+            # (blocking only the corrected axes lets the same request return)
+            for axes in (c.get("axes"), c.get("requested_axes")):
+                if not isinstance(axes, dict):
+                    continue
+                try:
+                    axes = validate_axes(axes)
+                except ValueError:
+                    pass                  # old-format record — key it as-is
+                out.add(tuple(sorted(axes.items())))
     return out
 
 

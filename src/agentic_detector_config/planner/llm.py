@@ -262,9 +262,12 @@ def _tried_lines(history: list[dict], champion: dict) -> list[str]:
     seen: dict[tuple, None] = {}
     for e in history:
         for c in e.get("candidates", []):
-            axes = c.get("axes")
-            if isinstance(axes, dict):
-                seen[tuple(sorted(axes.items()))] = None
+            # a relabelled candidate's original request is a tried combination
+            # too — the runner's combo filter (tried_combos) blocks it, so the
+            # prompt must list it or the planner re-proposes the same request
+            for axes in (c.get("axes"), c.get("requested_axes")):
+                if isinstance(axes, dict):
+                    seen[tuple(sorted(axes.items()))] = None
     lines = []
     for key in list(seen)[-MAX_TRIED:]:
         axes = dict(key)

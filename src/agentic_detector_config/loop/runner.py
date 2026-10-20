@@ -457,10 +457,30 @@ class Loop:
             if self._guard_material(c, materials, skipped):
                 return
             setting = self._screen(materials, c["axes"])
+        if self._tiling_unused(c, entry, setting, skipped):
+            return
         entry.update({"setting": setting,
                       "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
                       "_materials": materials})
+        _relabel_untiled(entry)
         screened.append(entry)
+
+    def _tiling_unused(self, c: dict, entry: dict, setting: dict,
+                       skipped: list) -> bool:
+        """Tiling was requested but screen picked an untiled config, which makes
+        the setting equal the champion's — reject without holdout evaluation
+        (True). It still counts as tried: the skipped row keeps the requested
+        axes, so tried_combos blocks it."""
+        if not entry["axes"].get("tiling") or _uses_tiling(setting):
+            return False
+        champ = (getattr(self, "_champion", None) or {}).get("axes")
+        if champ is None or {**entry["axes"], "tiling": False} != champ:
+            return False
+        log.info("candidate %s: screen picked an untiled config — same as champion", c["id"])
+        skipped.append({**c, "skipped": "tiling_unused", "tiling_used": False,
+                        "note": f"tiling={entry['axes']['tiling']}: screen picked an "
+                                "untiled config — same setting as champion, evaluation skipped"})
+        return True
 
     # ------------------------------------------------------------- rounds
 
@@ -627,9 +647,11 @@ class Loop:
                      "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
                                              default=0.0),
                      "lora": res["decision"]}
+            _relabel_untiled(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]})
+                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
+                            | _requested(entry))
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", "")})
@@ -687,10 +709,12 @@ class Loop:
                      "fit_dev_micro_f_beta":
                          res["setting"]["fit_dev_micro_f_beta"],
                      "crop_classifier": res["decision"]}
+            _relabel_untiled(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")}
-                            | {"crop_classifier": res["decision"]})
+                            | {"crop_classifier": res["decision"]}
+                            | _requested(entry))
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -766,7 +790,7 @@ class Loop:
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
-                            | _tiling_record(c)
+                            | _tiling_record(c) | _requested(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -860,17 +884,37 @@ def _tiling_variants(search, axes: dict) -> tuple:
              "merge": search.tiling_merge},)
 
 
-def _tiling_record(c: dict) -> dict:
-    """For a tiling candidate, whether screen actually assigned a tile config — the
-    signal the planner reads to raise or drop the zoom. False means that grid helped
-    no class on fit_dev, and the candidate's setting equals tiling off despite its axes."""
-    if not c["axes"].get("tiling") or not c.get("setting"):
-        return {}
-    setting = c["setting"]
+def _uses_tiling(setting: dict) -> bool:
+    """Whether any pass the setting actually runs uses a tile config."""
     configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
-    used = any(configs.get(e["config_id"], {}).get("tiling")
-               for e in setting.get("per_class", {}).values())
-    return {"tiling_used": bool(used)}
+    return any(configs.get(e["config_id"], {}).get("tiling")
+               for e in (setting.get("per_class") or {}).values())
+
+
+def _tiling_record(c: dict) -> dict:
+    """For a candidate that requested tiling, whether screen actually assigned a
+    tile config — the signal the planner reads to raise or drop the zoom. False
+    means that grid helped no class on fit_dev. The request survives relabelling
+    in requested_axes, so read that first."""
+    requested = c.get("requested_axes") or c["axes"]
+    if not requested.get("tiling") or not c.get("setting"):
+        return {}
+    return {"tiling_used": _uses_tiling(c["setting"])}
+
+
+def _relabel_untiled(entry: dict) -> None:
+    """Tiling was requested but the setting uses no tile — correct axes to the
+    measured state (no tiling) and keep the request in requested_axes. A
+    champion labelled with tiling it never runs would credit other axes' gains
+    to tiling, and the next round's step-up would start from an unused zoom.
+    Same principle as the rescorer identity-refit relabel (_measured_axes)."""
+    if entry["axes"].get("tiling") and not _uses_tiling(entry["setting"]):
+        entry["requested_axes"] = dict(entry["axes"])
+        entry["axes"] = {**entry["axes"], "tiling": False}
+
+
+def _requested(c: dict) -> dict:
+    return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
 
 
 def _stagnant(decision: dict, epsilon: float) -> bool:
