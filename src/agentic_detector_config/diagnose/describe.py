@@ -32,7 +32,11 @@ from .sample import pick_detail
 log = logging.getLogger(__name__)
 
 ARTIFACT = "crop_notes.json"
-CROPS_PER_CALL = 6       # crops per call — too many at once blurs the descriptions
+CROPS_PER_CALL = 4       # crops per call — too many at once blurs the descriptions,
+                         # and servers cap images per prompt: under vLLM
+                         # --limit-mm-per-prompt=4 a batch of 6 is rejected **whole**
+                         # (400, no notes at all). The default must stay under the
+                         # cap — over it the result is not fewer notes but none.
 MIN_CROP_PX = 96         # upscale if the short side is smaller — error crops are
                          # often a few dozen px, too small for the VLM to read shape
 
