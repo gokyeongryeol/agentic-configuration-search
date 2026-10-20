@@ -327,7 +327,10 @@ VLM_CAPTION_SCHEMA = {
     },
 }
 
-VLM_BATCH = 8            # crops shown per call — more blurs the descriptions
+VLM_BATCH = 4            # crops shown per call — more blurs the descriptions, and a
+                         # server capping images per prompt (--limit-mm-per-prompt)
+                         # rejects an over-limit batch whole (400). Same as
+                         # diagnose.describe.CROPS_PER_CALL.
 
 
 def vlm_caption(rows: list[dict], chat, *, open_image=None,

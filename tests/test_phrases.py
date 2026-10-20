@@ -130,3 +130,13 @@ def test_vlm_caption_rows_contract():
     assert len(uris) == 2 and uris[0]["image_url"]["url"].startswith("data:image")
     # a broken response yields an empty result instead of an exception — mining degrades to no material
     assert vlm_caption(rows, lambda m, **k: {"bad": 1}, open_image=lambda p: img) == {}
+
+
+def test_vlm_batches_stay_under_server_image_limit():
+    """Both paths that send crops to the VLM in batches (the alias=vlm captioner
+    and diagnosis crop notes) keep the same limit — a server capping images per
+    prompt (--limit-mm-per-prompt) rejects an over-limit batch whole (400)."""
+    from agentic_detector_config.diagnose import describe
+    from agentic_detector_config.infer import phrases
+
+    assert phrases.VLM_BATCH == describe.CROPS_PER_CALL <= 4
