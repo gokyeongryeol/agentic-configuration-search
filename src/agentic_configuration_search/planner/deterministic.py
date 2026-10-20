@@ -7,7 +7,7 @@ cause→remedy mapping.
 
 from __future__ import annotations
 
-from .axes import BASELINE, TILING_GRIDS, DatasetFacts, validate_axes
+from .axes import BASELINE, TILING_GRIDS, DatasetFacts, uses_disabled_axes, validate_axes
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -82,6 +82,46 @@ def tried_combos(history: list[dict]) -> set[tuple]:
                 except ValueError:
                     pass                  # old-format record — key it as-is
                 out.add(tuple(sorted(axes.items())))
+    return out
+
+
+def carryover(history: list[dict], disabled_axes=(), disabled_values=None, *,
+              facts: DatasetFacts | None = None) -> list[dict]:
+    """Carry over candidates that passed the gate last round but lost to the winner.
+
+    A round adopts one candidate (largest Δ), so the other gate passers are
+    dropped even though they beat the champion. The axes such a candidate
+    changed relative to the previous champion are applied on top of the **new**
+    champion and returned as next-round candidates — a single increment over the
+    new champion keeps attribution clean, and nothing is merged within the round
+    (which would reuse holdout). Pure function of history, so resume yields the
+    same candidates. Skipped when the result equals the new champion, is blocked
+    by the data (facts), or turns on a disabled axis/value.
+    """
+    if len(history) < 2:
+        return []
+    last, prev = history[-1], history[-2]
+    base = (prev.get("champion") or {}).get("axes") or BASELINE
+    try:
+        champ = validate_axes((last.get("champion") or {}).get("axes") or BASELINE)
+    except ValueError:
+        return []
+    out = []
+    for c in last.get("candidates", []):
+        if not c.get("gate_passed_but_lost"):
+            continue
+        delta = {k: v for k, v in (c.get("axes") or {}).items() if base.get(k) != v}
+        try:
+            axes = validate_axes({**champ, **delta}, facts=facts)
+        except ValueError:
+            continue
+        if not delta or axes == champ:
+            continue
+        if uses_disabled_axes(axes, disabled_axes, disabled_values, base=champ):
+            continue
+        out.append({"id": f"carry_{c['id']}", "axes": axes, "source": "carryover",
+                    "rationale": f"passed the gate in round {last.get('round')} but lost "
+                                 "to the adopted candidate — carried onto the new champion"})
     return out
 
 

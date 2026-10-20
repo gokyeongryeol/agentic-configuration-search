@@ -698,3 +698,28 @@ def test_forwards_recorded_on_champion_and_candidates(big_root, tmp_path, monkey
     assert all("forwards_per_image" in h["champion"] for h in hist)
     screened = [c for c in hist[1]["candidates"] if not c.get("skipped")]
     assert screened and all(c["forwards"] >= 1 for c in screened)
+
+
+def test_gate_passer_that_lost_is_carried_to_next_round(big_root, tmp_path, monkeypatch):
+    """When two candidates pass the gate in one round, only the larger Δ is adopted.
+    The other is recorded as gate_passed_but_lost and carried onto the new
+    champion in the next round."""
+    monkeypatch.setattr(gateway, "infer_config", _tile_helps_infer(_gt_lookup(big_root)))
+    human = tmp_path / "candidates.yaml"
+    human.write_text("- {id: ex, axes: {exemplar: base}}\n"
+                     "- {id: t2, axes: {tiling: 2}}\n")
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+                     rounds=2, candidates_file=human, **_fakes())
+    hist = _hist(tmp_path / "run")
+    r1 = {c["id"]: c for c in hist[1]["candidates"]}
+    passed = [i for i, ev in out.decisions[1]["evaluated"].items() if ev["gate"]["adopted"]]
+    assert len(passed) == 2, f"invalid scenario — both must pass the gate: {out.decisions[1]}"
+    loser = next(i for i in passed if i != out.decisions[1]["id"])
+    assert r1[loser]["gate_passed_but_lost"] is True
+    assert not r1[out.decisions[1]["id"]].get("gate_passed_but_lost")
+    r2 = {c["id"]: c for c in hist[2]["candidates"]}
+    carried = r2.get(f"carry_{loser}")
+    assert carried is not None and carried.get("source") == "carryover"
+    champ = hist[1]["champion"]["axes"]
+    assert all(carried["axes"][k] == v for k, v in champ.items()
+               if k not in ("tiling", "exemplar", "exemplar_k"))

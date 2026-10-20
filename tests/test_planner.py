@@ -785,3 +785,60 @@ def test_llm_prompt_and_response_drop_untrainable_lora(tmp_path):
     assert [c["id"] for c in out["candidates"]] == ["t"]
     assert out["dropped"][0]["id"] == "l"
     assert out["dropped"][0]["skipped"] == "invalid_axes"
+
+
+# ------------------------- carry-over of gate passers that lost to the winner
+
+def _carry_history(lost_axes, *, winner_axes, base_axes=None):
+    base = validate_axes(base_axes or {})
+    win = validate_axes(winner_axes)
+    return [{"round": 0, "champion": {"axes": base}, "candidates": []},
+            {"round": 1, "champion": {"axes": win},
+             "candidates": [{"id": "w", "axes": win, "adopted": True},
+                            {"id": "l", "axes": validate_axes(lost_axes),
+                             "adopted": False, "gate_passed_but_lost": True},
+                            {"id": "x", "axes": validate_axes({"alias": "vlm"}),
+                             "adopted": False}]}]
+
+
+def test_carryover_puts_lost_axis_on_new_champion():
+    """A candidate that passed the gate but lost to the winner comes back next
+    round as 'new champion + the axes it changed' — a single increment over the
+    new champion, so attribution stays clean."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    out = deterministic.carryover(hist)
+    assert [c["id"] for c in out] == ["carry_l"]
+    assert out[0]["axes"] == validate_axes({"exemplar": "base", "rescorer": True})
+    assert out[0]["source"] == "carryover"
+
+
+def test_carryover_skips_invalid_identical_or_disabled():
+    from agentic_configuration_search.planner.axes import DatasetFacts
+    # nothing to carry if it equals the new champion
+    assert deterministic.carryover(
+        _carry_history({"exemplar": "base"}, winner_axes={"exemplar": "base"})) == []
+    # combinations the data blocks (facts) are not carried
+    small = DatasetFacts(n_classes=2, n_fit_train=5, lora_min_images=20)
+    assert deterministic.carryover(
+        _carry_history({"lora": True}, winner_axes={"exemplar": "base"}),
+        facts=small) == []
+    # nor are ones that turn on a disabled axis
+    assert deterministic.carryover(
+        _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"}),
+        disabled_axes=("rescorer",)) == []
+    assert deterministic.carryover([]) == []
+
+
+def test_llm_prompt_lists_carried_candidates_only_when_present(tmp_path):
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["p"] = messages[-1]["content"]
+        return {"candidates": [], "stop": True}
+
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    LLMPlanner(chat=chat, artifact_dir=tmp_path / "a").propose(hist, {})
+    assert "Re-queued automatically" in seen["p"]
+    assert "rescorer=True" in seen["p"].split("Re-queued automatically", 1)[1][:400]
+    LLMPlanner(chat=chat, artifact_dir=tmp_path / "b").propose(hist[:1], {})
+    assert "Re-queued automatically" not in seen["p"]
