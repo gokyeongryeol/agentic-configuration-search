@@ -102,7 +102,11 @@ class RescorerCfg:
     """
     min_samples: int = 64             # tripwire for fitting the discriminator (fit_train rows)
     min_samples_per_class: int = 50   # per-class sample floor for choosing α (fit_dev rows)
-    alphas: list = field(default_factory=lambda: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0])
+    # If the top end is picked often, the range caps the search — at 4 P̂ nearly
+    # overrides the raw score. Ties pick the smaller α, so a larger α wins only
+    # when it is clearly better on fit_dev.
+    alphas: list = field(default_factory=lambda: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0,
+                                                  3.0, 4.0])
     margin: float = 0.005             # adopt α>0 only if the fit_dev F(β) gain exceeds this
     ensemble_members: int = 5         # discriminator ensemble size
     inner_folds: int = 5              # for the oof_phat diagnostic

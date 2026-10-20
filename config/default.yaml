@@ -94,7 +94,7 @@ search:                                   # value space of the screen (fit_dev) 
 rescorer:                                 # discriminator on fit_train + α grid on fit_dev
   min_samples: 64                         # discriminator fit tripwire — below this P̂ degenerates to a constant
   min_samples_per_class: 50               # adequate per-class sample count for the α decision (fit_dev rows)
-  alphas: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0] # 0.0 required — not adopting means exactly the current setting
+  alphas: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 4.0] # 0.0 required — not adopting means exactly the current setting
   margin: 0.005                           # adopt α>0 only if the fit_dev F(β) gain exceeds this
   ensemble_members: 5
   inner_folds: 5                          # for the oof_phat diagnostic
