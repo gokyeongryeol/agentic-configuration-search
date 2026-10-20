@@ -55,7 +55,7 @@ def test_decision_changes_when_holdout_changes(dataset_root, tmp_path, monkeypat
 
     assert dec_a != dec_b, \
         "decision unchanged under perturbed holdout GT — the decision does not come from holdout"
-    # concretely: the holdout micro F1 in the baseline adoption record must differ
+    # concretely: the holdout micro F(β) in the baseline adoption record must differ
     assert dec_a[0]["micro_f_beta"] != pytest.approx(dec_b[0]["micro_f_beta"])
 
 
@@ -78,12 +78,10 @@ def test_arm_candidate_with_rescorer_is_gated_on_calibrated_channel(
     """If an arm-path candidate (lora, crop classifier) refit the rescorer, the holdout
     evaluation the gate sees must also be on the **rescored channel**.
 
-    Breakage is silent. With the champion scored on the rescored channel and the
-    candidate on raw scores, the paired Δ becomes "candidate − rescorer layer" rather
-    than "the candidate's increment" — the arm axis competes handicapped by the
-    rescorer's gain (a compound Δ). Conversely, if such a candidate is adopted, raw-score
-    records land in the ledger and next round's rescored candidates get a free gain
-    equal to the channel gap.
+    On different channels the paired Δ becomes "candidate − rescorer layer" rather
+    than the candidate's increment, so the arm axis competes handicapped by the
+    rescorer's gain; if adopted, raw-score records land in the ledger and next
+    round's candidates get a free gain equal to the channel gap.
     """
     from agentic_detector_config.config import config_from_dict
     from agentic_detector_config.infer import gateway
@@ -168,11 +166,9 @@ class _FakeDetectorState:
 
 def _human_candidates_only(monkeypatch):
     """The detector-state scenarios only hold if the human-injected candidates are
-    what gets evaluated — when a deterministic proposal carries the same axes
-    combination, combo dedup keeps the planner's (earlier) candidate and folds the
-    human_* one. With the fixture's FNs classified as missed, deterministic proposes
-    lora=True and exactly that happens. These scenarios measure detector state, not
-    the planner, so planner proposals are emptied (the judgment assertions are unchanged)."""
+    what gets evaluated — if deterministic proposes the same axes combination, combo
+    dedup folds the human_* one. These scenarios measure detector state, not the
+    planner, so planner proposals are emptied (the judgment assertions are unchanged)."""
     from agentic_detector_config.planner import deterministic
     monkeypatch.setattr(deterministic, "propose",
                         lambda history, diagnosis, **kw: {

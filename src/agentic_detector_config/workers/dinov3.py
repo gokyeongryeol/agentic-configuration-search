@@ -1,8 +1,8 @@
 """One-shot worker for DINOv3 crop embeddings.
 
-**Runs with the vLLM venv python (`services.paths.VLLM_VENV`)**, where torch and
-transformers already exist as vLLM dependencies. The package proper has no torch,
-so in-process loading is impossible; exiting also releases the GPU entirely.
+**Runs with the worker venv python (`services.paths.VLLM_VENV`)**, which must have
+torch and transformers. The package proper has no torch, so in-process loading
+is impossible; exiting also releases the GPU entirely.
 
 Hence this file **imports only stdlib + torch + transformers + numpy + PIL** — it
 must not import agentic_detector_config modules.
@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 
-# Feeding all crops to ViT-L at once OOMs on ~60GB of activations.
+# Feeding all crops at once OOMs on activations — split into mini-batches.
 BATCH = 64
 
 

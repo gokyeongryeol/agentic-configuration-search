@@ -1,4 +1,4 @@
-"""Holdout evaluation — τ_c estimation, micro F1, adoption gate.
+"""Holdout evaluation — τ_c estimation, micro F(β), adoption gate.
 
 τ_c is the **single channel estimated on the holdout** (the explicit exception
 to the materials-purity guard — tests/test_materialize_purity.py). The field is
@@ -7,8 +7,7 @@ Adoption and saturation are decided by a paired bootstrap CI over the records
 produced here.
 
 The holdout is read only **after** the setting has been fixed by screen
-(fit_dev). It changes only τ and the adoption decision, never the materials
-(materials-purity invariant).
+(fit_dev). It changes only τ and the adoption decision, never the materials.
 """
 
 from __future__ import annotations
@@ -25,13 +24,11 @@ log = logging.getLogger(__name__)
 def score_setting(cfg, client, split, ontology, setting: dict,
                   materials: Materials, *,
                   return_embeddings: bool = False) -> dict:
-    """Infer the setting on `split` → re-estimate thresholds on that split → micro F1.
+    """Infer the setting on `split` → re-estimate thresholds on that split → micro F(β).
 
     The thresholds carried in per_class (used for fit_dev scoring) are
-    **discarded**; F1-max thresholds are re-estimated on the target split.
-    Applied to the holdout, these are `tau_test`. LoRA-arm fit_dev scoring uses
-    the same procedure — arms are comparable only if scoring and holdout
-    evaluation run through the same code.
+    **discarded**; F(β)-max thresholds are re-estimated on the target split.
+    Applied to the holdout, these are `tau_test`.
     """
     per_class = setting["per_class"]
     if not per_class:
@@ -67,7 +64,8 @@ def score_setting(cfg, client, split, ontology, setting: dict,
 
 def evaluate_on_holdout(cfg, client, test_split, ontology, setting: dict,
                      materials: Materials) -> dict:
-    """Infer the fixed setting on the holdout → estimate `tau_test` → micro F1."""
+    """Infer the fixed setting on the holdout (the argument name test_split is
+    legacy) → estimate `tau_test` → micro F(β)."""
     out = score_setting(cfg, client, test_split, ontology, setting, materials)
     out["tau_test"] = out.pop("thresholds")
     return out
@@ -86,8 +84,8 @@ def gate(champion_records: list[dict], candidate_records: list[dict], *,
          cat_ids: list[int], iou_thr: float, margin: float,
          n_boot: int = 2000, seed: int = 0, alpha: float = 0.05,
          beta: float = 1.0) -> dict:
-    """Adoption gate — adopt only if the paired-bootstrap CI lower bound of
-    Δ micro F1 clears the margin. Otherwise the champion stays, unchanged.
+    """Adoption gate — adopt only if the paired-bootstrap one-sided lower bound
+    of Δ micro F(β) is ≥ margin and Δ > 0. Otherwise the champion stays, unchanged.
 
     Both record lists must cover **the same holdout images in the same order**
     (paired) — metrics.bootstrap_ci raises on a length mismatch.

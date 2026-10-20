@@ -56,7 +56,7 @@ class PlannerCfg:
 
 @dataclass(frozen=True)
 class GateCfg:
-    margin: float = 0.0                  # adopt iff lower CI bound of Δ micro F(β) > margin
+    margin: float = 0.0                  # adopt iff holdout Δ micro F(β) CI lower bound ≥ margin and Δ > 0
     bootstrap: int = 2000                # number of paired bootstrap resamples
     confidence: float = 0.95
 
@@ -86,9 +86,9 @@ class LoraCfg:
     uses fit_train, λ scoring uses fit_dev. λ=0 is in the grid, so without a
     proven gain the result is exactly base. (The axis name `lora` is kept for
     history-artifact compatibility.)"""
-    min_images: int = 20             # skip (keep base) if fit_train has fewer images
+    min_images: int = 20             # block lora candidates if fit_train has fewer images (DatasetFacts)
     lambdas: list = field(default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0])
-    margin: float = 0.01             # adopt only if fit_dev ΔF(β) exceeds this
+    margin: float = 0.01             # adopt the arm only if fit_dev ΔF(β) exceeds this
     epochs: int = 10
     batch_size: int = 8
     lr: float = 1e-3                 # AdamW lr0 (the worker pins optimizer=AdamW)
@@ -102,7 +102,11 @@ class RescorerCfg:
     """
     min_samples: int = 64             # tripwire for fitting the discriminator (fit_train rows)
     min_samples_per_class: int = 50   # per-class sample floor for choosing α (fit_dev rows)
-    alphas: list = field(default_factory=lambda: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0])
+    # If the top end is picked often, the range caps the search — at 4 P̂ nearly
+    # overrides the raw score. Ties pick the smaller α, so a larger α wins only
+    # when it is clearly better on fit_dev.
+    alphas: list = field(default_factory=lambda: [0.0, 0.1, 0.25, 0.5, 1.0, 2.0,
+                                                  3.0, 4.0])
     margin: float = 0.005             # adopt α>0 only if the fit_dev F(β) gain exceeds this
     ensemble_members: int = 5         # discriminator ensemble size
     inner_folds: int = 5              # for the oof_phat diagnostic
@@ -126,24 +130,23 @@ class SearchCfg:
     the grid's value space."""
     max_threshold_candidates: int = 50
     # Tie tolerance for τ_c. Among points whose F(β) is within this band, pick the
-    # one with the **largest margin above the next observed score below**
-    # (core.metrics). 0 uses the plain F(β)-max candidate — that rule keeps the
-    # lowest τ on ties and sits right on top of a noise cluster with no margin.
+    # one with the largest margin above the next observed score below
+    # (core.metrics). 0 uses the plain F(β)-max candidate.
     tau_tolerance: float = 0.005
     # Grid of suppression IoU thresholds for emulated negatives (neg_eta)
     neg_eta_grid: list = field(default_factory=lambda: [0.25, 0.35, 0.5, 0.65, 0.75])
     # Parameters shared by every tiling grid — the grid g itself is the value of
     # the planner-chosen tiling axis (planner.axes.TILING_GRIDS). Tiles are an
-    # image-relative g×g, so tile count (= cost) and zoom (g-1)(1-overlap)+1 do
-    # not depend on resolution. At overlap 0.5, grid 2 and 3 match the old 640px
-    # slice 416 / 320 in tile count and zoom (1.5x / 2.0x). merge=nmm unions only
-    # fragments touching a seam (containment union would swallow instances).
+    # image-relative g×g, so tile count and zoom (g-1)(1-overlap)+1 do not depend
+    # on resolution. merge=nmm unions only fragments touching a seam (containment
+    # union would swallow instances).
     tiling_overlap: float = 0.5
     tiling_merge: str = "nmm"
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
-    # Axes that may not be proposed in this run — unwireable axes are blocked at
+    # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
-    # (deterministic and LLM prompt) and by candidate sanitization.
+    # (deterministic and LLM prompt) and by candidate sanitization; a value the
+    # champion already has is inherited, not blocked.
     disabled_axes: list = field(default_factory=list)
     # Forbid specific values of an axis — {axis: [value, ...]} (e.g. a material
     # source the backend does not support). Honored by the same three places
@@ -159,13 +162,10 @@ class MineCfg:
     exemplars_per_class: int = 4          # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
     # Outlier trim before kcenter — drop only candidates whose centroid distance
-    # exceeds median + k·MAD (0 = off). A fixed-fraction trim (top 20%) always
-    # dropped candidates even with no outliers, 2 of ~10 per class on few-shot
-    # datasets. 3.0 is about 3σ under a normal distribution.
+    # exceeds median + k·MAD (0 = off). 3.0 is about 3σ under a normal distribution.
     kcenter_outlier_mad: float = 3.0
-    # The FN arm trims less than base (a larger multiple) — the FN set is noisy
-    # (truncation, occlusion, label errors cluster there), but its purpose is broad
-    # coverage of missed appearances, so over-trimming diversity defeats the axis.
+    # The FN arm trims less than base (a larger multiple) — filter the noise but
+    # keep the diversity that broadly covers missed appearances.
     fn_kcenter_outlier_mad: float = 3.5
     fn_exemplars_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
@@ -174,7 +174,7 @@ class MineCfg:
     visual_negatives_per_class: int = 1
     visual_negative_min_score: float = 0.05
     visual_negative_exclude_gt_iom: float = 0.7
-    embedder_model: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"  # gated — needs HF_TOKEN
+    embedder_model: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"  # gated — HF_TOKEN, or cache + HF_HUB_OFFLINE=1
     device: str = "cuda:0"                # device for the embedding and crop-classifier workers
     text_negatives_max_per_class: int = 1
     text_aliases: dict = field(default_factory=dict)  # manual aliases — always override generated ones
@@ -195,10 +195,8 @@ class DiagnoseCfg:
     # missed_small cut — an object is small if its size relative to the image,
     # √(box area / image area), is below this. The detector sees a resized image,
     # so the ratio, not the original px, sets how large an object looks. 0.04
-    # (4% of a side, 0.16% of the area) is about 26px on a square image at YOLOE's
-    # 640px input, within COCO's small. A relative cut (lower quartile of a class's
-    # GT areas) produced "small" misses even on datasets of only large objects, so
-    # the tiling remedy kept repeating.
+    # (4% of a side) is about 26px on a square image at YOLOE's 640px input,
+    # within COCO's small.
     small_object_ratio: float = 0.04
 
 
@@ -213,7 +211,7 @@ class QueryCfg:
 
 @dataclass(frozen=True)
 class Config:
-    dataset: str                         # Roboflow-format dataset root (train/valid/test)
+    dataset: str                         # Roboflow-format dataset root — train/ + holdout (valid/, else test/)
     out_dir: str = "runs"
     rounds: int = 10                     # upper bound — saturation stops earlier if it triggers
     # β of the decision metric — 1.0 is F1, β>1 weights recall, β<1 precision.
@@ -223,14 +221,12 @@ class Config:
     beta: float = 1.0
     # Optional operator-supplied description of the dataset — inserted verbatim
     # into the LLM planner prompt only (the deterministic planner ignores it).
-    # With "" the prompt is byte-identical to the no-notes prompt (pinned by
-    # tests/test_planner.py).
+    # With "" the prompt has no such block.
     dataset_notes: str = ""
     # Seed for run stochasticity — used by material-mining sampling, lora and
-    # crop-classifier training, and gate bootstrap resampling. **Separate from
-    # the split seed (split.seed)**: seed waves must measure only search variance
-    # with the fit_train/fit_dev boundary fixed, so they vary this and keep
-    # split.seed fixed.
+    # crop-classifier training, and gate bootstrap resampling. Separate from the
+    # split seed (split.seed), so search variance can be measured by varying only
+    # this with the fit_train/fit_dev boundary fixed.
     run_seed: int = 0
     planner: PlannerCfg = field(default_factory=PlannerCfg)
     gate: GateCfg = field(default_factory=GateCfg)

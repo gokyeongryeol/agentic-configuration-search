@@ -112,6 +112,94 @@ def test_tiling_grid_single_batched_call(tmp_path):
     assert out[0] and all(d["category_id"] == 1 for d in out[0])
 
 
+TILE_CFG = {"visual_negatives": False, "neg_eta": None,
+            "tiling": {"grid": 2, "overlap": 0.25, "merge": "nmm"}}
+
+
+def _content_pred(im):
+    """A response that depends on the pixels — mixing pieces across images changes it."""
+    im = (im if isinstance(im, Image.Image) else Image.open(im)).convert("RGB")
+    r = im.getpixel((0, 0))[0]
+    w, h = im.size
+    return _pred([("cat a", round(0.3 + r / 512, 4))]) | {
+        "boxes": [[2.0, 2.0, min(w, 20.0 + r % 7), min(h, 18.0)]]}
+
+
+class ContentClient(StubClient):
+    def predict_images(self, images, queries, **kw):
+        self.calls.append({"n": len(images), "kw": kw})
+        return [_content_pred(im) for im in images]
+
+
+def _colored_images(tmp_path, n, size=(100, 80)):
+    paths = []
+    for i in range(n):
+        p = tmp_path / f"c{i}.png"
+        Image.new("RGB", size, (40 * i + 10, 0, 0)).save(p)
+        paths.append(p)
+    return paths
+
+
+def _reference_tiled(paths):
+    """Per-image run_tiled — the unbatched behavior (reference)."""
+    from agentic_detector_config.clients.wire import parse_prediction
+    from agentic_detector_config.core import tiling
+    out = []
+    for p in paths:
+        with Image.open(p) as im:
+            im = im.convert("RGB")
+
+            def predict_fn(images):
+                return [[{"box": d["box"], "score": d["score"], "label": d["category_id"]}
+                         for d in parse_prediction(_content_pred(x), ONTO.name_to_id)]
+                        for x in images]
+
+            merged = tiling.run_tiled(predict_fn, im, TILE_CFG["tiling"])
+        out.append([{"box": d["box"], "score": d["score"], "category_id": d["label"],
+                     "sources": d["sources"]} for d in merged])
+    return out
+
+
+def test_tiled_pieces_fill_batches_across_images(tmp_path):
+    """Pieces (full + tiles) are grouped BATCH at a time across image boundaries —
+    results equal per-image run_tiled. The detector runs each image of a call on
+    its own, so grouping changes only the number of calls."""
+    paths = _colored_images(tmp_path, 3)          # grid 2 → 5 pieces per image (full + 4 tiles)
+    client = ContentClient()
+    out = gateway.infer_config(_ctx(), client, TILE_CFG, [], ONTO, paths)
+    assert [c["n"] for c in client.calls] == [gateway.BATCH, 15 - gateway.BATCH]
+    assert out == _reference_tiled(paths)
+
+
+def test_image_prep_overlaps_with_inference(tmp_path, monkeypatch):
+    """The next chunk is prepared (decode, tile crops) while the current one runs
+    on the detector. Calls themselves stay serial and in order."""
+    import time
+    paths = _colored_images(tmp_path, 3, size=(8, 8))
+    real_pieces = gateway._tile_pieces
+
+    def slow_pieces(*a, **kw):
+        for im in real_pieces(*a, **kw):
+            time.sleep(0.05)
+            yield im
+
+    monkeypatch.setattr(gateway, "_tile_pieces", slow_pieces)
+
+    class SlowClient(StubClient):
+        def predict_images(self, images, queries, **kw):
+            time.sleep(0.5)
+            return super().predict_images(images, queries, **kw)
+
+    cfg = {**TILE_CFG, "tiling": {"grid": 2, "overlap": 0.0, "merge": "nmm"}}
+    client = SlowClient()
+    t0 = time.perf_counter()
+    out = gateway.infer_config(_ctx(), client, cfg, [], ONTO, paths)
+    elapsed = time.perf_counter() - t0
+    assert len(out) == 3 and [c["n"] for c in client.calls] == [gateway.BATCH, 7]
+    serial = 2 * 0.5 + 15 * 0.05                  # no overlap = 1.75s, overlapped ≈ 1.4s
+    assert elapsed < serial - 0.2, f"{elapsed:.2f}s — prep does not overlap inference"
+
+
 def test_dedup_is_deterministic():
     dets = [{"box": [10, 10, 30, 30], "score": 0.8, "category_id": 1},
             {"box": [11, 11, 31, 31], "score": 0.9, "category_id": 1},

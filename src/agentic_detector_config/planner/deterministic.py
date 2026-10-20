@@ -1,8 +1,8 @@
 """Deterministic planner — a rule implementation of the cause→remedy mapping.
 
 It is the LLM planner's fallback, the A/B control, and the fixed execution
-path for the guard test (test_decision_channel). The cause→remedy mapping
-matches the README's FP/FN diagnosis section.
+path for the guard test (test_decision_channel). REMEDY below is the canonical
+cause→remedy mapping.
 """
 
 from __future__ import annotations
@@ -26,18 +26,14 @@ REMEDY: dict[str, tuple] = {
     # tiling raises grid g one step at a time — a g at or below the champion's is
     # not a remedy (propose's step-up rule). The first value is the cheapest zoom.
     "missed_small": tuple(("tiling", g) for g in TILING_GRIDS),
-    # below_threshold = detected but did not clear τ_c. Scores can be raised not
-    # only by calibration (rescorer) but also by better prompts (exemplar), a
-    # better detector (lora), and re-classification (crop_classifier). rescorer
-    # is the direct remedy so it goes first, but listing only it would leave
-    # this kind without a remedy once rescorer is blocked.
+    # below_threshold = detected but did not clear τ_c. rescorer, the direct
+    # remedy, goes first; the other score-raising paths (exemplar, lora,
+    # crop_classifier) are listed too.
     "below_threshold": (("rescorer", True), ("exemplar", "base"),
                         ("exemplar", "fn_arm"), ("lora", True),
                         ("crop_classifier", True)),
     # The crop classifier drops detections it reclassifies as background (0) — it
-    # is a background-FP filter too. On a single-class dataset class_confusion is
-    # zero by definition, so without this entry the diagnosis reaches the axis only
-    # through below_threshold. Training costs the most (classifier fit + detector
+    # is a background-FP filter too. It costs the most (classifier fit + detector
     # state swap), so it goes last.
     "background": (("visual_negatives", True),
                    ("text_negatives", "background"), ("rescorer", True),
@@ -67,24 +63,25 @@ def _error_ranking(diagnosis: dict) -> list[str]:
 def tried_combos(history: list[dict]) -> set[tuple]:
     """Set of **full axes combinations** tried in previous rounds.
 
-    Keyed by combination rather than (axis, value) because a candidate is a
-    single increment over the champion, so the combination carries the champion
-    context — an axis rejected under an old champion (e.g. lora while
-    text-only) must be retryable as a new combination once the champion changes
-    (e.g. after exemplar is adopted). Only exact retries of the same
-    combination are blocked for good. The runner's shared filter uses this set too.
+    Keyed by combination because it carries the champion context — an axis
+    rejected under an old champion must be retryable once the champion changes.
+    Only exact retries of the same combination are blocked for good. The
+    runner's shared filter uses this set too.
     """
     out: set[tuple] = set()
     for entry in history:
         for c in entry.get("candidates", []):
-            axes = c.get("axes")
-            if not isinstance(axes, dict):
-                continue
-            try:
-                axes = validate_axes(axes)
-            except ValueError:
-                pass                      # old-format record — key it as-is
-            out.add(tuple(sorted(axes.items())))
+            # requested_axes: the original request of a candidate relabelled
+            # after measurement — the requested combination was tried too
+            # (blocking only the corrected axes lets the same request return)
+            for axes in (c.get("axes"), c.get("requested_axes")):
+                if not isinstance(axes, dict):
+                    continue
+                try:
+                    axes = validate_axes(axes)
+                except ValueError:
+                    pass                  # old-format record — key it as-is
+                out.add(tuple(sorted(axes.items())))
     return out
 
 

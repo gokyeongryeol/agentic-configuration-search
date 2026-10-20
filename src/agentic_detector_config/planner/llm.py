@@ -1,8 +1,8 @@
-"""LLM planner — an LLM (default Qwen3.8-27B-FP8 on vLLM) reads the diagnosis
-and proposes the next candidates.
+"""LLM planner — the model served by vLLM reads the diagnosis and proposes the
+next candidates.
 
 Why non-determinism is harmless: the LLM **only proposes**; adoption is
-decided by the holdout F1 CI gate. Reproducibility comes from **replay** —
+decided by the holdout F(β) CI gate. Reproducibility comes from **replay** —
 prompt, response, and candidates are saved to `proposal.json`, and rebuilding
 with the same artifact_dir (= resume) replays them without calling the LLM.
 The resume key is this artifact, not a config hash (guard: tests/test_replay.py).
@@ -52,15 +52,13 @@ SCHEMA = {
     },
 }
 
-# Caps on diagnosis detail and history in the prompt — train detail can run to
-# thousands of rows and would overflow the server context (HTTP 400). The caps
-# below are the first defense; the budget guard that measures the assembled
-# prompt (DEFAULT_CHAR_BUDGET) is the last.
+# Caps on diagnosis detail and history in the prompt — the first defense against
+# overflowing the server context. The last is the budget guard that measures the
+# assembled prompt (DEFAULT_CHAR_BUDGET).
 MAX_HISTORY = 8          # recent rounds in the prompt (the budget guard may cut further)
 # Prompt character budget — overflow is fixed by shrinking history. Derived
-# from max_model_len 16384 − 1024 output − slack, at a conservative 2.0
-# chars/token. Without it, vLLM returns 400 in later rounds as history grows and
-# the planner silently falls back to deterministic.
+# from max_model_len 16384 − 1024 output − slack, at 2.0 chars/token. Overflow
+# makes vLLM return 400 and the planner silently falls back to deterministic.
 DEFAULT_CHAR_BUDGET = 28_000
 MAX_NOTE = 80            # prefix length of the skip note carried in the prompt
 NDIGITS = 4              # float digits in the prompt — at margin scale (0.005) the
@@ -116,12 +114,9 @@ def _merge_notes(c: dict) -> None:
 def _slim_rows(c: dict) -> None:
     """Trim sample rows for the prompt — call after _merge_notes.
 
-    - category_id → category (name). per_class is keyed by name while samples
-      carried only ids with no mapping anywhere in the prompt, so individual
-      errors could not be attributed to a class.
-    - box (xyxy) → wh (integer size). The planner can do nothing with
-      coordinates; size is what maps to an action (small box → tiling,
-      missed_small).
+    - category_id → category (name). per_class is keyed by name, so a name lets
+      individual errors be attributed to a class.
+    - box (xyxy) → wh (integer size). The planner can use size, not coordinates.
     """
     for key in ("fp_sample", "fn_sample", "crop_notes"):
         rows = c.get(key)
@@ -133,10 +128,9 @@ def _slim_rows(c: dict) -> None:
             box = r.pop("box", None)
             if box and len(box) == 4:
                 r["wh"] = [round(box[2] - box[0]), round(box[3] - box[1])]
-            # Drop image — once notes are merged there is nothing to join on,
-            # and a filename without coordinates points at nothing. Its only
-            # remaining signal ("several errors in one image") maps to no axis.
-            # image_index appears only when resuming from old artifacts.
+            # Drop image — once notes are merged there is nothing to join on and
+            # the planner cannot point at an image. image_index exists only in
+            # old artifacts.
             r.pop("image", None)
             r.pop("image_index", None)
 
@@ -190,11 +184,9 @@ def _kind_counts(diagnosis: dict) -> dict[str, int]:
 def _leverage_lines(diagnosis: dict) -> list[str]:
     """One line per axis with **the error count it touches this round**, largest first.
 
-    Replaces a static "kind → axis" table, which was identical in every prompt
-    and, since several kinds are usually observed, unioned to every axis and
-    narrowed nothing. We hold the counts, so the join happens here and the model
-    gets only the result — values change per round and carry real information,
-    and counts appear as evidence rather than a ranking.
+    A static "kind → axis" table unions to every axis when several kinds are
+    observed and narrows nothing. The join happens here and the model gets only
+    the per-round counts, as evidence.
 
     Axis names come from REMEDY (canonical), so no nonexistent axis can appear.
     """
@@ -213,13 +205,12 @@ def _leverage_lines(diagnosis: dict) -> list[str]:
 
 
 def _dead_axis_lines(history: list[dict]) -> list[str]:
-    """Axes rejected for empty material — collected over the full history.
+    """Axes rejected for empty material, or too little to train on (empty_axis)
+    — collected over the full history.
 
-    Skip records within the history window (MAX_HISTORY) are not enough. Tried
-    combinations are listed explicitly as permanently blocked, but an
-    empty-material axis is one line buried in a history row, so the model reads
-    it as a one-off failure and proposes it again. It is not a permanent ban —
-    once the champion changes, the mining source changes and material may appear.
+    Once pushed out of the history window (MAX_HISTORY) the model proposes the
+    same axis again. It is not a permanent ban — once the champion changes, the
+    mining source changes and material may appear.
     """
     dead: dict[str, set] = {}
     for e in history:
@@ -254,17 +245,19 @@ MAX_TRIED = 40           # cap on tried combos in the prompt (most recent first)
 def _tried_lines(history: list[dict], champion: dict) -> list[str]:
     """Already-tried axes combinations, compressed to **deltas vs. the champion**.
 
-    If the planner forgets a combination outside the window (MAX_HISTORY) and
-    re-proposes it, the runner's combo filter silently drops it and the
-    candidate budget is wasted. Collect combinations from the full history,
-    but list only what differs from the current champion to keep it short.
+    A combination outside the window (MAX_HISTORY) that is re-proposed is dropped
+    by the runner's combo filter and wastes the candidate budget, so collect from
+    the full history. List only what differs from the champion to keep it short.
     """
     seen: dict[tuple, None] = {}
     for e in history:
         for c in e.get("candidates", []):
-            axes = c.get("axes")
-            if isinstance(axes, dict):
-                seen[tuple(sorted(axes.items()))] = None
+            # a relabelled candidate's original request is a tried combination
+            # too — the runner's combo filter (tried_combos) blocks it, so the
+            # prompt must list it or the planner re-proposes the same request
+            for axes in (c.get("axes"), c.get("requested_axes")):
+                if isinstance(axes, dict):
+                    seen[tuple(sorted(axes.items()))] = None
     lines = []
     for key in list(seen)[-MAX_TRIED:]:
         axes = dict(key)
@@ -278,18 +271,14 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
     """Per round: trajectory, candidate deltas, and verdicts only — large
     record-like fields are left out.
 
-    axes are carried **as deltas only**: listing all 12 keys, including
-    False/None, costs thousands of chars per round and overflows the context in
-    later rounds.
+    axes are carried **as deltas only** — listing them all overflows the context
+    in later rounds.
 
-    *How badly* a candidate was rejected feeds the next proposal: include each
-    candidate's holdout score and gate Δ / CI lower bound (decision.evaluated),
-    fit_dev score, and the skip note prefix — so a near miss (worth a variant)
-    can be told from a clear regression (drop the direction)."""
+    *How badly* a candidate was rejected is included too: holdout score (keys
+    are legacy test_*) and gate Δ / CI lower bound, fit_dev score, and the skip
+    note prefix — so a near miss can be told from a clear regression."""
     out = []
-    # window=0 means "no history" — history[-0:] is the **whole list** in Python,
-    # so without this the prompt would grow back just as the budget guard
-    # shrinks the window to 0.
+    # window=0 means "no history" — history[-0:] is the whole list in Python.
     for e in (history[-window:] if window > 0 else []):
         d = e.get("decision", {})
         evaluated = d.get("evaluated") or {}
@@ -404,7 +393,7 @@ Dataset notes from the operator (verbatim context — weigh against the diagnosi
 # are not just omitted from the list but explicitly forbidden (so the LLM does
 # not reintroduce them from its own world knowledge).
 DISABLED_BLOCK = """
-Unavailable in this run (never propose): {disabled}.
+Unavailable in this run (never turn these on; the champion keeps any it already has): {disabled}.
 """
 
 
@@ -522,6 +511,7 @@ class LLMPlanner:
                                          dropped=dropped,
                                          disabled_axes=self.disabled_axes,
                                          disabled_values=self.disabled_values,
+                                         base=champion or None,
                                          facts=self.facts)
         if dropped:
             log.info("sanitizer dropped %d candidates: %s", len(dropped),

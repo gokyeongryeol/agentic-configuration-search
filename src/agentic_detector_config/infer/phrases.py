@@ -1,29 +1,19 @@
 """Caption pool → text prompt phrases (negative / alias). LLM refinement (hygiene filter).
 
 Phrases the captioner attaches to mined negative crops cannot be used as-is —
-many **describe the suppression target itself**:
+many **describe the suppression target itself** (containing the class name, a
+part of the target, the target's object family). Using such phrases as
+suppression prompts **suppresses the true positives**. The judgment needs world
+knowledge (e.g. 'red cap' is part of a coca-cola bottle but a distinct object
+next to a yellow ball) — string matching or text embeddings cannot separate
+these, hence an LLM.
 
-    soda / sprite     → 'green sprite bottle cap'   (contains the class name)
-    soda / coca-cola  → 'red cap'                    (a **part** of the target)
-    cable/ melted lump→ 'black cable', 'steel wire'  (the target's object family)
-    aerial/ red ball  → 'red blemishes'              (color + shape overlap the target)
-
-Using such phrases as suppression prompts **suppresses the true positives**. The
-judgment needs world knowledge — the same surface form gets opposite verdicts:
-
-    aerial / yellow ball → 'yellow cap'  ✅ a yellow bottle cap is a distinct object resembling a yellow ball
-    soda  / coca-cola    → 'red cap'     ❌ a red cap is part of a coca-cola bottle
-
-Neither string matching nor text-embedding cosine can separate these, hence an LLM.
-
-The four rules are derived backwards from the failures above.
 **This stage is a filter, not a gate** — it only judges semantic conflict;
-whether a surviving phrase actually reduces FPs is decided by train measurement.
+whether a surviving phrase actually reduces FPs is decided by the adoption gate.
 
 Uses vLLM's `/v1/chat/completions` + `json_schema` (same server as the planner).
 On parse failure or server error the fallback is **to drop the phrase** — no
-suppression is the status quo, while wrong suppression costs recall (the opposite
-direction from the positive side, whose fallback is "use the class name").
+suppression is the status quo, while wrong suppression costs recall.
 """
 
 from __future__ import annotations
@@ -54,11 +44,9 @@ def normalize_caption(text: str) -> str:
     **Idempotent** — articles and punctuation are stripped **alternately** until
     a fixed point. Repeating only one leaves punctuation exposed by removing an
     article (`the "red cap"` → `"red cap`), which then hides the next article, so
-    f(f(x)) ≠ f(x). There are two call paths (pool construction in select,
+    f(f(x)) ≠ f(x). There are two call paths (pool construction in mining,
     re-counting in refine_*); if non-idempotent, one phrase gets two forms and
-    (1) the frequency table splits, (2) the cross-pool filter catches only one
-    form and is bypassed, (3) a phrase the LLM picked verbatim from the pool fails
-    the verbatim check.
+    the frequency table, cross-pool filter and verbatim check disagree.
     """
     t = " ".join(str(text).split()).lower()
     while True:
@@ -73,22 +61,11 @@ def normalize_caption(text: str) -> str:
 SYSTEM = ("You filter candidate *negative* phrases for an open-vocabulary object "
           "detector. Answer with JSON only.")
 
-# This prompt is **a safety filter only**. An earlier version also required a keep
-# criterion, "could be visually confused with the target"; it rejected **all** 258
-# candidates across 8 datasets, killing the text-negative channel outright (keep 0;
-# the gate never ran). Half of the rejection reasons were unfounded — "not
-# confusable" 17.8%, LLM-invented "could be a valid target" 30.6%. The refiner
-# **sees only phrase text, not the crops**, so its only way to answer "visually
-# confusable?" is semantic prior knowledge, which says "a bicycle is not a melted
-# lump" — yet that phrase came from the caption of a crop the model actually
-# misdetected as a melted lump. The refiner was overturning, without evidence,
-# what mining had shown empirically.
-# So confusability is left to **the margin gate, by measurement** (this codebase's
-# "identity unless a gain is proven" principle), and the refiner checks only rules
-# 1-4, which are answerable from text alone. Rules 1-4 are essential: using a
-# synonym, part, or parent category of the target as a negative suppresses the
-# target itself (a dangerous direction that costs recall before the gate can
-# catch it).
+# This prompt is **a safety filter only**. The refiner sees only phrase text, not
+# the crops, so it does not judge "visually confusable?" — the phrase came from
+# the caption of a real misdetected crop, and its effect is measured by the gate.
+# The refiner checks only rules 1-4, answerable from text alone: using a synonym,
+# part, or parent category of the target as a negative suppresses the target itself.
 RULES = """The detector is being prompted to find these categories:
 {categories}
 
@@ -160,8 +137,8 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
         "messages": [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": prompt}],
         # Each rejected phrase carries a one-line reason, so a large pool makes
-        # long JSON — at 512 a pool of ~20 already truncates the response and
-        # breaks parsing. json_schema enforcement does not prevent truncation.
+        # long JSON — too small a budget truncates the response and breaks
+        # parsing (json_schema enforcement does not prevent truncation).
         "max_tokens": 1536,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -350,7 +327,10 @@ VLM_CAPTION_SCHEMA = {
     },
 }
 
-VLM_BATCH = 8            # crops shown per call — more blurs the descriptions
+VLM_BATCH = 4            # crops shown per call — more blurs the descriptions, and a
+                         # server capping images per prompt (--limit-mm-per-prompt)
+                         # rejects an over-limit batch whole (400). Same as
+                         # diagnose.describe.CROPS_PER_CALL.
 
 
 def vlm_caption(rows: list[dict], chat, *, open_image=None,

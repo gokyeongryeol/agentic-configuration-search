@@ -124,9 +124,9 @@ def build_tail_arms(tuned: Path, lambdas, out_dir: Path) -> dict[float, Path]:
 
 
 def select_candidate(grid: list[dict], margin: float) -> tuple[dict, dict]:
-    """Pick the arm to adopt from each λ arm's fit_dev ΔF1.
+    """Pick the arm to adopt from each λ arm's fit_dev ΔF(β).
 
-    Takes the best candidate with ΔF1 > `margin` (ties go to the smaller λ —
+    Takes the best candidate with ΔF(β) > `margin` (ties go to the smaller λ —
     the conservative choice, closest to base). λ=0 is on the grid, so without
     proven gain it naturally falls back to identity — same structure as the
     rescorer's α selection. champion (lam=None) re-enters the weights adopted
@@ -153,9 +153,9 @@ def select_candidate(grid: list[dict], margin: float) -> tuple[dict, dict]:
         return best, {**info, "adopted": True, "rank": best["rank"],
                       "lam": best["lam"], "source": best["source"],
                       "delta": best["delta"],
-                      "reason": f"fit_dev ΔF1 {best['delta']:+.4f} > margin {margin}"
+                      "reason": f"fit_dev ΔF(β) {best['delta']:+.4f} > margin {margin}"
                                 + (" (champion reused)" if best["source"] == "champion" else "")}
     return best, {**info, "adopted": False, "delta": best["delta"],
                   "source": best["source"],
-                  "reason": f"best candidate fit_dev ΔF1 {best['delta']:+.4f} "
+                  "reason": f"best candidate fit_dev ΔF(β) {best['delta']:+.4f} "
                             f"≤ margin {margin}"}

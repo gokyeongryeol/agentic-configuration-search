@@ -1,14 +1,13 @@
 """One-shot worker that trains the SigLIP2+LoRA crop classifier.
 
-**Runs with the vLLM venv python (`services.paths.VLLM_VENV`, env ADC_VLLM_VENV)**,
-which has torch and transformers; peft must also be installed there (peft,
-Apache-2.0). The package proper is torch-free, so in-process training is
-impossible; exiting also releases the GPU entirely.
+**Runs with the worker venv python (`services.paths.VLLM_VENV`, env ADC_VLLM_VENV)**,
+which must have torch, transformers and peft (Apache-2.0). The package proper
+is torch-free, so in-process training is impossible; exiting also releases the
+GPU entirely.
 **Imports only stdlib + torch + transformers + peft + PIL.**
 
-Hyperparameters are fixed to the universal-best from a prior sweep — not a
-search axis. The output checkpoint contract matches the loader in
-clients.yoloe._CropReclassifier:
+Hyperparameters are fixed universal-best constants — not a search axis. The
+output checkpoint contract matches the loader in clients.yoloe._CropReclassifier:
     {"state_dict", "num_classes", "classifier_model": "siglip"}
 label 0 = background, label i+1 = class_names[i] (ascending category id).
 
@@ -23,7 +22,7 @@ import random
 import sys
 from collections import Counter, defaultdict
 
-# Universal-best from a prior sweep — fixed constants, not a search axis
+# Universal-best — fixed constants, not a search axis
 # (tests/test_crop_classifier.py keeps these in sync with the fitting-side copy)
 MODEL_NAME = "google/siglip2-base-patch16-224"
 LORA_R = 16

@@ -9,8 +9,8 @@ from agentic_detector_config import cli
 
 @pytest.fixture(autouse=True)
 def _no_real_servers(monkeypatch):
-    """Never start a real ManagedServer in unit tests — the vllm2 venv exists on this
-    box, so planner.kind=llm without base_url could launch the real 27B server."""
+    """Never start a real ManagedServer in unit tests — on a machine with a vLLM venv,
+    planner.kind=llm without base_url could launch a real planner server."""
     import agentic_detector_config.loop.hooks as hooks
 
     @contextlib.contextmanager

@@ -9,11 +9,10 @@ rescorer candidates are wired by loop.rescore, lora candidates (YOLOE tail
 fine-tune) by loop.tail_round, crop classifier candidates by loop.adapt_round.
 The latter two are **detector-state candidates**: they swap the
 in-process detector client's weights (weights_ctl) or reclassification
-artifact (adapt_ctl), so they run only when `detector_hooks` is injected; otherwise
-they are just recorded as `skipped` (being recorded, they join the tried set
-and are not re-proposed). Because they mutate client state they are handled
-**after all other candidates are evaluated**, and the current state is
-restored if they are not adopted.
+artifact (adapt_ctl), so they run only when `detector_hooks` is injected;
+otherwise they are just recorded as `skipped`. They are handled **after all
+other candidates are evaluated**, and the current state is restored if they
+are not adopted.
 """
 
 from __future__ import annotations
@@ -74,6 +73,7 @@ def _setting_load(lite: dict) -> dict:
 
 
 def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
+                          base: dict | None = None,
                           facts: DatasetFacts | None = None
                           ) -> tuple[list[dict], list[dict]]:
     """Human-injected candidates — (kept, dropped). Drops are recorded by the same
@@ -88,7 +88,7 @@ def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
     cands = sanitize_candidates(raw, max_candidates=64, dropped=dropped,
                                 disabled_axes=disabled_axes,
                                 disabled_values=disabled_values,
-                                facts=facts)
+                                base=base, facts=facts)
     for c in cands + dropped:
         c["id"] = f"human_{c['id']}"
         c["source"] = "human"
@@ -148,7 +148,8 @@ class Loop:
                   "micro_f_beta": champion["eval"]["micro_f_beta"],
                   "weights": champion.get("weights"),
                   "adapt_root": champion.get("adapt_root"),
-                  "rescorer_path": champion.get("rescorer_path")})
+                  "rescorer_path": champion.get("rescorer_path"),
+                  "forwards_per_image": setting_forwards(champion["setting"])})
         _write(self.out_dir / "champion_eval.json", champion["eval"])
 
     def _load_champion(self) -> dict:
@@ -188,11 +189,9 @@ class Loop:
         channel the candidate will serve**.
 
         The rescorer is a client-side calibration layer, so skipping it in
-        evaluation changes the score channel. If champion and candidate are on
-        different channels, the paired Δ becomes "candidate ± calibration
-        layer" instead of the candidate's increment, and if those records become
-        the champion the contamination spreads to later rounds. The branch lives
-        in this one place so call sites cannot drift apart.
+        evaluation changes the score channel and the paired Δ becomes
+        "candidate ± calibration layer" instead of the candidate's increment.
+        The branch lives in this one place so call sites cannot drift apart.
         """
         if entry.get("_rescorer") is not None:
             return rescore.rescored_evaluate(self.cfg, self.client, self.ds,
@@ -208,14 +207,10 @@ class Loop:
         """On resume, re-apply the champion's detector state (weights and
         reclassification artifact) to the in-process client.
 
-        champion.json only **records** the paths; a new process's client starts
-        with base weights and no reclassifier. Without re-applying them, the
-        round's candidates are scored with a **different detector** than the
-        champion, while the gate compares paired against the champion's recorded
-        records — so Δ becomes "candidate − champion's state gain" rather than
-        the candidate's increment. No error or warning is raised and the axis
-        labels, inherited from the champion, still look enabled — a silent
-        failure.
+        A new process's client starts with base weights and no reclassifier.
+        Without re-applying them, candidates are scored with a different
+        detector than the champion, and the gate's Δ against the champion's
+        recorded records is silently wrong.
         """
         if not self.detector_hooks:
             return                        # run without client state controls
@@ -336,6 +331,7 @@ class Loop:
         # merge human-injected candidates (hybrid loop)
         humans, human_dropped = _load_candidates_file(
             self.candidates_file, self.disabled_axes, self.disabled_values,
+            base=(history[-1].get("champion", {}).get("axes") if history else None),
             facts=self._facts())
         merged = proposal["candidates"] + humans
 
@@ -457,10 +453,30 @@ class Loop:
             if self._guard_material(c, materials, skipped):
                 return
             setting = self._screen(materials, c["axes"])
+        if self._tiling_unused(c, entry, setting, skipped):
+            return
         entry.update({"setting": setting,
                       "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
                       "_materials": materials})
+        _relabel_untiled(entry)
         screened.append(entry)
+
+    def _tiling_unused(self, c: dict, entry: dict, setting: dict,
+                       skipped: list) -> bool:
+        """Tiling was requested but screen picked an untiled config, which makes
+        the setting equal the champion's — reject without holdout evaluation
+        (True). It still counts as tried: the skipped row keeps the requested
+        axes, so tried_combos blocks it."""
+        if not entry["axes"].get("tiling") or _uses_tiling(setting):
+            return False
+        champ = (getattr(self, "_champion", None) or {}).get("axes")
+        if champ is None or {**entry["axes"], "tiling": False} != champ:
+            return False
+        log.info("candidate %s: screen picked an untiled config — same as champion", c["id"])
+        skipped.append({**c, "skipped": "tiling_unused", "tiling_used": False,
+                        "note": f"tiling={entry['axes']['tiling']}: screen picked an "
+                                "untiled config — same setting as champion, evaluation skipped"})
+        return True
 
     # ------------------------------------------------------------- rounds
 
@@ -484,8 +500,7 @@ class Loop:
         self._save_champion(champion)
         self._append_history({
             "round": 0,
-            "champion": {"axes": champion["axes"], "round": 0, "id": "baseline",
-                         "micro_f_beta": ev["micro_f_beta"]},
+            "champion": _champion_summary(champion),
             "candidates": [], "decision": decision})
         return champion
 
@@ -542,9 +557,7 @@ class Loop:
             _write(rd / "decision.json", decision)
             self._append_history({
                 "round": r,
-                "champion": {"axes": champion["axes"], "round": champion["round"],
-                             "id": champion["id"],
-                             "micro_f_beta": champion["eval"]["micro_f_beta"]},
+                "champion": _champion_summary(champion),
                 "candidates": skipped, "decision": decision})
             return decision, champion
 
@@ -579,14 +592,10 @@ class Loop:
             evaluated.append({**c, "eval": ev, "gate": _gate(ev)})
 
         # --- lora candidates — they swap the client's weights, so always last ---
-        # Evaluate with the champion's classifier **left loaded**. The classifier
-        # is a crop -> class function, not calibrated to the detector's score
-        # distribution (its only detector dependence is that background crops
-        # were mined from old FPs). Removing it would make lora fight carrying a
-        # handicap equal to the classifier's gain.
-        # What the detector has loaded right now — updated whenever a candidate
-        # swaps it. A dirty flag cannot tell whether a later candidate restored
-        # the current state, so it loses an earlier winner's state.
+        # Evaluate with the champion's classifier left loaded — a crop -> class
+        # function is not tied to the detector's score distribution, and removing
+        # it would make lora fight carrying a handicap equal to its gain.
+        # served_* is what the detector has loaded right now (updated per candidate).
         served_w = champion.get("weights")
         served_a = champion.get("adapt_root")
         for c in lora_cands:
@@ -627,9 +636,11 @@ class Loop:
                      "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
                                              default=0.0),
                      "lora": res["decision"]}
+            _relabel_untiled(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]})
+                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
+                            | _requested(entry))
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", "")})
@@ -687,10 +698,12 @@ class Loop:
                      "fit_dev_micro_f_beta":
                          res["setting"]["fit_dev_micro_f_beta"],
                      "crop_classifier": res["decision"]}
+            _relabel_untiled(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")}
-                            | {"crop_classifier": res["decision"]})
+                            | {"crop_classifier": res["decision"]}
+                            | _requested(entry))
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -760,13 +773,12 @@ class Loop:
         _write(rd / "decision.json", decision)
         self._append_history({
             "round": r,
-            "champion": {"axes": champion["axes"], "round": champion["round"],
-                         "id": champion["id"],
-                         "micro_f_beta": champion["eval"]["micro_f_beta"]},
+            "champion": _champion_summary(champion),
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
-                            | _tiling_record(c)
+                            | _tiling_record(c) | _requested(c)
+                            | {"forwards": setting_forwards(c["setting"])}
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -860,17 +872,58 @@ def _tiling_variants(search, axes: dict) -> tuple:
              "merge": search.tiling_merge},)
 
 
-def _tiling_record(c: dict) -> dict:
-    """For a tiling candidate, whether screen actually assigned a tile config — the
-    signal the planner reads to raise or drop the zoom. False means that grid helped
-    no class on fit_dev, and the candidate's setting equals tiling off despite its axes."""
-    if not c["axes"].get("tiling") or not c.get("setting"):
-        return {}
-    setting = c["setting"]
+def setting_forwards(setting: dict) -> int:
+    """How many detector forwards the setting runs per image — 1 + g² per
+    (config, modality) pass (grid g tiles, 1 without tiling). The grid tile
+    count does not depend on image size."""
     configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
-    used = any(configs.get(e["config_id"], {}).get("tiling")
-               for e in setting.get("per_class", {}).values())
-    return {"tiling_used": bool(used)}
+    groups = {(e["config_id"], e.get("modality", "semantic"))
+              for e in (setting.get("per_class") or {}).values()}
+    total = 0
+    for config_id, _modality in groups:
+        tile = (configs.get(config_id) or {}).get("tiling")
+        total += 1 + (int(tile["grid"]) ** 2 if tile else 0)
+    return total or 1
+
+
+def _champion_summary(champion: dict) -> dict:
+    """The champion summary in a history row — with its serving cost (forwards_per_image)."""
+    return {"axes": champion["axes"], "round": champion["round"],
+            "id": champion["id"], "micro_f_beta": champion["eval"]["micro_f_beta"],
+            "forwards_per_image": setting_forwards(champion["setting"])}
+
+
+def _uses_tiling(setting: dict) -> bool:
+    """Whether any pass the setting actually runs uses a tile config."""
+    configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
+    return any(configs.get(e["config_id"], {}).get("tiling")
+               for e in (setting.get("per_class") or {}).values())
+
+
+def _tiling_record(c: dict) -> dict:
+    """For a candidate that requested tiling, whether screen actually assigned a
+    tile config — the signal the planner reads to raise or drop the zoom. False
+    means that grid helped no class on fit_dev. The request survives relabelling
+    in requested_axes, so read that first."""
+    requested = c.get("requested_axes") or c["axes"]
+    if not requested.get("tiling") or not c.get("setting"):
+        return {}
+    return {"tiling_used": _uses_tiling(c["setting"])}
+
+
+def _relabel_untiled(entry: dict) -> None:
+    """Tiling was requested but the setting uses no tile — correct axes to the
+    measured state (no tiling) and keep the request in requested_axes. A
+    champion labelled with tiling it never runs would credit other axes' gains
+    to tiling, and the next round's step-up would start from an unused zoom.
+    Same principle as the rescorer identity-refit relabel (_measured_axes)."""
+    if entry["axes"].get("tiling") and not _uses_tiling(entry["setting"]):
+        entry["requested_axes"] = dict(entry["axes"])
+        entry["axes"] = {**entry["axes"], "tiling": False}
+
+
+def _requested(c: dict) -> dict:
+    return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
 
 
 def _stagnant(decision: dict, epsilon: float) -> bool:
@@ -889,11 +942,10 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
     """Name of an enabled axis whose materials are empty — meaning the candidate
     equals baseline.
 
-    Especially common for alias and text_negatives — caption pools get
-    exhausted by safety rules (own parts, kin classes, category names). Going
-    through screen and holdout eval while empty just spends round budget
-    re-confirming Δ≈0. Rejecting here leaves a history entry that also feeds
-    back to the planner."""
+    Common for alias and text_negatives — caption pools get exhausted by the
+    safety rules. Going through screen and holdout eval while empty just spends
+    budget re-confirming Δ≈0. Rejecting here leaves a history entry that also
+    feeds back to the planner."""
     if axes.get("exemplar", "none") != "none" and not any(
             (materials.exemplars or {}).values()):
         return "exemplar"
@@ -925,12 +977,9 @@ def _winner_axes(winner: dict) -> tuple[dict, bool]:
     """Champion label reconciliation — axes.rescorer must match whether
     rescorer_path exists.
 
-    Labels must reflect **the actual serving state**. Arms refit the rescorer
-    and measure with it on (_arm_rescorer), which already corrects axes if the
-    refit is identity — this function is the backstop after that: any label
-    that arrives enabled without a rescorer_path is turned off. If labels drift
-    from serving, the next round's dedup, diagnosis and champion.json all
-    record a layer that does not exist."""
+    The backstop after _arm_rescorer's own correction: any label that arrives
+    enabled without a rescorer_path is turned off. If labels drift from
+    serving, dedup, diagnosis and champion.json record a layer that does not exist."""
     axes = dict(winner["axes"])
     if axes.get("rescorer") and not winner.get("rescorer_path"):
         axes["rescorer"] = False
@@ -942,10 +991,7 @@ def _measured_axes(axes: dict, *, rescorer: bool) -> dict:
     """Reconcile candidate axes with **the actually measured state**.
 
     Upstream arms (lora, classifier) also refit the rescorer and measure with
-    it on — removing it would make the gate's Δ a "+upstream, −rescorer"
-    composite, handicapping the upstream axis by the rescorer's gain. If the
-    refit is identity (α=0 for every class), axes reflects that: labels must
-    match the measured state (_winner_axes checks the same thing)."""
+    it on. If the refit is identity (α=0 for every class), axes reflects that."""
     return {**axes, "rescorer": bool(rescorer)}
 
 

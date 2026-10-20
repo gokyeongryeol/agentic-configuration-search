@@ -166,9 +166,9 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
                    and "text_negatives" not in inherited))
     if need_fp:
         # FP mining uses **the pass of the configuration to be served
-        # (including adopted FN exemplars)**. A text_negatives-only (text-only)
-        # candidate may have no exemplars; the mining pipeline is the same —
-        # if exemplars are empty, a base GT selection is built as the mining source.
+        # (including adopted FN exemplars)**. A text-only candidate without
+        # exemplars mines with a GT k-center selection as exemplars — an
+        # approximation that differs from the served configuration (text pass).
         src_exemplars = exemplars
         if not any(src_exemplars.values()):
             src_exemplars = _gt_selection("negative/text_negatives")

@@ -1,10 +1,8 @@
 """Material inheritance — materials for axes carried over from the champion are not re-mined.
 
-Re-mining can change results even for an axis that was merely carried over — if a
-candidate raising exemplar to fn_arm also changed the negative crops, the gate's Δ
-would be "increment + material swap" rather than the pure increment. The champion's
-score was achieved with those materials, so carried-over axes must inherit them from
-the parent unchanged.
+Re-mining a carried-over axis would make the gate's Δ "increment + material swap"
+rather than the pure increment. The champion's score was achieved with those
+materials, so they are inherited from the parent unchanged.
 """
 
 import numpy as np

@@ -150,9 +150,8 @@ def tile_plan(width: int, height: int, tile_cfg: dict):
     """(tiles, degenerate) — the tiles run_tiled will cut (deterministic).
 
     tile_cfg is an image-relative g×g grid (`grid`) — cost and zoom do not depend
-    on resolution. Absolute px (`slice`) is not accepted: values tuned for 640px
-    made the tile count grow quadratically at high resolution (320px at 4000×3000
-    is 221 tiles).
+    on resolution. Absolute px (`slice`) is not accepted — its tile count grows
+    quadratically with resolution.
     """
     if "grid" not in tile_cfg:
         raise ValueError(f"tiling config has no grid ({tile_cfg!r}) — the absolute "

@@ -8,7 +8,7 @@ module just for VLLM_VENV.)
 import os
 from pathlib import Path
 
-# Default vLLM venv on this box; override with ADC_VLLM_VENV. It is absolute, so
+# Worker (dinov3, adapt) venv — override with ADC_VLLM_VENV. If absolute,
 # `repo_root / VLLM_VENV` resolves independently of repo_root (Path.__truediv__
 # returns an absolute right operand unchanged).
 VLLM_VENV = Path(os.environ.get("ADC_VLLM_VENV", "/data/krgo/vllm2"))

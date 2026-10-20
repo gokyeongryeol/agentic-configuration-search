@@ -13,7 +13,7 @@ from agentic_detector_config.infer import embedder
 
 @pytest.fixture(autouse=True)
 def _relative_vllm_venv(monkeypatch):
-    """Pin a tmp-relative path so the real vLLM venv (absolute /data/krgo/vllm2) is
+    """Pin a tmp-relative path so the real worker venv (absolute, ADC_VLLM_VENV) is
     never touched — repo_root(tmp_path) / VLLM_VENV stays inside tmp."""
     monkeypatch.setattr(embedder, "VLLM_VENV", Path("external/vllm-venv"))
 
@@ -73,12 +73,11 @@ def test_zero_k_selects_nothing():
 
 
 # --- outlier trim = distribution-based (median + k·MAD) --------------------------
-# A fixed-fraction trim (base 20%, FN 10%) **always** dropped the farthest share —
-# 2 of ~10 per class on few-shot data even with no outliers, and only part of them
-# when outliers were 30%. Only distances that stand out from the distribution are cut.
+# Only candidates whose centroid distance stands out from the distribution are
+# cut — unlike a fixed-fraction trim, nothing is dropped when there are no outliers.
 
 def test_trim_keeps_everything_when_no_outliers():
-    """An even distribution loses nothing (a fixed-fraction trim dropped 20%)."""
+    """An even distribution loses nothing."""
     emb = np.array([[np.cos(t), np.sin(t)] for t in np.linspace(0, 6.0, 10)])
     assert list(embedder.trim_outliers(emb, 3.0)) == list(range(10))
 
@@ -292,7 +291,7 @@ def test_encode_crops_missing_venv_raises(tmp_path):
 # ------------------------------------------------- select_indices (shared dispatch)
 
 def test_select_indices_dispatch_matches_primitives():
-    """The single dispatch point shared by select and tune_eval — must match the primitives."""
+    """The single exemplar-selection dispatch — must match the primitives."""
     import random
 
     import numpy as np

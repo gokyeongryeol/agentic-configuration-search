@@ -1,4 +1,4 @@
-"""mAP/F1, F-max threshold estimation, and FP/FN cause classification.
+"""mAP/F(β), F(β)-max threshold estimation, and FP/FN cause classification.
 
 Threshold estimation is a pure function (score distribution + GT -> threshold),
 so it lives here, separate from the stages, and is unit-tested.
@@ -86,9 +86,9 @@ def match_greedy(pred_boxes: np.ndarray, pred_scores: np.ndarray,
 
 
 def prf(tp: int, fp: int, fn: int, beta: float = 1.0) -> dict:
-    """The "f_beta" field is **F-beta** (beta>1 weights recall, beta<1 precision;
-    beta=1 is F1). All consumers (threshold estimation, micro, gate) read this one
-    key, so changing the metric threads through a single argument with no key change."""
+    """The "f_beta" field is the F-beta set by beta (beta>1 weights recall, beta<1
+    precision; beta=1 is F1). Threshold estimation, micro and the gate all read
+    this key, so the metric changes through the single beta argument."""
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
     b2 = float(beta) ** 2
@@ -132,12 +132,9 @@ def _class_counts(per_image: list[dict], category_id: int, threshold: float, iou
 def _threshold_candidates(scores: list[float], max_candidates: int) -> list[float]:
     """Candidate grid — **uniform in score**, not in rank.
 
-    A rank-uniform grid (linspace over index) spends the whole budget where
-    unique scores cluster. In a run with reclassification, ~200 noise scores
-    clustered at the low end, so almost none of 50 candidates landed in the
-    meaningful range and the global optimum was not even a candidate (measured:
-    all candidates gave τ=0.0566/F=0.9886, 50 rank-uniform gave τ=0.0217/F=0.9831
-    — and that τ caused a detection flood on test).
+    A rank-uniform grid (linspace over index) spends the whole candidate budget
+    where unique scores cluster (e.g. low noise scores) and misses the global
+    optimum.
 
     F(beta) only changes at observed scores, so each uniform grid point is snapped
     up to **the first observed score at or above it**. The lowest score (the
@@ -163,12 +160,9 @@ def _max_margin_threshold(plateau: list[float], scores: list[float], floor: floa
     """Midpoint of the gap, within the plateau, with **the largest margin to the
     next-lower observed score**.
 
-    Why the middle: when F(beta) is flat over a wide range, holdout evidence cannot
-    pin τ inside it. Taking the lowest sits right on top of the noise cluster with
-    no margin; taking the highest sits just below true detections — each is
-    exposed to one failure mode. The lowest-τ rule once made a champion at 0.98
-    on holdout collapse to 0.57 on test (462 detections for 207 GT; moving τ
-    within the same plateau gave 0.81).
+    When F(beta) is flat over a wide range, holdout evidence cannot pin τ inside
+    it. The lowest τ sits right on top of the noise cluster and the highest just
+    below true detections, both with no margin — each exposed to one failure mode.
 
     τ owns the interval (previous observed score, that score], so picking its
     midpoint yields F(τ) exactly equal to F(that score) — nothing leaks outside
@@ -194,16 +188,12 @@ def estimate_f_beta_threshold(per_image: list[dict], category_id: int, *,
     among candidates within `tol` of the max, the point with the largest margin
     to observed scores (_max_margin_threshold). No candidates -> keep floor.
 
-    tol=0 uses the first maximum as-is. tol>0 acknowledges "a range holdout
-    F(beta) cannot distinguish" and picks the safest point within it — see
-    _max_margin_threshold for why.
+    tol=0 uses the first candidate reaching the max. tol>0 picks the safest
+    point within the range F(beta) cannot distinguish (_max_margin_threshold).
 
-    A class whose F never exceeds 0 at any candidate (never correctly detected)
-    only gets a warning and its threshold is left unchanged — its detections are
-    filtered by the P̂ layer anyway (the discriminator is trained on exactly those
-    false positives). Blocking it here would also erase the class from later
-    rounds' diagnosis and recovery signals: that policy call belongs to the
-    owner, so the stage does not make it silently.
+    A class whose F(beta) never exceeds 0 at any candidate only gets a warning
+    and its threshold is left unchanged — blocking it here would erase the class
+    from later rounds' diagnosis and recovery signals.
     """
     scores = sorted({float(d["score"]) for rec in per_image for d in rec["detections"]
                      if d["category_id"] == category_id})
@@ -217,7 +207,7 @@ def estimate_f_beta_threshold(per_image: list[dict], category_id: int, *,
         evaluated.append((float(thr), prf(tp, fp, fn, beta)["f_beta"]))
     best_f1 = max(f for _, f in evaluated)
     if tol <= 0.0:
-        # First candidate reaching the max (lowest τ on ties).
+        # tol=0 — first candidate reaching the max (lowest τ on ties).
         best_thr = next(thr for thr, f in evaluated if f == best_f1)
     else:
         # Candidates within tol are **indistinguishable**; pick the one with the
@@ -227,7 +217,7 @@ def estimate_f_beta_threshold(per_image: list[dict], category_id: int, *,
                                                   dict(evaluated), best_f1)
     if best_f1 <= 0.0 and any(g["category_id"] == category_id
                               for rec in per_image for g in rec["gts"]):
-        log.warning("class %d: no threshold yields F1>0 (%d candidates, GT present) "
+        log.warning("class %d: no threshold yields F(β)>0 (%d candidates, GT present) "
                     "— leaving τ_c at %.3f. Detections for this class are "
                     "unreliable",
                     category_id, len(scores), best_thr)
@@ -420,11 +410,10 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
     but boxes on a real object (IoM>=0.7) are localization/class_confusion.
 
     missed_small is cut by **the object's size relative to the image** — small if
-    r = √(box area / image area) is below small_ratio. A relative cut (lower
-    quartile of a class's GT areas) would rank objects within the dataset, so a
-    dataset of only large objects would still get "small" misses every round and
-    tiling would keep coming back as a remedy. An FN record's size_ratio is that
-    r — material for judging how much zoom is needed.
+    r = √(box area / image area) is below small_ratio. A cut by rank within a
+    class would produce "small" misses even on a dataset of only large objects.
+    An FN record's size_ratio is that r — material for judging how much zoom is
+    needed.
     """
     fp_records, fn_records = [], []
 

@@ -1,4 +1,4 @@
-"""Crop-classifier axis material — mining, training call, artifact assembly (all from train).
+"""Crop-classifier axis material — mining, training call, artifact assembly (from the split the caller passes).
 
 Serving: the detector client (clients.yoloe) loads the artifact directory
 (classifier.pt / classifier_config.json) and **reclassifies predicted boxes**
@@ -93,7 +93,7 @@ def mine_classifier_crops(train: Split, ontology: Ontology,
                           out_dir: Path) -> tuple[Path, dict]:
     """Write crops + manifest.jsonl — returns (manifest_path, per-source counts).
 
-    dets_by_image = floor detections from the train pass (image order = train.images).
+    dets_by_image = floor detections from that split's pass (image order = train.images).
     thresholds = per-class thresholds **estimated on fit_dev** (purity requirement — see module docstring).
     """
     out_dir = Path(out_dir)
@@ -113,7 +113,7 @@ def mine_classifier_crops(train: Split, ontology: Ontology,
             continue
         with Image.open(train.image_path(entry)) as im:
             im = im.convert("RGB")
-            for a in entry.annotations:                # positive — train GT
+            for a in entry.annotations:                # positive — GT crop
                 if not promptable(a.bbox_xyxy):
                     counts["skipped_degenerate"] += 1
                     continue

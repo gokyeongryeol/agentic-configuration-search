@@ -10,6 +10,7 @@ eval/runner.py; this module holds only the seam.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
@@ -20,6 +21,58 @@ from ..clients.wire import parse_prediction
 from ..core import metrics, tiling
 
 BATCH = 8  # images per predict_images call
+
+
+def _chunks(items, size: int):
+    chunk = []
+    for it in items:
+        chunk.append(it)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _prefetched(items, size: int = BATCH):
+    """Image iterable → BATCH-sized lists, with the next chunk pulled on a worker
+    thread while the caller runs the current one on the detector.
+
+    Pulling a chunk is CPU work (decoding the image, cutting tile crops); without
+    the overlap the GPU waits for it between every call. One thread suffices —
+    only one chunk ahead is needed — and keeps the source iterator single-consumer."""
+    it = _chunks(items, size)
+    with ThreadPoolExecutor(1) as pool:
+        nxt = pool.submit(next, it, None)
+        while (chunk := nxt.result()) is not None:
+            nxt = pool.submit(next, it, None)
+            yield chunk
+
+
+def _tile_pieces(image_paths, tile_cfg: dict, plans: list):
+    """Yield [full] + tile crops per image, flat, so pieces fill BATCH across
+    image boundaries. Per-image merge geometry is appended to plans as (tiles,
+    degenerate, size). The detector runs each image of a call on its own, so
+    how pieces are grouped does not change results (same as per-image run_tiled)."""
+    for path in image_paths:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+        tiles, degenerate = tiling.tile_plan(im.width, im.height, tile_cfg)
+        plans.append((tiles, degenerate, (im.width, im.height)))
+        yield im
+        if not degenerate:
+            for t in tiles:
+                yield im.crop(t)
+
+
+def _split_by_plan(flat: list, plans: list):
+    """Flat piece results → per-image (piece results, plan)."""
+    pos = 0
+    for plan in plans:
+        tiles, degenerate, _ = plan
+        n = 1 + (0 if degenerate else len(tiles))
+        yield flat[pos:pos + n], plan
+        pos += n
 
 
 def _has_alias_multiplicity(alias_to_name) -> bool:
@@ -65,8 +118,8 @@ def make_predictor(ctx, client, config: dict, queries, ontology,
 
     def predict(images) -> list[list[dict]]:
         out: list[list[dict]] = []
-        for i in range(0, len(images), BATCH):
-            preds = client.predict_images(images[i:i + BATCH], queries,
+        for batch in _prefetched(images):
+            preds = client.predict_images(batch, queries,
                                           apply_topk=z.apply_topk,
                                           iou_threshold=z.iou_threshold, **neg_kwargs)
             # Class resolution uses text (name) only — labels (flat prompt
@@ -102,17 +155,15 @@ def infer_config(ctx, client, config: dict, queries, ontology,
         for dets in predict([str(p) for p in image_paths]):
             results.append([{**d, "sources": ["full"]} for d in dets])
     else:
-        for path in image_paths:
-            with Image.open(path) as im:
-                im = im.convert("RGB")
-
-                def predict_fn(images):
-                    # tiling.run_tiled compares on the label key → pass category_id as label
-                    return [[{"box": d["box"], "score": d["score"],
-                              "label": d["category_id"], **_emb(d)} for d in dets]
-                            for dets in predict(images)]
-
-                merged = tiling.run_tiled(predict_fn, im, config["tiling"])
+        plans: list = []
+        flat = predict(_tile_pieces(image_paths, config["tiling"], plans))
+        for piece_dets, (tiles, degenerate, size) in _split_by_plan(flat, plans):
+            # the merge compares on the label key → pass category_id as label
+            label_form = [[{"box": d["box"], "score": d["score"],
+                            "label": d["category_id"], **_emb(d)} for d in dets]
+                          for dets in piece_dets]
+            merged = tiling.merge_from_results(label_form, tiles, degenerate,
+                                               size[0], size[1], config["tiling"])
             results.append([{"box": d["box"], "score": d["score"],
                              "category_id": d["label"], "sources": d["sources"],
                              **_emb(d)}

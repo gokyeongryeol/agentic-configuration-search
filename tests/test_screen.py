@@ -70,6 +70,54 @@ def test_text_only_candidate_rescues_all_classes(ds, monkeypatch):
     assert out["fit_dev_micro_f_beta"] == pytest.approx(1.0)
 
 
+def _tiling_aware_infer(fit_dev, calls, *, tiles_help):
+    """Text pass only — hits GT only on a tile config (tiles_help) or always."""
+    def fake_infer(ctx, client, config, queries, ontology, image_paths,
+                   alias_to_name=None, **kw):
+        assert alias_to_name is not None, "there must be only the text pass"
+        calls.append(config["tiling"])
+        if tiles_help and config["tiling"] is None:
+            return [[] for _ in fit_dev.images]
+        return _gt_hits(fit_dev)
+    return fake_infer
+
+
+TILE = {"grid": 2, "overlap": 0.5, "merge": "nmm"}
+
+
+def test_text_only_candidate_screens_each_tiling_variant(ds, monkeypatch):
+    """A text-only candidate (no exemplars) runs the text pass on each tiling
+    variant and shares the config that wins."""
+    calls: list = []
+    monkeypatch.setattr(gateway, "infer_config",
+                        _tiling_aware_infer(ds.fit_dev, calls, tiles_help=True))
+    out = screen_candidate(CFG, object(), ds.fit_dev, ds.ontology, Materials(),
+                           tiling_variants=(TILE,))
+    assert calls == [None, TILE]
+    cfgs = {c["config_id"]: c for c in out["configs"]}
+    assert all(cfgs[e["config_id"]]["tiling"] == TILE for e in out["per_class"].values())
+    assert out["fit_dev_micro_f_beta"] == pytest.approx(1.0)
+
+
+def test_text_only_tiling_tie_prefers_untiled(ds, monkeypatch):
+    """On a tie the untiled config wins — same score, cheaper."""
+    calls: list = []
+    monkeypatch.setattr(gateway, "infer_config",
+                        _tiling_aware_infer(ds.fit_dev, calls, tiles_help=False))
+    out = screen_candidate(CFG, object(), ds.fit_dev, ds.ontology, Materials(),
+                           tiling_variants=(TILE,))
+    cfgs = {c["config_id"]: c for c in out["configs"]}
+    assert all(cfgs[e["config_id"]]["tiling"] is None for e in out["per_class"].values())
+
+
+def test_text_only_without_tiling_runs_one_pass(ds, monkeypatch):
+    calls: list = []
+    monkeypatch.setattr(gateway, "infer_config",
+                        _tiling_aware_infer(ds.fit_dev, calls, tiles_help=False))
+    screen_candidate(CFG, object(), ds.fit_dev, ds.ontology, Materials())
+    assert calls == [None]
+
+
 def test_modality_pick_per_class(ds, monkeypatch):
     """Only classes semantic cannot find move to text — ties go to semantic."""
     fit_dev = ds.fit_dev

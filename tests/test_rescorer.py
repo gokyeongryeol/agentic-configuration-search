@@ -341,3 +341,12 @@ class _FakeSplit:
         file_name = "a.png"
         annotations = []
     images = [_E()]
+
+
+def test_default_alpha_grid_extends_past_two():
+    """The α grid's top end (2.0) capped the search — 3 and 4 are added. Ties pick
+    the smaller α, so a larger α wins only when it is clearly better on fit_dev."""
+    from agentic_detector_config.config import config_from_dict
+    alphas = config_from_dict({"dataset": "x"}).rescorer.alphas
+    assert alphas[0] == 0.0 and alphas == sorted(alphas)
+    assert {3.0, 4.0} <= set(alphas)
