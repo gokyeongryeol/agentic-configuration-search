@@ -292,6 +292,8 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
+            if c.get("gate_passed_but_lost"):
+                row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
             if c.get("note"):
                 row["note"] = str(c["note"])[:MAX_NOTE]
             ev = evaluated.get(c.get("id"))
@@ -369,7 +371,7 @@ says how much is at stake if the axis works, not that it will. Weigh them
 against the diagnosis above (aggregate counts, then per-class, then the
 individual samples and their notes) rather than picking the largest number.
 {leverage}
-{dead_block}{notes_block}
+{dead_block}{carry_block}{notes_block}
 Propose up to {max_candidates} candidates."""
 
 # Inserted only when some axis had empty material — otherwise omitted.
@@ -379,6 +381,14 @@ dataset (the candidate was rejected without evaluation, so it cost a slot for
 nothing). Their material pool is exhausted here — re-propose one only with a
 different source value, or after the champion has changed:
 {dead}
+"""
+
+# Inserted only when some candidate is carried over — otherwise omitted.
+CARRY_BLOCK = """
+Re-queued automatically this round — each passed the gate last round but lost
+to the adopted candidate, so it is retried on top of the new champion (listed
+as its difference from the current champion). Do not spend a slot on these:
+{carried}
 """
 
 # Inserted only when dataset_notes (config) is set — otherwise notes_block=""
@@ -462,6 +472,11 @@ class LLMPlanner:
             ln for ln in _leverage_lines(diagnosis)
             if not any(ln.startswith(f"- {a}:") for a in self.disabled_axes)]
         dead_lines = _dead_axis_lines(history)
+        carried = deterministic.carryover(history, self.disabled_axes,
+                                          self.disabled_values, facts=self.facts)
+        carry_lines = [", ".join(f"{k}={v}" for k, v in
+                                 sorted(_delta_axes(c["axes"], champion).items()))
+                       for c in carried]
 
         def build(window: int) -> list[dict]:
             return [
@@ -479,6 +494,9 @@ class LLMPlanner:
                          if banned else "")
                         + (DEAD_BLOCK.format(
                             dead="\n".join(dead_lines)) if dead_lines else "")),
+                    carry_block=(CARRY_BLOCK.format(
+                        carried="\n".join(f"- {x}" for x in carry_lines))
+                        if carry_lines else ""),
                     notes_block=(NOTES_BLOCK.format(notes=self.notes)
                                  if self.notes else ""),
                     max_candidates=self.max_candidates)},

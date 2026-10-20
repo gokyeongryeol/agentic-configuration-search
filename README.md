@@ -94,6 +94,13 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   holdout Δ clears the margin; otherwise the champion stays.
 - **saturation** stops the run after `saturation.rounds` rounds without a
   meaningful adoption, or when the planner has nothing left to try.
+- A round adopts one candidate, the one with the largest Δ. Candidates that
+  passed the gate but lost to it are marked `gate_passed_but_lost` and carried
+  into the next round as `carry_<id>`: the axes they changed are applied on top
+  of the **new** champion. That makes each one a single increment over the new
+  champion, and holdout is not reused within the round. Carried candidates go
+  through the same filters as planner and human candidates, whichever planner
+  is used.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
   they are not adopted.

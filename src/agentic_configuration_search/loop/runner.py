@@ -333,7 +333,12 @@ class Loop:
             self.candidates_file, self.disabled_axes, self.disabled_values,
             base=(history[-1].get("champion", {}).get("axes") if history else None),
             facts=self._facts())
-        merged = proposal["candidates"] + humans
+        # candidates that passed the gate last round but lost to the winner —
+        # carried onto the new champion whatever the planner (the shared filter
+        # below still applies)
+        carried = deterministic.carryover(history, self.disabled_axes,
+                                          self.disabled_values, facts=self._facts())
+        merged = proposal["candidates"] + humans + carried
 
         # Common combo filter: regardless of source (LLM, deterministic, human),
         # block retrying **an already-tried full axes combination**. It works per
@@ -723,6 +728,8 @@ class Loop:
 
         winners = [c for c in evaluated if c["gate"]["adopted"]]
         winner = max(winners, key=lambda c: c["gate"]["delta"]) if winners else None
+        # passed the gate but lost to a winner with a larger Δ — carried to the next round
+        lost = {c["id"] for c in winners if c is not winner}
         decision = {
             "round": r, "adopted": winner is not None,
             "id": winner["id"] if winner else None,
@@ -779,6 +786,8 @@ class Loop:
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
                             | _tiling_record(c) | _requested(c)
                             | {"forwards": setting_forwards(c["setting"])}
+                            | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
+                            | ({"source": c["source"]} if c.get("source") else {})
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
