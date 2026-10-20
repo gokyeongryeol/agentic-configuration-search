@@ -1,7 +1,7 @@
 """DINOv3 worker invocation + k-center greedy.
 
 Embedding itself runs in `workers/dinov3.py` as a one-shot subprocess in the
-vLLM venv — the package proper has no torch. This module only calls the worker,
+GPU worker venv (`ADC_VLLM_VENV`) — the package proper has no torch. This module only calls the worker,
 reads the result, and does k-center selection.
 """
 
@@ -80,10 +80,9 @@ def trim_outliers(embeddings: np.ndarray, outlier_mad: float,
     centroid distance stands out from the distribution.
 
     A distance d is an outlier if it exceeds `median(d) + outlier_mad × σ̂`
-    (σ̂ = MAD × 1.4826 — a spread estimate not pulled by extremes). A fixed-fraction
-    trim would always drop the farthest share even with no outliers (2 of ~10 GTs
-    per class on few-shot datasets), and would catch only part of them when
-    outliers exceed that share. 0 turns trimming off.
+    (σ̂ = MAD × 1.4826 — a spread estimate not pulled by extremes). Unlike a
+    fixed-fraction trim, nothing is dropped when there are no outliers. 0 turns
+    trimming off.
 
     The centroid is computed once on the **full, untrimmed set** — recomputing it
     iteratively makes results vary strongly with the data, hurting
@@ -148,10 +147,10 @@ def kcenter_greedy(embeddings: np.ndarray, k: int, outlier_mad: float = 0.0) -> 
     as possible.
 
     With `outlier_mad > 0`, **first drop candidates whose centroid distance stands
-    out from the distribution** (trim_outliers), then traverse only the remainder. Pure k-center deliberately picks
-    the most atypical instances to maximize coverage, but such outliers hurt as
-    visual prompts. Trimming is the compromise: **keep diversity, exclude what
-    cannot serve as a prompt**. Returned indices always refer to the original set.
+    out from the distribution** (trim_outliers), then traverse only the remainder.
+    Pure k-center picks the most atypical instances, but such outliers hurt as
+    visual prompts — keep diversity, exclude the extremes. Returned indices
+    always refer to the original set.
 
     If exactly k candidates remain after trimming, the result equals the k nearest
     to the centroid (`mean_nearest`).
@@ -180,9 +179,7 @@ def mean_nearest(embeddings: np.ndarray, k: int) -> list[int]:
 
 def select_indices(selection: str, k: int, n: int, *, embeddings=None,
                    outlier_mad: float = 0.0, rng=None) -> list[int]:
-    """Per-class exemplar selection dispatch — the single point that makes select
-    and tune_eval use **the same rule** (if they diverged, tune's adoption
-    decision would be measured under a different prompt regime than serving).
+    """Per-class exemplar selection dispatch (single entry point per exemplar_selection).
 
     mean/kcenter need `embeddings`; random needs `rng`. random needs no
     embeddings, so callers may skip the DINOv3 pass.

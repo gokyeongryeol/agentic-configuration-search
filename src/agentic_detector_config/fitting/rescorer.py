@@ -17,7 +17,7 @@ Form (logit-space blending):
 
 **Not monotone**: P̂ is a function of the embedding and features, so within-class
 ranking changes. This is the only path that moves the PR curve (a monotone
-transform leaves F1 unchanged once τ_c is re-estimated) and is what the recall
+transform leaves F(β) unchanged once τ_c is re-estimated) and is what the recall
 channel relies on.
 
 **Dataset fingerprint**: the artifact carries a fingerprint of the training
@@ -216,10 +216,8 @@ def oof_phat(feature_names: list[str], X_hand: np.ndarray, E: np.ndarray,
     """Out-of-fold P̂ for α selection — keeps discriminator overfitting out of α selection.
 
     Trains members per outer fold, takes the **logit mean**, and fits isotonic
-    once over the pooled OOF values. Calling `GbdtVerifier.fit` per fold would
-    nest the internal-CV isotonic, blowing fits up from folds×members to
-    folds×(inner_folds+1)×members, and the selection signal does not need that
-    precision.
+    once over the pooled OOF values (calling `GbdtVerifier.fit` per fold would
+    nest the internal-CV isotonic and blow up the number of fits).
 
     With `groups` (per-row group key, usually the image filename), splits are
     **by group** — detections of one image share context features
@@ -262,7 +260,7 @@ def _label_correct(det: dict, cid: int, gt_anns, iou_thr: float) -> bool:
     """Whether labeling this detection as class cid agrees with a GT.
 
     `iou_thr` is **passed by the caller from config** — with a default here, the
-    F1/τ_c path would use `detector.iou_threshold` while P̂'s training target
+    F(β)/τ_c path would use `detector.iou_threshold` while P̂'s training target
     stayed pinned at 0.5, so raising the threshold would make the discriminator
     learn a different criterion.
 
@@ -381,7 +379,7 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
             return per_image_records(dev_split, dev_image_paths,
                                      [by.get(p.name, []) for p in dev_image_paths])
 
-        # only classes where comparison is meaningful — α moves F1 only with both GT and detections
+        # only classes where comparison is meaningful — α moves F(β) only with both GT and detections
         base_recs = recs_for(0.0)
         with_det = {d["category_id"] for rec in base_recs for d in rec["detections"]}
         with_gt = {g["category_id"] for rec in base_recs for g in rec["gts"]}

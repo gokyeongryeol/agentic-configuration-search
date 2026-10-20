@@ -1,8 +1,8 @@
 """text×semantic modality ensemble merge — **diagnostic only**.
 
 union is not a selectable option — a single τ_c over a mixed score
-distribution breaks F1 estimation. It is used only when screen records "the F1
-union would have reached" in `modality_diagnostic`; a consistently large
+distribution breaks F(β) estimation. It is used only when screen records "the
+F(β) union would have reached" in `modality_diagnostic`; a consistently large
 union_margin is a reason to revisit per-modality τ.
 
 Semantics match stage 1 of `tiling.merge` (class-wise IoU dedup): when both

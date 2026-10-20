@@ -9,14 +9,14 @@ dataset: demo_data/soccer-players-5fuqs   # (required) Roboflow root — needs t
 out_dir: runs                             # root for run artifacts (--out takes precedence)
 rounds: 10                                # planner round cap — saturation wins if it stops first
 # β of the decision metric F-beta — 1.0=F1, >1 weights recall, <1 weights precision.
-# Runs through threshold estimation (incl. tau_test), screen scoring, the adoption gate and the rescorer α curve.
+# Runs through threshold estimation, screen scoring, the adoption gate and the rescorer α curve.
 beta: 1.0
 # Operator-supplied description of the dataset (optional) — inserted verbatim into the
-# LLM planner prompt only (the deterministic planner ignores it). With "" the prompt is byte-identical to before this key existed.
+# LLM planner prompt only (the deterministic planner ignores it). With "" the prompt has no such block.
 dataset_notes: ""
 # Execution randomness seed — material-mining sampling, lora, crop classifier training, gate bootstrap.
-# Kept separate from split.seed (split boundaries): seed waves hold fit_train/fit_dev fixed
-# and vary only this value to measure search variance.
+# Kept separate from split.seed (split boundaries), so search variance can be measured
+# by varying only this value with fit_train/fit_dev fixed.
 run_seed: 0
 
 planner:
@@ -36,7 +36,7 @@ planner:
     persist: true                         # resident: attach to a healthy port, not torn down at run end
 
 gate:                                     # adoption gate
-  margin: 0.0                             # adopt iff one-sided CI lower bound of Δ micro F(β) ≥ margin **and** Δ > 0
+  margin: 0.0                             # adopt iff one-sided CI lower bound of holdout Δ micro F(β) ≥ margin **and** Δ > 0
   bootstrap: 2000                         # paired bootstrap resamples
   confidence: 0.95                        # CI confidence level (alpha = 1 - confidence)
 
@@ -82,9 +82,9 @@ search:                                   # value space of the screen (fit_dev) 
   max_threshold_candidates: 50
   tau_tolerance: 0.005                    # τ_c tie tolerance — within it, pick the point with the most margin
   neg_eta_grid: [0.25, 0.35, 0.5, 0.65, 0.75]   # negative suppression IoU threshold sweep
-  # Tile grids — tiling is the zoom. grid g (image-relative g×g) is the value of
-  # the planner-chosen tiling axis (2–6); only parameters shared by every grid live
-  # here. Zoom (g-1)(1-overlap)+1, 1+g² passes per image — resolution-independent.
+  # Tile grids — grid g (image-relative g×g) is the value of the planner-chosen
+  # tiling axis (2–6); only parameters shared by every grid live here.
+  # Zoom (g-1)(1-overlap)+1, 1+g² passes per image — resolution-independent.
   tiling_overlap: 0.5                     # overlap 0.5: grid 2 → 1.5×, grid 3 → 2.0×
   tiling_merge: nmm                       # nmm (union seam fragments) | nms
   modalities: [semantic, text]
@@ -105,7 +105,7 @@ crop_classifier:                          # detection reclassification axis — 
   margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this
 
 lora:                                     # tail fine-tune + λ-interpolation arms — off by default, the planner turns it on
-  min_images: 20                          # skip training (keep base) if fit_train has fewer images
+  min_images: 20                          # block lora candidates if fit_train has fewer images
   lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]    # 0.0 required — λ=0 is bit-exact base
   margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this
   epochs: 10
@@ -115,4 +115,4 @@ lora:                                     # tail fine-tune + λ-interpolation ar
 
 diagnose:                                 # FP/FN diagnosis criteria
   small_object_ratio: 0.04                # missed_small cut — object size relative to the image, √(box area/image area).
-                                          #   0.04 = 4% of a side (0.16% of the area), about 26px at YOLOE's 640px input
+                                          #   0.04 = 4% of a side, about 26px at YOLOE's 640px input

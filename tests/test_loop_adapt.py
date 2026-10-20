@@ -228,10 +228,9 @@ def test_arm_refits_rescorer_instead_of_dropping(root, tmp_path, monkeypatch):
 
 
 def test_resume_restores_server_state(root, tmp_path, monkeypatch):
-    """resume must reapply the champion's server state — champion.json only records paths, and
-    a fresh process starts with the base model and reclassification off. Without reapplying, that
-    round's candidates are scored by a different detector than the champion, while the gate compares
-    paired against the champion's recorded records, so Δ is silently contaminated."""
+    """resume must reapply the champion's detector state — a fresh process starts with the base
+    model, so without reapplying, candidates are scored by a different detector than the
+    champion and Δ is contaminated."""
     from agentic_detector_config.config import config_from_dict
     from agentic_detector_config.loop.runner import Loop
 

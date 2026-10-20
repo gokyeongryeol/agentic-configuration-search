@@ -9,11 +9,10 @@ rescorer candidates are wired by loop.rescore, lora candidates (YOLOE tail
 fine-tune) by loop.tail_round, crop classifier candidates by loop.adapt_round.
 The latter two are **detector-state candidates**: they swap the
 in-process detector client's weights (weights_ctl) or reclassification
-artifact (adapt_ctl), so they run only when `detector_hooks` is injected; otherwise
-they are just recorded as `skipped` (being recorded, they join the tried set
-and are not re-proposed). Because they mutate client state they are handled
-**after all other candidates are evaluated**, and the current state is
-restored if they are not adopted.
+artifact (adapt_ctl), so they run only when `detector_hooks` is injected;
+otherwise they are just recorded as `skipped`. They are handled **after all
+other candidates are evaluated**, and the current state is restored if they
+are not adopted.
 """
 
 from __future__ import annotations
@@ -188,11 +187,9 @@ class Loop:
         channel the candidate will serve**.
 
         The rescorer is a client-side calibration layer, so skipping it in
-        evaluation changes the score channel. If champion and candidate are on
-        different channels, the paired Δ becomes "candidate ± calibration
-        layer" instead of the candidate's increment, and if those records become
-        the champion the contamination spreads to later rounds. The branch lives
-        in this one place so call sites cannot drift apart.
+        evaluation changes the score channel and the paired Δ becomes
+        "candidate ± calibration layer" instead of the candidate's increment.
+        The branch lives in this one place so call sites cannot drift apart.
         """
         if entry.get("_rescorer") is not None:
             return rescore.rescored_evaluate(self.cfg, self.client, self.ds,
@@ -208,14 +205,10 @@ class Loop:
         """On resume, re-apply the champion's detector state (weights and
         reclassification artifact) to the in-process client.
 
-        champion.json only **records** the paths; a new process's client starts
-        with base weights and no reclassifier. Without re-applying them, the
-        round's candidates are scored with a **different detector** than the
-        champion, while the gate compares paired against the champion's recorded
-        records — so Δ becomes "candidate − champion's state gain" rather than
-        the candidate's increment. No error or warning is raised and the axis
-        labels, inherited from the champion, still look enabled — a silent
-        failure.
+        A new process's client starts with base weights and no reclassifier.
+        Without re-applying them, candidates are scored with a different
+        detector than the champion, and the gate's Δ against the champion's
+        recorded records is silently wrong.
         """
         if not self.detector_hooks:
             return                        # run without client state controls
@@ -599,14 +592,10 @@ class Loop:
             evaluated.append({**c, "eval": ev, "gate": _gate(ev)})
 
         # --- lora candidates — they swap the client's weights, so always last ---
-        # Evaluate with the champion's classifier **left loaded**. The classifier
-        # is a crop -> class function, not calibrated to the detector's score
-        # distribution (its only detector dependence is that background crops
-        # were mined from old FPs). Removing it would make lora fight carrying a
-        # handicap equal to the classifier's gain.
-        # What the detector has loaded right now — updated whenever a candidate
-        # swaps it. A dirty flag cannot tell whether a later candidate restored
-        # the current state, so it loses an earlier winner's state.
+        # Evaluate with the champion's classifier left loaded — a crop -> class
+        # function is not tied to the detector's score distribution, and removing
+        # it would make lora fight carrying a handicap equal to its gain.
+        # served_* is what the detector has loaded right now (updated per candidate).
         served_w = champion.get("weights")
         served_a = champion.get("adapt_root")
         for c in lora_cands:
@@ -933,11 +922,10 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
     """Name of an enabled axis whose materials are empty — meaning the candidate
     equals baseline.
 
-    Especially common for alias and text_negatives — caption pools get
-    exhausted by safety rules (own parts, kin classes, category names). Going
-    through screen and holdout eval while empty just spends round budget
-    re-confirming Δ≈0. Rejecting here leaves a history entry that also feeds
-    back to the planner."""
+    Common for alias and text_negatives — caption pools get exhausted by the
+    safety rules. Going through screen and holdout eval while empty just spends
+    budget re-confirming Δ≈0. Rejecting here leaves a history entry that also
+    feeds back to the planner."""
     if axes.get("exemplar", "none") != "none" and not any(
             (materials.exemplars or {}).values()):
         return "exemplar"
@@ -969,12 +957,9 @@ def _winner_axes(winner: dict) -> tuple[dict, bool]:
     """Champion label reconciliation — axes.rescorer must match whether
     rescorer_path exists.
 
-    Labels must reflect **the actual serving state**. Arms refit the rescorer
-    and measure with it on (_arm_rescorer), which already corrects axes if the
-    refit is identity — this function is the backstop after that: any label
-    that arrives enabled without a rescorer_path is turned off. If labels drift
-    from serving, the next round's dedup, diagnosis and champion.json all
-    record a layer that does not exist."""
+    The backstop after _arm_rescorer's own correction: any label that arrives
+    enabled without a rescorer_path is turned off. If labels drift from
+    serving, dedup, diagnosis and champion.json record a layer that does not exist."""
     axes = dict(winner["axes"])
     if axes.get("rescorer") and not winner.get("rescorer_path"):
         axes["rescorer"] = False
@@ -986,10 +971,7 @@ def _measured_axes(axes: dict, *, rescorer: bool) -> dict:
     """Reconcile candidate axes with **the actually measured state**.
 
     Upstream arms (lora, classifier) also refit the rescorer and measure with
-    it on — removing it would make the gate's Δ a "+upstream, −rescorer"
-    composite, handicapping the upstream axis by the rescorer's gain. If the
-    refit is identity (α=0 for every class), axes reflects that: labels must
-    match the measured state (_winner_axes checks the same thing)."""
+    it on. If the refit is identity (α=0 for every class), axes reflects that."""
     return {**axes, "rescorer": bool(rescorer)}
 
 

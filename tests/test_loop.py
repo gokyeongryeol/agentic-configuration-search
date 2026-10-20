@@ -23,8 +23,7 @@ def big_root(tmp_path: Path) -> Path:
     the bootstrap CI lower bound sticks to 0 and no gate scenario can be built."""
     ds = tmp_path / "big"
     # Mix GT sizes (r≈0.22–0.45 relative to the image — no missed_small at the
-    # default cut 0.04). The sizes date from a relative (lower-quartile) cut, under
-    # which uniform sizes made every FN missed_small and the planner only proposed tiling.
+    # default cut 0.04).
     size = lambda i: 20 + (i % 3) * 10  # noqa: E731
     make_split(ds / "train", [
         {"name": f"tr{i:02d}.png", "w": 100, "h": 80,
@@ -280,9 +279,8 @@ def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
 def test_resume_honors_saturation_and_writes_summary(big_root, tmp_path,
                                                      monkeypatch):
     """resume restores the saturation counter from the history tail — an already saturated
-    run does not run more rounds on resume (regression guard against restarts resetting the
-    counter to 0 and burning extra GPU rounds on a saturated run). For analysis, history
-    round timestamps (ts, dur_s) and run_summary.json are also written."""
+    run does not run more rounds on resume. For analysis, history round timestamps
+    (ts, dur_s) and run_summary.json are also written."""
     import json as _json
 
     from agentic_detector_config.config import config_from_dict
@@ -342,8 +340,7 @@ def test_server_state_routing_is_increment_based():
 def test_winner_axes_drop_stale_rescorer_label():
     """Champion label consistency: if the rescorer was not applied when evaluating the winner (the
     winner has no rescorer_path), axes.rescorer=True is a false label — it must be corrected to False
-    so a rescorer refit can be re-proposed as a new increment in later rounds (guards against the
-    calibration layer silently dropping when a server-state axis is accepted on a rescorer champion)."""
+    so a rescorer refit can be re-proposed as a new increment in later rounds."""
     from agentic_detector_config.loop.runner import _winner_axes
 
     ax, dropped = _winner_axes({"axes": {"rescorer": True, "lora": True},

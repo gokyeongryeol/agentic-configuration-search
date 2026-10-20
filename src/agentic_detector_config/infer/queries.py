@@ -34,7 +34,7 @@ def config_grid(neg_eta_grid=(), tiling_variants=()) -> list[dict]:
 
 def build_config_queries(qcfg, config: dict, exemplars, visual_negatives):
     """Semantic query construction depends only on negatives on/off — unified in
-    this one function so screen and test evaluation build identically.
+    this one function so screen and holdout evaluation build identically.
     qcfg = Config.query."""
     return build_queries(
         exemplars,

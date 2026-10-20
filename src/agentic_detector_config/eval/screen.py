@@ -4,11 +4,11 @@ Grid evaluation, shared config, per-class modality pick. Two boundaries:
 (1) The evaluation split is **fit_dev**, not all of train (search runs on
     fit_dev; τ_c, adoption, and saturation on the holdout).
 (2) This only **fixes the setting and ranks** candidates — τ_c is
-    re-estimated on the holdout (eval.evaluate); the thresholds and F1 here
+    re-estimated on the holdout (eval.evaluate); the thresholds and F(β) here
     exist only to rank candidates in screen.
 
 union (merging both modalities) is not a selectable option — a single τ_c over
-a mixed score distribution breaks F1 estimation. "The F1 union would have
+a mixed score distribution breaks F(β) estimation. "The F(β) union would have
 reached" is recorded as a diagnostic only.
 """
 
@@ -31,13 +31,10 @@ def select_shared_config(rows: list[dict], grid: list[dict]) -> dict[int, dict]:
     """From the config×class evaluation, pick **one config shared by all
     classes** plus per-class thresholds.
 
-    Picks the config with the largest sum of per-class F1. Choosing the best
-    config per class scores slightly higher, but inference of the adopted
-    setting then sweeps **all images once per distinct config**, multiplying
-    cost by up to the number of classes. Sharing costs one pass regardless.
-
-    Thresholds are not shared — each class peaks at a different point, and
-    thresholds are applied post hoc at no extra inference cost.
+    Picks the config with the largest sum of per-class F(β). Picking per class
+    multiplies inference by the number of distinct configs; sharing costs one
+    pass regardless of class count. Thresholds are not shared — they are
+    applied post hoc at no extra inference cost.
     """
     by_class: dict[int, dict[int, dict]] = {}
     for r in rows:
@@ -181,7 +178,7 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
                 per_class[c.id] = {"config_id": shared_id, "threshold": thr,
                                    "f_beta": f1, "modality": "text"}
 
-    # --- fit_dev micro F1 of the adopted setting (reuses cached passes — no
+    # --- fit_dev micro F(β) of the adopted setting (reuses cached passes — no
     # extra inference) ---
     micro = 0.0
     if per_class:

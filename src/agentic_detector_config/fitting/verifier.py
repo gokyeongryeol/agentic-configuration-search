@@ -44,11 +44,9 @@ def detection_features(det: dict, context_dets: list[dict], area_stats: dict,
     # Minimum score gap to overlapping detections of other classes.
     # +1.0 if nothing overlaps (no ambiguity).
     #
-    # Calling iou_matrix per pair, with this function called per detection, would
-    # mean n² numpy calls per image (270 detections/image on dense datasets -> 70k).
-    # Candidates are stacked into one array and computed in **one** call —
-    # iou_matrix is all elementwise broadcast, so per-pair values are bit-identical,
-    # and the min reduction (IEEE double min) is order-independent.
+    # The caller invokes this per detection, so calling iou_matrix per pair would
+    # mean n² calls per image — candidates are stacked and computed in **one**
+    # call (elementwise, so per-pair values are bit-identical).
     margin = 1.0
     others = [o for o in context_dets
               if o is not det and o["category_id"] != det["category_id"]]
@@ -88,11 +86,8 @@ def fit_isotonic(scores: np.ndarray, y: np.ndarray) -> list[list[float]]:
 
     **Tied scores are merged before PAV.** If rows with the same x fall into
     different blocks, one x gets several y values and `np.interp` picks the
-    last — a tied group with a true rate of 0.1 got calibrated to 1.0, and the
-    result depended on row order within the group (an inflated P̂ lifts that
-    whole group's scores in the rescorer blend). Ties are common: clip
-    saturation of the ensemble logit mean, constant fill for degenerate folds,
-    and identical GBDT leaves all produce bit-identical raw scores.
+    last, so a tied group's calibration depends on row order. Ties are common
+    (clip saturation, constant fill for degenerate folds, identical GBDT leaves).
     """
     s_all = np.asarray(scores, dtype=float)
     y_all = np.asarray(y, dtype=float)
@@ -186,10 +181,9 @@ class GbdtVerifier:
 
     Ensemble (`members`>1): uses the **logit mean** of members varying seed and
     an 80% subsample (averaging probabilities overweights extremes and smears
-    the pre-calibration distribution). The ensemble shifts the P̂ distribution,
-    so any fixed cut on P̂ changes meaning unless re-tuned.
+    the pre-calibration distribution).
 
-    Serialization: the rescorer pickles this whole object into rescorer.pkl —
+    Serialization: the rescorer pickles this whole object (rescorer.MODEL_FILE) —
     pickle is used only to exchange artifacts inside a run directory.
     """
 
@@ -197,7 +191,7 @@ class GbdtVerifier:
                  isotonic: list[list[float]], meta: dict | None = None):
         self.features = list(features)
         self.emb_dim = int(emb_dim)
-        # also accepts a single model (e.g. callers and test stubs passing one estimator)
+        # also accepts a single model (members=1, test stubs)
         self.models = list(models) if isinstance(models, (list, tuple)) else [models]
         self.isotonic = [list(map(float, p)) for p in isotonic]
         self.meta = meta or {}

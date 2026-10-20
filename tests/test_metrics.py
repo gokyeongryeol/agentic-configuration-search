@@ -1,4 +1,4 @@
-"""metrics.py: FP cause classification + F1-max threshold estimation."""
+"""metrics.py: FP/FN cause classification + F(β)-max threshold estimation."""
 
 import pytest
 
@@ -265,11 +265,9 @@ def test_threshold_is_deterministic():
 
 
 # --- missed_small = object size relative to the image ---------------------------
-# A relative cut (lower quartile of a class's GT areas) ranked objects within the
-# dataset, so even a dataset of only large objects got missed_small every round and
-# tiling kept coming back as a remedy. The cut is now the object's **size relative to
-# the image**, r = √(box area / image area) — the detector sees the image resized by
-# its preprocessor, so the ratio, not the original px, sets how large an object looks.
+# The cut is the object's **size relative to the image**, r = √(box area / image
+# area) — the detector sees the image resized by its preprocessor, so the ratio,
+# not the original px, sets how large an object looks.
 
 def _miss_kinds(gts, w, h, **kw):
     per_image = [_rec([], gts, w=w, h=h)]

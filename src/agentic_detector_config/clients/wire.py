@@ -26,7 +26,7 @@ def parse_prediction(pred: dict, name_to_id: dict,
 
     If the response carries `embeddings` (per-detection, when `return_embeddings`
     was requested), attach each as the detection's `embedding` key — features
-    for the verifier (gbdt engine).
+    for the rescorer discriminator.
     """
     texts = pred.get("text") or []
     boxes, scores = pred.get("boxes", []), pred.get("scores", [])

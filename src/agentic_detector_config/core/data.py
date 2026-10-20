@@ -50,7 +50,7 @@ class Dataset:
     root: Path
     ontology: Ontology
     train: Split      # full train — prompt mining, FP/FN diagnosis
-    fit_train: Split    # training for YOLOE tail fine-tune (lora axis) and rescorer
+    fit_train: Split    # training for YOLOE tail fine-tune (lora axis), rescorer and crop classifier
     fit_dev: Split      # scoring grids, λ, α (screen)
     holdout: Split      # τ_c estimation, adoption, saturation
     holdout_split: str  # directory the holdout came from — "valid" or substitute "test"

@@ -33,12 +33,10 @@ AXES: dict[str, tuple] = {
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
     "crop_classifier": (False, True),         # re-classify detections (fixes class_confusion, drops background FPs)
-    # --- count axes (grid 1·2·4; exemplar up to 8) ---
-    # None = the config's default quota (MineCfg's *_per_class), which is the
-    # count axes' safe point. Meaningful only when the matching feature axis is
-    # on (enforced by validate_axes). config/default.yaml is canonical for the
-    # concrete defaults.
-    # Up to 8 so we can tell whether the grid hits its upper bound
+    # --- count axes (grid 1·2·4; exemplar up to 8 to see whether it hits the cap) ---
+    # None = the config's default quota (MineCfg's *_per_class) and the safe
+    # point. Meaningful only when the matching feature axis is on (enforced by
+    # validate_axes).
     "exemplar_k": (None, 1, 2, 4, 8),         # base exemplars per class
     "fn_k": (None, 1, 2, 4),                  # extra FN-arm exemplars per class
     "visual_negative_k": (None, 1, 2, 4),            # visual negatives per class
@@ -168,11 +166,9 @@ def sanitize_candidates(raw, *, max_candidates: int,
     adopts, so leniency here is harmless while propagating errors kills the loop.
 
     **No silent drops**: given a `dropped` list, record each discarded
-    candidate with its reason. Without it two things quietly break — only 2 of
-    3 proposals get evaluated, shrinking the round budget, and the planner
-    cannot tell "evaluated and rejected" from "never evaluated", so it resubmits
-    the same candidate next round (observed: three rounds in a row in one run).
-    The runner's combo_tried already follows the same principle.
+    candidate with its reason. Without it the planner cannot tell "evaluated and
+    rejected" from "never evaluated" and resubmits the same candidate. The
+    runner's combo_tried follows the same principle.
 
     Four reasons: invalid_axes (contract violation) · disabled_axes (axis/value
     banned for this run) · duplicate_axes (repeat within one response) ·

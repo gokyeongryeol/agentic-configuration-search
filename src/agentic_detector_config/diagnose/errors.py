@@ -56,13 +56,9 @@ def diagnose(records: list[dict], floor_records: list[dict] | None,
         names = {c.id: c.name for c in ontology.classes}
 
         def _named(rows: list[dict]) -> list[dict]:
-            # **Replace** image_index with the filename — carrying both gives two
-            # identifiers for one image, and since the prompt substitutes image
-            # with an alias (planner.llm), the numbers would disagree too.
-            #
-            # Attach the category name — per_class is keyed by name but detail
-            # rows carry only the id, so consumers (planner, VLM descriptions)
-            # could not attribute individual errors to a class.
+            # **Replace** image_index with the filename — one identifier per
+            # image. Attach the category name — per_class is keyed by name, so
+            # consumers (planner, VLM descriptions) attribute errors to a class.
             return [{**{k: v for k, v in r.items() if k != "image_index"},
                      "category": names.get(r.get("category_id")),
                      "image": files[r["image_index"]]} for r in rows]

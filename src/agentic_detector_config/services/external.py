@@ -76,8 +76,8 @@ class ManagedServer:
     persist=True is resident mode: attach (without owning) if a healthy server
     already holds the port; otherwise launch one but never take it down in
     stop() — keeps VRAM held between runs and avoids restart cost. An unhealthy
-    occupant still fails immediately (silently attaching to a dead server is the
-    worst failure mode)."""
+    occupant fails immediately — silently attaching to a dead server is the
+    worst failure mode."""
 
     name = "server"
     persist = False

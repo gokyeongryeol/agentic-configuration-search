@@ -10,11 +10,10 @@ threshold — **estimated on fit_dev**. Using tau_test (the holdout estimate)
 would let the holdout pick training material and break material purity. This
 module never receives the holdout split.
 
-**Training uses fit_train only** — the arm is scored by its fit_dev Δ. If fit_dev
-crops were in the training material (previously all of train), scoring would be
-an in-sample comparison on crops the classifier had already seen and the margin
-would filter nothing. Same discipline as lora (trained on fit_train, scored on
-fit_dev).
+**Training uses fit_train only** — the arm is scored by its fit_dev Δ, so fit_dev
+crops in the training material would make scoring an in-sample comparison and
+the margin would filter nothing. Same discipline as lora (trained on fit_train,
+scored on fit_dev).
 """
 
 from __future__ import annotations
