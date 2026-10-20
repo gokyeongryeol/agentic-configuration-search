@@ -88,7 +88,7 @@ search:                                   # value space of the screen (fit_dev) 
   tiling_overlap: 0.5                     # overlap 0.5: grid 2 → 1.5×, grid 3 → 2.0×
   tiling_merge: nmm                       # nmm (union seam fragments) | nms
   modalities: [semantic, text]
-  disabled_axes: []                       # axes the planner may not propose in this run (e.g. [crop_classifier])
+  disabled_axes: []                       # axes the planner may not turn on in this run (e.g. [lora, tiling]) — a champion's own value is kept
   disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}
 
 rescorer:                                 # discriminator on fit_train + α grid on fit_dev

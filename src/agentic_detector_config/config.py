@@ -139,9 +139,10 @@ class SearchCfg:
     tiling_overlap: float = 0.5
     tiling_merge: str = "nmm"
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
-    # Axes that may not be proposed in this run — unwireable axes are blocked at
+    # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
-    # (deterministic and LLM prompt) and by candidate sanitization.
+    # (deterministic and LLM prompt) and by candidate sanitization; a value the
+    # champion already has is inherited, not blocked.
     disabled_axes: list = field(default_factory=list)
     # Forbid specific values of an axis — {axis: [value, ...]} (e.g. a material
     # source the backend does not support). Honored by the same three places

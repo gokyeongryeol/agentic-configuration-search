@@ -64,7 +64,7 @@ def test_llm_prompt_omits_disabled_axes(tmp_path):
     prop = planner.propose([], _diag({"missed": 1}))
     assert "- lora:" not in seen["prompt"]
     assert "- crop_classifier:" not in seen["prompt"]
-    assert "never propose" in seen["prompt"] and "lora" in seen["prompt"]
+    assert "never turn these on" in seen["prompt"] and "lora" in seen["prompt"]
     # LLM candidates that turn on a disabled axis are dropped by sanitize
     assert [c["id"] for c in prop["candidates"]] == ["y"]
 
@@ -132,7 +132,7 @@ def test_llm_prompt_omits_disabled_values(tmp_path):
     LLMPlanner(chat=chat, artifact_dir=tmp_path,
                disabled_values={"exemplar": ("fn_arm",)}).propose([], _diag({}))
     assert "- exemplar: one of ['none', 'base']" in seen["prompt"]
-    assert "never propose" in seen["prompt"] and "exemplar='fn_arm'" in seen["prompt"]
+    assert "never turn these on" in seen["prompt"] and "exemplar='fn_arm'" in seen["prompt"]
 
 
 def test_loop_rejects_unknown_disabled_value(dataset_root, tmp_path):
@@ -141,3 +141,42 @@ def test_loop_rejects_unknown_disabled_value(dataset_root, tmp_path):
                             "search": {"disabled_values": {"exemplar": ["warp"]}}})
     with pytest.raises(ValueError, match="warp"):
         Loop(cfg, dataset_root, tmp_path / "run")
+
+
+# ------------------------------------------- champion inheritance (base)
+
+def test_disabled_axis_value_inherited_from_champion_is_kept():
+    """Only turning an axis on is blocked — blocking a value the champion already
+    has would reject every candidate once the scope is narrowed on resume."""
+    champ = {**BASELINE, "tiling": 2}
+    assert not uses_disabled_axes({**champ, "alias": "vlm"}, ("tiling",), base=champ)
+    assert uses_disabled_axes({**champ, "tiling": 3}, ("tiling",), base=champ)
+    assert uses_disabled_axes({**BASELINE, "tiling": 2}, ("tiling",))
+    dv = {"exemplar": ("fn_arm",)}
+    fn_champ = {**BASELINE, "exemplar": "fn_arm"}
+    assert not uses_disabled_axes({**fn_champ, "alias": "vlm"}, (), dv, base=fn_champ)
+
+
+def test_llm_and_human_candidates_inherit_champion_disabled_axis(tmp_path):
+    champ = {**BASELINE, "tiling": 2}
+    history = [{"round": 1, "champion": {"axes": champ},
+                "decision": {"adopted": True}, "candidates": []}]
+
+    def chat(messages, **kw):
+        return {"candidates": [{"id": "keep", "axes": {"tiling": 2, "alias": "vlm"},
+                                "rationale": "r"},
+                               {"id": "raise", "axes": {"tiling": 3},
+                                "rationale": "r"}], "stop": False}
+
+    prop = LLMPlanner(chat=chat, artifact_dir=tmp_path,
+                      disabled_axes=("tiling",)).propose(history, _diag({}))
+    assert [c["id"] for c in prop["candidates"]] == ["keep"]
+    assert [c["id"] for c in prop["dropped"]] == ["raise"]
+
+    from agentic_detector_config.loop.runner import _load_candidates_file
+    f = tmp_path / "candidates.yaml"
+    f.write_text("- {id: k, axes: {tiling: 2, alias: vlm}}\n"
+                 "- {id: r, axes: {tiling: 3}}\n")
+    kept, dropped = _load_candidates_file(f, ("tiling",), base=champ)
+    assert [c["id"] for c in kept] == ["human_k"]
+    assert [(c["id"], c["skipped"]) for c in dropped] == [("human_r", "disabled_axes")]

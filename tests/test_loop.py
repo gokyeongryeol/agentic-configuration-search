@@ -663,3 +663,38 @@ def test_untiled_setting_is_relabelled_with_request_kept():
                              "requested_axes": entry["requested_axes"]}]}]
     assert tuple(sorted(entry["requested_axes"].items())) in tried_combos(hist)
     assert any("tiling=2" in l for l in _tried_lines(hist, validate_axes({})))
+
+
+# --- forwards per image ---------------------------------------------------
+
+def _setting(groups, tilings):
+    """groups: {cid: (config_id, modality)}, tilings: {config_id: grid g | None}."""
+    return {"configs": [{"config_id": i,
+                         "tiling": ({"grid": g, "overlap": 0.5, "merge": "nmm"}
+                                    if g else None)} for i, g in tilings.items()],
+            "per_class": {cid: {"config_id": c, "modality": m}
+                          for cid, (c, m) in groups.items()}}
+
+
+def test_setting_forwards_counts_passes_and_tiles():
+    """Forwards per image = 1 + g² per (config, modality) pass the setting runs.
+    A grid has g² tiles regardless of image size, so the setting alone decides it."""
+    from agentic_detector_config.loop.runner import setting_forwards
+
+    assert setting_forwards(_setting({1: (0, "text"), 2: (0, "text")}, {0: None})) == 1
+    assert setting_forwards(_setting({1: (0, "semantic"), 2: (0, "text")}, {0: None})) == 2
+    assert setting_forwards(_setting({1: (1, "text")}, {0: None, 1: 3})) == 10
+    assert setting_forwards(_setting({1: (1, "semantic"), 2: (1, "text")},
+                                     {0: None, 1: 2})) == 10
+
+
+def test_forwards_recorded_on_champion_and_candidates(big_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+               rounds=1, **_fakes())
+    champ = json.loads((tmp_path / "run" / "champion.json").read_text())
+    assert champ["forwards_per_image"] >= 1
+    hist = _hist(tmp_path / "run")
+    assert all("forwards_per_image" in h["champion"] for h in hist)
+    screened = [c for c in hist[1]["candidates"] if not c.get("skipped")]
+    assert screened and all(c["forwards"] >= 1 for c in screened)

@@ -143,22 +143,33 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
     return full
 
 
-def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None) -> bool:
-    """Do the axes use a banned axis/value? (per-run proposal bans)
+def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None,
+                       base: dict | None = None) -> bool:
+    """Do the axes turn on a banned axis/value? (per-run proposal bans)
 
     - disabled_axes: ban a whole axis — only moving it off its safe point
       (BASELINE) counts.
     - disabled_values: {axis: [banned value, ...]} — ban specific values only;
       other values of the axis can still be proposed.
+
+    A value equal to base (the current champion's) is inherited, not turned on —
+    blocking it would reject every candidate once the scope is narrowed on resume.
     """
-    if any(axes.get(a) != BASELINE.get(a) for a in (disabled_axes or ())):
+    base = base or {}
+
+    def _new(a) -> bool:
+        return a not in base or axes.get(a) != base[a]
+
+    if any(axes.get(a) != BASELINE.get(a) and _new(a) for a in (disabled_axes or ())):
         return True
-    return any(axes.get(a) in vals for a, vals in (disabled_values or {}).items())
+    return any(axes.get(a) in vals and _new(a)
+               for a, vals in (disabled_values or {}).items())
 
 
 def sanitize_candidates(raw, *, max_candidates: int,
                         dropped: list | None = None,
                         disabled_axes=(), disabled_values=None,
+                        base: dict | None = None,
                         facts: DatasetFacts | None = None) -> list[dict]:
     """Filter the planner's (especially the LLM's) candidate list against the contract.
 
@@ -171,8 +182,8 @@ def sanitize_candidates(raw, *, max_candidates: int,
     runner's combo_tried follows the same principle.
 
     Four reasons: invalid_axes (contract violation) · disabled_axes (axis/value
-    banned for this run) · duplicate_axes (repeat within one response) ·
-    max_candidates (over quota).
+    banned for this run, unless inherited from base — the champion's axes) ·
+    duplicate_axes (repeat within one response) · max_candidates (over quota).
     """
     out, seen = [], set()
 
@@ -197,7 +208,7 @@ def sanitize_candidates(raw, *, max_candidates: int,
             # round's prompt and is the only signal that stops the same violation.
             _drop(i, c, "invalid_axes", str(exc))
             continue
-        if uses_disabled_axes(axes, disabled_axes, disabled_values):
+        if uses_disabled_axes(axes, disabled_axes, disabled_values, base=base):
             _drop(i, c, "disabled_axes", "uses an axis/value disabled for this run")
             continue
         key = tuple(sorted(axes.items()))

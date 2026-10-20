@@ -73,6 +73,7 @@ def _setting_load(lite: dict) -> dict:
 
 
 def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
+                          base: dict | None = None,
                           facts: DatasetFacts | None = None
                           ) -> tuple[list[dict], list[dict]]:
     """Human-injected candidates — (kept, dropped). Drops are recorded by the same
@@ -87,7 +88,7 @@ def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
     cands = sanitize_candidates(raw, max_candidates=64, dropped=dropped,
                                 disabled_axes=disabled_axes,
                                 disabled_values=disabled_values,
-                                facts=facts)
+                                base=base, facts=facts)
     for c in cands + dropped:
         c["id"] = f"human_{c['id']}"
         c["source"] = "human"
@@ -147,7 +148,8 @@ class Loop:
                   "micro_f_beta": champion["eval"]["micro_f_beta"],
                   "weights": champion.get("weights"),
                   "adapt_root": champion.get("adapt_root"),
-                  "rescorer_path": champion.get("rescorer_path")})
+                  "rescorer_path": champion.get("rescorer_path"),
+                  "forwards_per_image": setting_forwards(champion["setting"])})
         _write(self.out_dir / "champion_eval.json", champion["eval"])
 
     def _load_champion(self) -> dict:
@@ -329,6 +331,7 @@ class Loop:
         # merge human-injected candidates (hybrid loop)
         humans, human_dropped = _load_candidates_file(
             self.candidates_file, self.disabled_axes, self.disabled_values,
+            base=(history[-1].get("champion", {}).get("axes") if history else None),
             facts=self._facts())
         merged = proposal["candidates"] + humans
 
@@ -497,8 +500,7 @@ class Loop:
         self._save_champion(champion)
         self._append_history({
             "round": 0,
-            "champion": {"axes": champion["axes"], "round": 0, "id": "baseline",
-                         "micro_f_beta": ev["micro_f_beta"]},
+            "champion": _champion_summary(champion),
             "candidates": [], "decision": decision})
         return champion
 
@@ -555,9 +557,7 @@ class Loop:
             _write(rd / "decision.json", decision)
             self._append_history({
                 "round": r,
-                "champion": {"axes": champion["axes"], "round": champion["round"],
-                             "id": champion["id"],
-                             "micro_f_beta": champion["eval"]["micro_f_beta"]},
+                "champion": _champion_summary(champion),
                 "candidates": skipped, "decision": decision})
             return decision, champion
 
@@ -773,13 +773,12 @@ class Loop:
         _write(rd / "decision.json", decision)
         self._append_history({
             "round": r,
-            "champion": {"axes": champion["axes"], "round": champion["round"],
-                         "id": champion["id"],
-                         "micro_f_beta": champion["eval"]["micro_f_beta"]},
+            "champion": _champion_summary(champion),
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
                             | _tiling_record(c) | _requested(c)
+                            | {"forwards": setting_forwards(c["setting"])}
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -871,6 +870,27 @@ def _tiling_variants(search, axes: dict) -> tuple:
         return ()
     return ({"grid": int(g), "overlap": search.tiling_overlap,
              "merge": search.tiling_merge},)
+
+
+def setting_forwards(setting: dict) -> int:
+    """How many detector forwards the setting runs per image — 1 + g² per
+    (config, modality) pass (grid g tiles, 1 without tiling). The grid tile
+    count does not depend on image size."""
+    configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
+    groups = {(e["config_id"], e.get("modality", "semantic"))
+              for e in (setting.get("per_class") or {}).values()}
+    total = 0
+    for config_id, _modality in groups:
+        tile = (configs.get(config_id) or {}).get("tiling")
+        total += 1 + (int(tile["grid"]) ** 2 if tile else 0)
+    return total or 1
+
+
+def _champion_summary(champion: dict) -> dict:
+    """The champion summary in a history row — with its serving cost (forwards_per_image)."""
+    return {"axes": champion["axes"], "round": champion["round"],
+            "id": champion["id"], "micro_f_beta": champion["eval"]["micro_f_beta"],
+            "forwards_per_image": setting_forwards(champion["setting"])}
 
 
 def _uses_tiling(setting: dict) -> bool:

@@ -393,7 +393,7 @@ Dataset notes from the operator (verbatim context — weigh against the diagnosi
 # are not just omitted from the list but explicitly forbidden (so the LLM does
 # not reintroduce them from its own world knowledge).
 DISABLED_BLOCK = """
-Unavailable in this run (never propose): {disabled}.
+Unavailable in this run (never turn these on; the champion keeps any it already has): {disabled}.
 """
 
 
@@ -511,6 +511,7 @@ class LLMPlanner:
                                          dropped=dropped,
                                          disabled_axes=self.disabled_axes,
                                          disabled_values=self.disabled_values,
+                                         base=champion or None,
                                          facts=self.facts)
         if dropped:
             log.info("sanitizer dropped %d candidates: %s", len(dropped),

@@ -79,6 +79,10 @@ the baseline behavior.
 | crop_classifier | SigLIP2+LoRA re-classification of detections |
 | counts k | how many exemplars/negatives to use |
 
+Axes not to search on a dataset go in `search.disabled_axes` (e.g. `[lora, tiling]`;
+`search.disabled_values` bans single values). Only candidates that newly turn one
+on are blocked — a value the champion already has is kept.
+
 ### Round loop
 
 ```
@@ -110,7 +114,7 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 runs/<dataset>/run/
   history.jsonl        # round ledger
   run_summary.json     # stop reason, final champion, holdout_split
-  champion.json        # champion setting (axes, materials, weights, adapt_root)
+  champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image)
   champion_eval.json   # champion holdout evaluation, incl. tau_test
   rounds/round_NNN/    # proposal, settings/<cand>/ materials, screen, eval, decision, diagnosis
 ```
