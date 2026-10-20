@@ -5,7 +5,7 @@ Includes train/dev discipline tests (fit_rescorer)."""
 import numpy as np
 import pytest
 
-from agentic_detector_config.fitting.rescorer import (Rescorer, blend, dataset_fingerprint,
+from agentic_configuration_search.fitting.rescorer import (Rescorer, blend, dataset_fingerprint,
                                      fit_discriminator, logit, oof_phat, sigmoid)
 
 FEATS = ["score", "overlap_margin", "area_z", "tile_agree"]
@@ -151,7 +151,7 @@ def test_emb_dim_mismatch_raises():
 
 
 def test_oof_phat_separates_and_is_out_of_fold():
-    from agentic_detector_config.core.metrics import rank_auc
+    from agentic_configuration_search.core.metrics import rank_auc
     hand, E, y = _sep()
     p = oof_phat(FEATS, hand, E, y, members=2)
     assert p.shape == y.shape
@@ -183,7 +183,7 @@ def test_ensemble_roundtrip_preserves_members():
 def test_config_alphas_must_include_identity():
     """Adoption is structurally safe only if the search space includes the baseline —
     validation at config load time enforces this."""
-    from agentic_detector_config.config import ConfigError, config_from_dict
+    from agentic_configuration_search.config import ConfigError, config_from_dict
 
     assert 0.0 in config_from_dict({"dataset": "x"}).rescorer.alphas
     with pytest.raises(ConfigError, match=r"rescorer\.alphas must include 0\.0"):
@@ -191,7 +191,7 @@ def test_config_alphas_must_include_identity():
 
 
 def test_config_rejects_negative_margin_and_zero_members():
-    from agentic_detector_config.config import ConfigError, config_from_dict
+    from agentic_configuration_search.config import ConfigError, config_from_dict
 
     with pytest.raises(ConfigError, match=r"rescorer\.margin cannot be negative"):
         config_from_dict({"dataset": "x", "rescorer": {"margin": -0.01}})
@@ -202,7 +202,7 @@ def test_config_rejects_negative_margin_and_zero_members():
 # ------------------------------------------- fit_rescorer (fit_train/fit_dev discipline)
 
 def _mk_train(root, prefix, n_images):
-    from agentic_detector_config.core.coco import Split
+    from agentic_configuration_search.core.coco import Split
     from tests.conftest import make_split
 
     make_split(root, [
@@ -237,12 +237,12 @@ def _mk_preds(train, prefix, seed=0):
 
 
 def _rs(**over):
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
     return config_from_dict({"dataset": "x", "rescorer": over}).rescorer
 
 
 def _fit(tmp_path, rs, n_train=24, n_dev=12):
-    from agentic_detector_config.fitting.rescorer import fit_rescorer
+    from agentic_configuration_search.fitting.rescorer import fit_rescorer
 
     train = _mk_train(tmp_path / "tr", "t", n_train)
     dev = _mk_train(tmp_path / "dv", "d", n_dev)
@@ -268,7 +268,7 @@ def test_fit_rescorer_adopts_signal_and_rejects_noise(tmp_path):
 
 def rescorer_ont():
     from tests.conftest import CATS
-    from agentic_detector_config.core.coco import Ontology
+    from agentic_configuration_search.core.coco import Ontology
     return Ontology.from_categories(CATS)
 
 
@@ -295,7 +295,7 @@ def test_total_guard_skips_when_train_too_small(tmp_path):
 
 
 def test_apply_rescorer_preserves_raw_and_identity(tmp_path):
-    from agentic_detector_config.fitting.rescorer import _apply_rescorer
+    from agentic_configuration_search.fitting.rescorer import _apply_rescorer
 
     rs = _rs(min_samples=50, min_samples_per_class=1, margin=0.005,
              ensemble_members=2)
@@ -323,7 +323,7 @@ def test_fits_without_embeddings_when_server_omits_them():
     """
     import numpy as np
 
-    from agentic_detector_config.fitting.rescorer import _rescorer_rows as _rows
+    from agentic_configuration_search.fitting.rescorer import _rescorer_rows as _rows
 
     preds = {}
     for i in range(4):
@@ -346,7 +346,7 @@ class _FakeSplit:
 def test_default_alpha_grid_extends_past_two():
     """The α grid's top end (2.0) capped the search — 3 and 4 are added. Ties pick
     the smaller α, so a larger α wins only when it is clearly better on fit_dev."""
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
     alphas = config_from_dict({"dataset": "x"}).rescorer.alphas
     assert alphas[0] == 0.0 and alphas == sorted(alphas)
     assert {3.0, 4.0} <= set(alphas)

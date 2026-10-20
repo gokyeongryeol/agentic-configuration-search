@@ -5,8 +5,8 @@ from collections import Counter
 
 import pytest
 
-from agentic_detector_config.infer import phrases
-from agentic_detector_config.infer.phrases import normalize_caption
+from agentic_configuration_search.infer import phrases
+from agentic_configuration_search.infer.phrases import normalize_caption
 
 ALIAS = "shiny widget"
 
@@ -111,7 +111,7 @@ def test_vlm_caption_rows_contract():
     """VLM captioner contract: rows -> {id: [phrase, ...]}.
     It actually shows the crop (multimodal), so captions are not trapped in the class-name context."""
     from PIL import Image
-    from agentic_detector_config.infer.phrases import vlm_caption
+    from agentic_configuration_search.infer.phrases import vlm_caption
 
     img = Image.new("RGB", (40, 30), "red")
     seen = {}
@@ -136,7 +136,7 @@ def test_vlm_batches_stay_under_server_image_limit():
     """Both paths that send crops to the VLM in batches (the alias=vlm captioner
     and diagnosis crop notes) keep the same limit — a server capping images per
     prompt (--limit-mm-per-prompt) rejects an over-limit batch whole (400)."""
-    from agentic_detector_config.diagnose import describe
-    from agentic_detector_config.infer import phrases
+    from agentic_configuration_search.diagnose import describe
+    from agentic_configuration_search.infer import phrases
 
     assert phrases.VLM_BATCH == describe.CROPS_PER_CALL <= 4

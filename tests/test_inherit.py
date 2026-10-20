@@ -8,11 +8,11 @@ materials, so they are inherited from the parent unchanged.
 import numpy as np
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.fitting.materials import Materials
-from agentic_detector_config.loop.materialize import inherit_plan, materialize
-from agentic_detector_config.planner.axes import BASELINE, validate_axes
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.fitting.materials import Materials
+from agentic_configuration_search.loop.materialize import inherit_plan, materialize
+from agentic_configuration_search.planner.axes import BASELINE, validate_axes
 
 
 def _ax(**kw):

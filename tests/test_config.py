@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentic_detector_config.config import ConfigError, config_from_dict, load_config
+from agentic_configuration_search.config import ConfigError, config_from_dict, load_config
 
 BASE = {"dataset": "demo"}
 

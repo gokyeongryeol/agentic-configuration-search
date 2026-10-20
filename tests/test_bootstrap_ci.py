@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from agentic_detector_config.core.metrics import bootstrap_ci, rank_auc, records_micro_f_beta
+from agentic_configuration_search.core.metrics import bootstrap_ci, rank_auc, records_micro_f_beta
 
 
 def _rec(dets, gts):
@@ -64,7 +64,7 @@ def test_one_sided_tail_is_less_conservative():
     the effective significance level and is over-conservative. tail="lower" gives the alpha percentile."""
     import numpy as np
 
-    from agentic_detector_config.core.metrics import bootstrap_ci
+    from agentic_configuration_search.core.metrics import bootstrap_ci
 
     def stat(recs):
         return float(np.mean([r["v"] for r in recs]))
@@ -80,7 +80,7 @@ def test_one_sided_tail_is_less_conservative():
 
 
 def test_gate_uses_one_sided_bound():
-    from agentic_detector_config.eval.evaluate import gate
+    from agentic_configuration_search.eval.evaluate import gate
     import inspect
     src = inspect.getsource(gate)
     assert 'tail="lower"' in src, "the gate does not use the one-sided lower bound"

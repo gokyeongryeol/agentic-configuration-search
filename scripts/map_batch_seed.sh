@@ -8,7 +8,7 @@
 #     (both written by scripts/run_seeds_yoloe.sh).
 #
 # Idempotent: skips anything that already has a .map.json. Also skips datasets whose
-# search is still running (detected by an adc run holding that config file).
+# search is still running (detected by an acs run holding that config file).
 #
 # Usage: scripts/map_batch_seed.sh <seed> [gpu...]
 set -u
@@ -54,7 +54,7 @@ for s in "$ROOT"/*/run/run_summary.json; do
   # 1) baseline — reconstruct round 0 → verify on holdout → test. Skipped if already done.
   if [ ! -f "$ROOT/$ds/baseline/predictions_test.map.json" ]; then
       log "baseline $ds (gpu $g)"
-      ADC_RUNS="$ROOT" ADC_CFG="$cfg" \
+      ACS_RUNS="$ROOT" ACS_CFG="$cfg" \
           bash scripts/baseline_one.sh "$ds" "$g" >> "$LOG" 2>&1 \
           || log "FAILED baseline $ds"
   fi

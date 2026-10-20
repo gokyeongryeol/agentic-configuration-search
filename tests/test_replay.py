@@ -9,7 +9,7 @@ import json
 
 
 def test_resume_calls_llm_zero_times(tmp_path):
-    from agentic_detector_config.planner.llm import LLMPlanner
+    from agentic_configuration_search.planner.llm import LLMPlanner
 
     calls = []
 
@@ -35,7 +35,7 @@ def test_resume_calls_llm_zero_times(tmp_path):
 
 def test_replay_survives_even_if_chat_would_now_fail(tmp_path):
     """Replay does not depend on the current LLM server state — resume works even if chat is dead."""
-    from agentic_detector_config.planner.llm import LLMPlanner
+    from agentic_configuration_search.planner.llm import LLMPlanner
 
     ok = LLMPlanner(chat=lambda m, **k: {"candidates": [], "stop": True},
                     artifact_dir=tmp_path)

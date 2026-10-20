@@ -5,13 +5,13 @@ Inference is blocked via the gateway seam monkeypatch.
 
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.core.prompts import PromptBox
-from agentic_detector_config.eval.screen import screen_candidate, select_shared_config
-from agentic_detector_config.fitting.materials import Materials
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.infer.queries import config_grid
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.core.prompts import PromptBox
+from agentic_configuration_search.eval.screen import screen_candidate, select_shared_config
+from agentic_configuration_search.fitting.materials import Materials
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.infer.queries import config_grid
 
 CFG = config_from_dict({"dataset": "x"})
 

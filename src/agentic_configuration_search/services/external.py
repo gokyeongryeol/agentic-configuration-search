@@ -27,17 +27,17 @@ def run_adapt_worker(repo_root: Path, *, manifest: Path, num_classes: int,
                      popen=subprocess.Popen) -> Path:
     """Train the crop classifier (SigLIP2+LoRA) — one-shot subprocess in the vLLM venv.
 
-    Same pattern as the dinov3 worker (`-m agentic_detector_config.workers.adapt`):
+    Same pattern as the dinov3 worker (`-m agentic_configuration_search.workers.adapt`):
     torch and peft live in the vLLM venv and the package stays torch-free.
     Hyperparameters are worker constants (universal-best), so none are taken here.
     """
     python = repo_root / VLLM_VENV / "bin" / "python"
     if not python.exists():
-        raise RuntimeError(f"vLLM venv python not found: {python} — check ADC_VLLM_VENV")
+        raise RuntimeError(f"vLLM venv python not found: {python} — check ACS_VLLM_VENV")
     manifest, out_path, log_path = (Path(manifest).resolve(),
                                     Path(out_path).resolve(),
                                     Path(log_path).resolve())
-    cmd = [str(python), "-m", "agentic_detector_config.workers.adapt",
+    cmd = [str(python), "-m", "agentic_configuration_search.workers.adapt",
            "--manifest", str(manifest), "--num-classes", str(int(num_classes)),
            "--out", str(out_path), "--device", device]
     log_path.parent.mkdir(parents=True, exist_ok=True)

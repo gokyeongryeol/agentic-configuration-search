@@ -2,8 +2,8 @@
 
 import pytest
 
-from agentic_detector_config.core.coco import Ontology
-from agentic_detector_config.core.prompts import PromptBox, build_queries
+from agentic_configuration_search.core.coco import Ontology
+from agentic_configuration_search.core.prompts import PromptBox, build_queries
 from tests.conftest import CATS
 
 

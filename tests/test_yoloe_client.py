@@ -6,9 +6,9 @@ and empty embeddings (emb_dim=0).
 
 import pytest
 
-from agentic_detector_config.clients.yoloe import DEFAULT_SUP_IOU, YoloeClient, parse_queries
-from agentic_detector_config.clients.wire import parse_prediction
-from agentic_detector_config.core.prompts import PromptBox, build_queries, build_text_queries
+from agentic_configuration_search.clients.yoloe import DEFAULT_SUP_IOU, YoloeClient, parse_queries
+from agentic_configuration_search.clients.wire import parse_prediction
+from agentic_configuration_search.core.prompts import PromptBox, build_queries, build_text_queries
 
 
 def text_bundle(negatives=None, aliases=None):
@@ -187,7 +187,7 @@ def test_cuda_visibility_restored_after_backend_calls():
     worker subprocess — it is restored at the call boundary."""
     import os
 
-    from agentic_detector_config.clients.yoloe import _preserve_cuda_visibility
+    from agentic_configuration_search.clients.yoloe import _preserve_cuda_visibility
 
     @_preserve_cuda_visibility()
     def call():

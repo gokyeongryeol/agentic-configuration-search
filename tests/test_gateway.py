@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Ontology
-from agentic_detector_config.infer import gateway
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Ontology
+from agentic_configuration_search.infer import gateway
 from tests.conftest import CATS
 
 ONTO = Ontology.from_categories(CATS)
@@ -142,8 +142,8 @@ def _colored_images(tmp_path, n, size=(100, 80)):
 
 def _reference_tiled(paths):
     """Per-image run_tiled — the unbatched behavior (reference)."""
-    from agentic_detector_config.clients.wire import parse_prediction
-    from agentic_detector_config.core import tiling
+    from agentic_configuration_search.clients.wire import parse_prediction
+    from agentic_configuration_search.core import tiling
     out = []
     for p in paths:
         with Image.open(p) as im:

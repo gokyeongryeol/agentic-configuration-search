@@ -25,9 +25,9 @@ PORT=8104
 MAXLEN=16384                       # the value actually served (the old inline copies had 8192)
 MODEL=Qwen/Qwen3.8-27B-FP8
 # Planner server venv. This is a **different variable** from the GPU worker venv
-# (ADC_VLLM_VENV, services/paths.py) — the two may diverge on this box. While the
+# (ACS_VLLM_VENV, services/paths.py) — the two may diverge on this box. While the
 # resident server is up, the worker side needs no vllm at all (VllmServer only attaches).
-VENV="${ADC_VLLM_SERVE_VENV:-/data/krgo/vllm2}/bin/vllm"
+VENV="${ACS_VLLM_SERVE_VENV:-/data/krgo/vllm2}/bin/vllm"
 STOP=0
 
 # HF cache location. Interactive shells have it set but agent/cron shells don't, so
@@ -54,8 +54,8 @@ mkdir -p runs
 if [ "$STOP" = 1 ]; then
     # Don't shut down while a run uses it — that would pull the planner out from under a live experiment.
     # The pattern also matches `za run` (legacy CLI name) since the vLLM may be shared with other checkouts.
-    if pgrep -f "(za|adc) run --config" >/dev/null 2>&1; then
-        echo "[vllm] an adc run is active — not stopping the planner. Stop the run first"; exit 1
+    if pgrep -f "(za|acs) run --config" >/dev/null 2>&1; then
+        echo "[vllm] an acs run is active — not stopping the planner. Stop the run first"; exit 1
     fi
     pids=$(pgrep -f "vllm serve $MODEL" | tr '\n' ' ')
     [ -z "$pids" ] && { echo "[vllm] not running"; exit 0; }

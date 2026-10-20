@@ -36,8 +36,8 @@ def _fakes():
 
 
 def test_decision_changes_when_holdout_changes(dataset_root, tmp_path, monkeypatch):
-    from agentic_detector_config.infer import gateway
-    from agentic_detector_config.loop.runner import run_rounds
+    from agentic_configuration_search.infer import gateway
+    from agentic_configuration_search.loop.runner import run_rounds
 
     monkeypatch.setattr(gateway, "infer_config", _stub_infer)
 
@@ -83,10 +83,10 @@ def test_arm_candidate_with_rescorer_is_gated_on_calibrated_channel(
     rescorer's gain; if adopted, raw-score records land in the ledger and next
     round's candidates get a free gain equal to the channel gap.
     """
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.infer import gateway
-    from agentic_detector_config.loop import rescore, runner as runner_mod, tail_round
-    from agentic_detector_config.loop.runner import run_rounds
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.infer import gateway
+    from agentic_configuration_search.loop import rescore, runner as runner_mod, tail_round
+    from agentic_configuration_search.loop.runner import run_rounds
 
     server = FakeDetector()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
@@ -169,7 +169,7 @@ def _human_candidates_only(monkeypatch):
     what gets evaluated — if deterministic proposes the same axes combination, combo
     dedup folds the human_* one. These scenarios measure detector state, not the
     planner, so planner proposals are emptied (the judgment assertions are unchanged)."""
-    from agentic_detector_config.planner import deterministic
+    from agentic_configuration_search.planner import deterministic
     monkeypatch.setattr(deterministic, "propose",
                         lambda history, diagnosis, **kw: {
                             "planner": "deterministic", "candidates": [],
@@ -181,11 +181,11 @@ def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by
     as class 1; `fixed_by(state)` decides whether the loaded state corrects it."""
     from pathlib import Path
 
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.core.coco import Split
-    from agentic_detector_config.infer import gateway
-    from agentic_detector_config.loop import adapt_round, tail_round
-    from agentic_detector_config.loop.runner import run_rounds
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.core.coco import Split
+    from agentic_configuration_search.infer import gateway
+    from agentic_configuration_search.loop import adapt_round, tail_round
+    from agentic_configuration_search.loop.runner import run_rounds
 
     state = _FakeDetectorState()
     splits = {n: Split.load(root / n) for n in ("train", "valid")}

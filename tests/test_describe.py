@@ -7,8 +7,8 @@ keeps them out of the decision path.
 
 import json
 
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.diagnose import describe
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.diagnose import describe
 
 
 def _fp(kind, image, cid, score, box=(0, 0, 10, 10)):
@@ -20,8 +20,8 @@ def test_select_crops_cover_every_prompt_sample():
     """Describe **every** sample that goes into the prompt. Describing only some makes
     the call budget, not significance, decide which get a note, and the planner
     misreads 'no note' as 'less important'."""
-    from agentic_detector_config.diagnose.sample import pick_detail
-    from agentic_detector_config.planner.llm import _compact_diagnosis, _det_key
+    from agentic_configuration_search.diagnose.sample import pick_detail
+    from agentic_configuration_search.planner.llm import _compact_diagnosis, _det_key
 
     fp = ([_fp("background", f"b{i}.png", 1, 0.5 + i * 0.01) for i in range(5)]
           + [_fp("class_confusion", "c0.png", 2, 0.9)]
@@ -59,7 +59,7 @@ def test_select_crops_cover_every_prompt_sample():
 def test_crop_notes_batches_and_isolates_failure(dataset_root, tmp_path):
     """Calls are split into CROPS_PER_CALL crops each; if one batch fails the other
     notes survive. Crop indices start at 0 within each batch."""
-    from agentic_detector_config.core.data import load_dataset
+    from agentic_configuration_search.core.data import load_dataset
 
     ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
     names = [e.file_name for e in ds.train.images]

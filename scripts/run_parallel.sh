@@ -57,7 +57,7 @@ while :; do
             echo "[scheduler] $(date +%H:%M:%S) $ds → GPU $g"
             HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
                 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-                .venv/bin/adc run --config "$cfg" --out "runs/$ds/run" --resume \
+                .venv/bin/acs run --config "$cfg" --out "runs/$ds/run" --resume \
                 > "runs/_log_$ds.txt" 2>&1 &
             PID_BY_GPU[$g]=$!
         fi
@@ -77,6 +77,6 @@ done
 echo "[scheduler] all done — generating reports"
 for ds in "${DATASETS[@]}"; do
     [ -f "runs/$ds/run/history.jsonl" ] && \
-        .venv/bin/adc report "runs/$ds/run" > /dev/null && \
+        .venv/bin/acs report "runs/$ds/run" > /dev/null && \
         echo "report: runs/$ds/run/report.md"
 done

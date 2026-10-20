@@ -1,4 +1,4 @@
-# agentic-detector-config reference config — every key with its default (README.md is normative)
+# agentic-configuration-search reference config — every key with its default (README.md is normative)
 #
 # Every value here equals the code default (test_default_yaml_matches_dataclass_defaults
 # in tests/test_config.py guards against drift).

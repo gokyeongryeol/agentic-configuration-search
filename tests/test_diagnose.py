@@ -7,8 +7,8 @@ r = √(box area / image area) is below 0.04. In the fixture the class-2 GT (3px
 
 import pytest
 
-from agentic_detector_config.core.coco import Ontology
-from agentic_detector_config.diagnose.errors import diagnose
+from agentic_configuration_search.core.coco import Ontology
+from agentic_configuration_search.diagnose.errors import diagnose
 from tests.conftest import CATS
 
 ONTO = Ontology.from_categories(CATS)

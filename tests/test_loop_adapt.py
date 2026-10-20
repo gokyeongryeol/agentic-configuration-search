@@ -11,10 +11,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Split
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.loop.runner import run_rounds
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Split
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.loop.runner import run_rounds
 from tests.conftest import make_split
 
 
@@ -98,7 +98,7 @@ def _human_candidates_only(monkeypatch):
     folds human_*. With untrainable lora blocked up front (DatasetFacts), the
     deterministic planner fills that slot with exactly this combination on the
     small fixture, so planner proposals are emptied here."""
-    from agentic_detector_config.planner import deterministic
+    from agentic_configuration_search.planner import deterministic
     monkeypatch.setattr(deterministic, "propose",
                         lambda history, diagnosis, **kw: {
                             "planner": "deterministic", "candidates": [],
@@ -109,7 +109,7 @@ def test_classifier_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     _human_candidates_only(monkeypatch)
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
-    import agentic_detector_config.loop.adapt_round as ar
+    import agentic_configuration_search.loop.adapt_round as ar
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
 
     cfg = config_from_dict({
@@ -147,7 +147,7 @@ def test_classifier_rejected_restores_state(root, tmp_path, monkeypatch):
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config",
                         _fake_infer(root, server, confuse=False))
-    import agentic_detector_config.loop.adapt_round as ar
+    import agentic_configuration_search.loop.adapt_round as ar
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
 
     cfg = config_from_dict({
@@ -181,7 +181,7 @@ def test_classifier_without_adapt_ctl_skips(root, tmp_path, monkeypatch):
 
 
 def _ONTO_FOR(root):
-    from agentic_detector_config.core.data import load_dataset
+    from agentic_configuration_search.core.data import load_dataset
     return load_dataset(root).ontology
 
 
@@ -189,9 +189,9 @@ def test_arm_refits_rescorer_instead_of_dropping(root, tmp_path, monkeypatch):
     """Upstream arms keep the rescorer and refit it on the new distribution — measuring without
     it would make the gate's Δ a compound "+upstream, −rescorer", so the upstream axis would fight
     handicapped by the rescorer's gain. If the refit is identity, only the label is corrected."""
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.loop import rescore
-    from agentic_detector_config.loop.runner import Loop
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop import rescore
+    from agentic_configuration_search.loop.runner import Loop
 
     loop = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "run")
     setting, materials = {"per_class": {}, "configs": []}, object()
@@ -231,8 +231,8 @@ def test_resume_restores_server_state(root, tmp_path, monkeypatch):
     """resume must reapply the champion's detector state — a fresh process starts with the base
     model, so without reapplying, candidates are scored by a different detector than the
     champion and Δ is contaminated."""
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.loop.runner import Loop
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import Loop
 
     seen = {"w": [], "a": []}
     loop = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "run",
@@ -259,8 +259,8 @@ def test_classifier_trains_on_fit_train_only(root, tmp_path, monkeypatch):
     """The arm is scored by its fit_dev Δ — if fit_dev crops are in the training
     material, scoring becomes an in-sample comparison on crops the classifier has
     already seen, and the margin filters nothing. Training uses fit_train only."""
-    from agentic_detector_config.core.data import load_dataset
-    import agentic_detector_config.loop.adapt_round as ar
+    from agentic_configuration_search.core.data import load_dataset
+    import agentic_configuration_search.loop.adapt_round as ar
 
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
@@ -306,7 +306,7 @@ def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
     the background FP count is known only after inference. When it trips, the axis is
     recorded as empty material (empty_axis) so it reaches the planner's dead-axis list —
     the material stays the same until the champion changes."""
-    import agentic_detector_config.loop.adapt_round as ar
+    import agentic_configuration_search.loop.adapt_round as ar
 
     _human_candidates_only(monkeypatch)
     server = FakeAdapt()
@@ -327,14 +327,14 @@ def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
     assert rec["skipped"] == "classifier_gate"
     assert rec["empty_axis"] == "crop_classifier"
 
-    from agentic_detector_config.planner.llm import _dead_axis_lines
+    from agentic_configuration_search.planner.llm import _dead_axis_lines
     assert "- crop_classifier (values tried: True)" in _dead_axis_lines(hist)
 
 
 def test_classifier_margin_rejection_is_not_dead(root, tmp_path, monkeypatch):
     """A rejection after training that falls short of the fit_dev margin is not a dead
     axis — the material was not short; it simply had no effect."""
-    import agentic_detector_config.loop.adapt_round as ar
+    import agentic_configuration_search.loop.adapt_round as ar
 
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server, confuse=False))

@@ -4,8 +4,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentic_detector_config.clients.yoloe import YoloeClient
-from agentic_detector_config.core.prompts import build_text_queries
+from agentic_configuration_search.clients.yoloe import YoloeClient
+from agentic_configuration_search.core.prompts import build_text_queries
 
 DEV = sys.argv[1] if len(sys.argv) > 1 else "cuda:5"
 imgs = sorted(glob.glob("demo_data/soccer-players-5fuqs/train/*.jpg"))[:4]

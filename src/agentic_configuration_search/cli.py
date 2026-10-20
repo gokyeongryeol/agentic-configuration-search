@@ -1,4 +1,4 @@
-"""adc CLI — runs the round loop.
+"""acs CLI — runs the round loop.
 
 The detector (YOLOE) runs in-process, so there is no detector server. The vLLM
 (planner) server is handled by `loop.hooks.managed_servers`: if
@@ -36,7 +36,7 @@ def _build_cfg(args) -> Config:
     elif args.dataset:
         cfg = config_from_dict({"dataset": args.dataset})
     else:
-        raise SystemExit("adc run: --config or --dataset is required")
+        raise SystemExit("acs run: --config or --dataset is required")
     if args.dataset:
         cfg = dataclasses.replace(cfg, dataset=args.dataset)
     if args.planner:
@@ -48,7 +48,7 @@ def _build_cfg(args) -> Config:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="adc", description=__doc__)
+    parser = argparse.ArgumentParser(prog="acs", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run", help="run the round loop")
     run.add_argument("--config", help="path to the config yaml")

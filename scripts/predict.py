@@ -36,7 +36,7 @@ def _image_split(root: Path, ontology):
     """Wrap a directory of images without GT as a Split (same shape as core.data._subset)."""
     from PIL import Image
 
-    from agentic_detector_config.core.coco import ImageEntry, Split
+    from agentic_configuration_search.core.coco import ImageEntry, Split
     split = Split.__new__(Split)
     split.root, split.raw, split.ontology = root, {}, ontology
     split.images = []
@@ -74,7 +74,7 @@ def _report_split(dataset_root: Path, ontology):
     That is why this calls Split.load directly instead of load_dataset — not going
     through the loop's data gate keeps the guard valid.
     """
-    from agentic_detector_config.core.coco import ANNOTATIONS_FILENAME, Split
+    from agentic_configuration_search.core.coco import ANNOTATIONS_FILENAME, Split
     if not (dataset_root / "valid" / ANNOTATIONS_FILENAME).exists():
         print("warning: this dataset has no valid/, so test served as the loop's "
               "holdout — the numbers below are a re-measurement of the split used "
@@ -112,13 +112,13 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    from agentic_detector_config.config import load_config
-    from agentic_detector_config.core import metrics
-    from agentic_detector_config.core.data import load_dataset
-    from agentic_detector_config.eval.runner import (chosen_groups, combined_detections,
+    from agentic_configuration_search.config import load_config
+    from agentic_configuration_search.core import metrics
+    from agentic_configuration_search.core.data import load_dataset
+    from agentic_configuration_search.eval.runner import (chosen_groups, combined_detections,
                                                      infer_for_groups)
-    from agentic_detector_config.fitting.materials import Materials
-    from agentic_detector_config.loop import rescore
+    from agentic_configuration_search.fitting.materials import Materials
+    from agentic_configuration_search.loop import rescore
 
     run_dir = Path(args.run_dir).resolve()
     champ = json.loads((run_dir / "champion.json").read_text())
@@ -147,7 +147,7 @@ def main(argv=None) -> int:
     # reproducibility hole.
     weights = Path(champ["weights"]) if champ.get("weights") else None
     adapt_root = Path(champ["adapt_root"]) if champ.get("adapt_root") else None
-    from agentic_detector_config.loop.hooks import build_hooks
+    from agentic_configuration_search.loop.hooks import build_hooks
     hooks = build_hooks(cfg, repo_root, run_dir.parent)
     client = hooks["client"]
     deps = hooks["detector_hooks"]
@@ -161,7 +161,7 @@ def main(argv=None) -> int:
     passes = infer_for_groups(cfg, client, groups, grid, ds.ontology, paths,
                               materials, return_embeddings=need_emb)
     if need_emb:
-        from agentic_detector_config.fitting.rescorer import Rescorer, dataset_fingerprint
+        from agentic_configuration_search.fitting.rescorer import Rescorer, dataset_fingerprint
         rescorer = Rescorer.load(
             Path(champ["rescorer_path"]),
             expect=dataset_fingerprint(ds.root.name, ds.ontology))
