@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentic_detector_config.core import metrics
+from agentic_configuration_search.core import metrics
 
 IOU = 0.5
 
@@ -131,7 +131,7 @@ def test_match_greedy_prefers_higher_score():
 
 def test_prf_fbeta_hand_values():
     """Hand-computed pin at P=1, R=0.5: F1=2/3, F2=5/9, ... (β>1 = recall-weighted)."""
-    from agentic_detector_config.core.metrics import prf
+    from agentic_configuration_search.core.metrics import prf
 
     base = prf(1, 0, 1)                      # P=1, R=0.5
     assert base["f_beta"] == pytest.approx(2 / 3)

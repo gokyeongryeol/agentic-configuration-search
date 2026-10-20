@@ -12,14 +12,14 @@ import numpy as np
 import pytest
 import yaml
 
-from agentic_detector_config.clients.yoloe import YoloeClient, read_arm
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Split
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.fitting.tail import build_tail_arms, export_yolo_dataset
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.loop import tail_round
-from agentic_detector_config.loop.runner import run_rounds
+from agentic_configuration_search.clients.yoloe import YoloeClient, read_arm
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Split
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.fitting.tail import build_tail_arms, export_yolo_dataset
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.loop import tail_round
+from agentic_configuration_search.loop.runner import run_rounds
 from tests.conftest import make_split
 
 
@@ -78,7 +78,7 @@ class SwapBackend:
 
 
 def test_set_weights_swaps_and_invalidates_vocab():
-    from agentic_detector_config.core.prompts import build_text_queries
+    from agentic_configuration_search.core.prompts import build_text_queries
     queries, _o, _a = build_text_queries(["cat a"], {}, box_threshold=0.01,
                                          multimodal_threshold=0.01)
     backend = SwapBackend()

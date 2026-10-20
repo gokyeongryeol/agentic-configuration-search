@@ -9,9 +9,9 @@ import json
 import pytest
 from PIL import Image
 
-from agentic_detector_config.clients.yoloe import YoloeClient, _reclassify, read_arm  # noqa: F401
-from agentic_detector_config.clients.wire import parse_prediction
-from agentic_detector_config.core.prompts import build_text_queries
+from agentic_configuration_search.clients.yoloe import YoloeClient, _reclassify, read_arm  # noqa: F401
+from agentic_configuration_search.clients.wire import parse_prediction
+from agentic_configuration_search.core.prompts import build_text_queries
 
 NAME_TO_ID = {"cat a": 1, "cat b": 2}
 
@@ -151,7 +151,7 @@ def test_artifact_config_mismatch_is_error(tmp_path):
     """Format validation in the real loader — num_classes / class_names mismatch is an explicit error.
 
     (Only the validation path before model load — the real SigLIP load is covered by the GPU smoke test.)"""
-    from agentic_detector_config.clients.yoloe import _CropReclassifier
+    from agentic_configuration_search.clients.yoloe import _CropReclassifier
     root = tmp_path / "artifact"
     root.mkdir()
     (root / "classifier_config.json").write_text(json.dumps({

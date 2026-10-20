@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from agentic_detector_config.core import tiling
+from agentic_configuration_search.core import tiling
 
 
 def test_offset_detections():

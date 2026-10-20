@@ -107,7 +107,7 @@ while :; do
             HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
                 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
                 PYTORCH_ALLOC_CONF=expandable_segments:True \
-                .venv/bin/adc run --config "$cfg" --resume \
+                .venv/bin/acs run --config "$cfg" --resume \
                 > "$ROOT/_log_$ds.txt" 2>&1 &
             PID_BY_GPU[$g]=$!
         fi
@@ -127,7 +127,7 @@ done
 
 echo "[yoloe-seed$SEED] search done — reports"
 for d in "$ROOT"/*/run; do
-    [ -f "$d/history.jsonl" ] && .venv/bin/adc report "$d" > /dev/null && echo "report: $d/report.md"
+    [ -f "$d/history.jsonl" ] && .venv/bin/acs report "$d" > /dev/null && echo "report: $d/report.md"
 done
 
 exit $LAST_RC

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_detector_config.core.coco import Ontology, Split, xywh_to_xyxy
+from agentic_configuration_search.core.coco import Ontology, Split, xywh_to_xyxy
 from tests.conftest import CATS
 
 

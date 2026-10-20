@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from agentic_detector_config.core.metrics import rank_auc
+from agentic_configuration_search.core.metrics import rank_auc
 
 class _FakeModel:
     """Discriminator stub providing only predict_proba — pins the calibration path with a hand-made P̂.
@@ -24,7 +24,7 @@ class _FakeModel:
 def _stub_verifier(features, emb_dim=4):
     return GbdtVerifier(features, emb_dim, _FakeModel(), isotonic=[])
 
-from agentic_detector_config.fitting.verifier import GbdtVerifier, detection_features, fit_isotonic
+from agentic_configuration_search.fitting.verifier import GbdtVerifier, detection_features, fit_isotonic
 
 
 def test_isotonic_pools_ties_and_is_order_invariant():
@@ -32,7 +32,7 @@ def test_isotonic_pools_ties_and_is_order_invariant():
     np.interp picks the last one, calibrating a tied group with true rate 0.1 to 1.0
     (the inflated P̂ then pushes that group's scores up wholesale in rescorer blending).
     Ties are common with ensemble clip saturation, constant fills for degenerate folds, and identical GBDT leaves."""
-    from agentic_detector_config.fitting.verifier import _iso_apply
+    from agentic_configuration_search.fitting.verifier import _iso_apply
 
     raw = np.array([0.1] + [0.5] * 20 + [0.9])
     got = []
@@ -138,8 +138,8 @@ def test_gbdt_dimension_mismatch_raises():
 
 def _margin_reference(det, kept_dets):
     """The pairwise-loop implementation from before vectorization — the semantic reference."""
-    from agentic_detector_config.core.metrics import iou_matrix
-    from agentic_detector_config.fitting.verifier import OVERLAP_IOU
+    from agentic_configuration_search.core.metrics import iou_matrix
+    from agentic_configuration_search.fitting.verifier import OVERLAP_IOU
 
     score = float(det["score"])
     margin = 1.0

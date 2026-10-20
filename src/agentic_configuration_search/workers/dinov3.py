@@ -5,7 +5,7 @@ torch and transformers. The package proper has no torch, so in-process loading
 is impossible; exiting also releases the GPU entirely.
 
 Hence this file **imports only stdlib + torch + transformers + numpy + PIL** — it
-must not import agentic_detector_config modules.
+must not import agentic_configuration_search modules.
 
 Encoding: pooler_output, else the CLS token → L2 normalization, in mini-batches.
 """

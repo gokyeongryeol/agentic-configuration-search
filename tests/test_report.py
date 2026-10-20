@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from agentic_detector_config.diagnose.report import (ab_compare, render_report,
+from agentic_configuration_search.diagnose.report import (ab_compare, render_report,
                                                      retrospective_hit_rate, trajectory)
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.loop.runner import run_rounds
-from agentic_detector_config.planner import deterministic
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.loop.runner import run_rounds
+from agentic_configuration_search.planner import deterministic
 from tests.conftest import make_split
 from tests.test_loop import _fake_infer, _fakes, _gt_lookup
 

@@ -12,10 +12,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Split
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.loop.runner import run_rounds
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Split
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.loop.runner import run_rounds
 from tests.conftest import make_split
 
 
@@ -109,7 +109,7 @@ def test_rescorer_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     # rescorer artifact is attached to the champion and loadable
     rp = Path(result.champion["rescorer_path"])
     assert rp.exists()
-    from agentic_detector_config.fitting.rescorer import Rescorer
+    from agentic_configuration_search.fitting.rescorer import Rescorer
     assert Rescorer.load(rp).active
     # round 2 diagnosis ran on the calibrated channel (rescorer_path branch — recorded without crashing)
     assert (out / "rounds" / "round_002" / "diagnosis_train.json").exists()

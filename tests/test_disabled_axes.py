@@ -4,10 +4,10 @@ planner surfaces (sanitize, deterministic, LLM prompt) and Loop validation."""
 
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.planner import deterministic
-from agentic_detector_config.planner.axes import BASELINE, sanitize_candidates, uses_disabled_axes
-from agentic_detector_config.planner.llm import LLMPlanner
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.planner import deterministic
+from agentic_configuration_search.planner.axes import BASELINE, sanitize_candidates, uses_disabled_axes
+from agentic_configuration_search.planner.llm import LLMPlanner
 
 DISABLED = ("lora", "crop_classifier")
 
@@ -86,7 +86,7 @@ def test_llm_prompt_unchanged_when_no_disabled(tmp_path):
 
 
 def test_loop_rejects_unknown_disabled_axis(dataset_root, tmp_path):
-    from agentic_detector_config.loop.runner import Loop
+    from agentic_configuration_search.loop.runner import Loop
     cfg = config_from_dict({"dataset": str(dataset_root),
                             "search": {"disabled_axes": ["warp_drive"]}})
     with pytest.raises(ValueError, match="warp_drive"):
@@ -136,7 +136,7 @@ def test_llm_prompt_omits_disabled_values(tmp_path):
 
 
 def test_loop_rejects_unknown_disabled_value(dataset_root, tmp_path):
-    from agentic_detector_config.loop.runner import Loop
+    from agentic_configuration_search.loop.runner import Loop
     cfg = config_from_dict({"dataset": str(dataset_root),
                             "search": {"disabled_values": {"exemplar": ["warp"]}}})
     with pytest.raises(ValueError, match="warp"):
@@ -173,7 +173,7 @@ def test_llm_and_human_candidates_inherit_champion_disabled_axis(tmp_path):
     assert [c["id"] for c in prop["candidates"]] == ["keep"]
     assert [c["id"] for c in prop["dropped"]] == ["raise"]
 
-    from agentic_detector_config.loop.runner import _load_candidates_file
+    from agentic_configuration_search.loop.runner import _load_candidates_file
     f = tmp_path / "candidates.yaml"
     f.write_text("- {id: k, axes: {tiling: 2, alias: vlm}}\n"
                  "- {id: r, axes: {tiling: 3}}\n")

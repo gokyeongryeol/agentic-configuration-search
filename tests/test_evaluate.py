@@ -2,12 +2,12 @@
 
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.eval.evaluate import evaluate_on_holdout, gate
-from agentic_detector_config.fitting.materials import Materials
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.infer.queries import config_grid
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.eval.evaluate import evaluate_on_holdout, gate
+from agentic_configuration_search.fitting.materials import Materials
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.infer.queries import config_grid
 
 CFG = config_from_dict({"dataset": "x"})
 
@@ -135,7 +135,7 @@ def test_eval_artifact_keeps_candidate_records(tmp_path):
     gate needs more than champion records."""
     import inspect
 
-    from agentic_detector_config.loop import runner
+    from agentic_configuration_search.loop import runner
     src = inspect.getsource(runner.Loop.run_round)
     i = src.index('_write(rd / "eval.json"')
     block = src[i:i + 400]
@@ -150,8 +150,8 @@ def test_gate_boundary_requires_positive_delta():
     A strict `>` alone would reject a real gain (Δ>0) and no change (Δ=0) for the same reason."""
     import numpy as np
 
-    from agentic_detector_config.core import metrics
-    from agentic_detector_config.eval.evaluate import gate
+    from agentic_configuration_search.core import metrics
+    from agentic_configuration_search.eval.evaluate import gate
 
     def fake_ci(a, b, stat, **kw):
         return dict(fake_ci.out, n_images=8)

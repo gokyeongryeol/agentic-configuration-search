@@ -18,10 +18,10 @@ import json
 
 import numpy as np
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import ANNOTATIONS_FILENAME
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.loop.materialize import materialize
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import ANNOTATIONS_FILENAME
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.loop.materialize import materialize
 
 AXES = {"exemplar": "base", "alias": "vlm"}
 

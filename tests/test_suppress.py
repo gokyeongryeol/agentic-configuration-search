@@ -1,6 +1,6 @@
 """core/suppress — pure functions emulating negatives (CPU, synthetic boxes)."""
 
-from agentic_detector_config.core.suppress import (batched_nms, emulate_negatives,
+from agentic_configuration_search.core.suppress import (batched_nms, emulate_negatives,
                                                    suppress_by_negatives)
 
 

@@ -19,13 +19,13 @@
 # The reconstruction is not taken on faith: it is first **replayed on holdout and
 # checked against the recorded BASE** (±0.002); on mismatch we abort without touching test.
 #
-# Usage: ADC_RUNS=<root> ADC_CFG=<config> scripts/baseline_one.sh <dataset> <gpu>
-#   e.g. ADC_RUNS=runs_yoloe_seed1 ADC_CFG=config/generated_seed1/yoloe-aerial.yaml
+# Usage: ACS_RUNS=<root> ACS_CFG=<config> scripts/baseline_one.sh <dataset> <gpu>
+#   e.g. ACS_RUNS=runs_yoloe_seed1 ACS_CFG=config/generated_seed1/yoloe-aerial.yaml
 set -u
 cd "$(dirname "$0")/.."
 ds=$1; gpu=$2
-RUNS=${ADC_RUNS:?ADC_RUNS required (e.g. runs_yoloe_seed1)}
-CFG=${ADC_CFG:?ADC_CFG required (e.g. config/generated_seed1/yoloe-aerial.yaml)}
+RUNS=${ACS_RUNS:?ACS_RUNS required (e.g. runs_yoloe_seed1)}
+CFG=${ACS_CFG:?ACS_CFG required (e.g. config/generated_seed1/yoloe-aerial.yaml)}
 base="$RUNS/$ds/baseline"
 log(){ echo "[base-$ds] $(date '+%m-%d %H:%M:%S') $*"; }
 

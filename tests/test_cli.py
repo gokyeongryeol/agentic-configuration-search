@@ -4,14 +4,14 @@ import contextlib
 
 import pytest
 
-from agentic_detector_config import cli
+from agentic_configuration_search import cli
 
 
 @pytest.fixture(autouse=True)
 def _no_real_servers(monkeypatch):
     """Never start a real ManagedServer in unit tests — on a machine with a vLLM venv,
     planner.kind=llm without base_url could launch a real planner server."""
-    import agentic_detector_config.loop.hooks as hooks
+    import agentic_configuration_search.loop.hooks as hooks
 
     @contextlib.contextmanager
     def fake_servers(cfg, repo_root, out_dir):
@@ -39,7 +39,7 @@ def test_cli_overrides_reach_runner(tmp_path, monkeypatch, dataset_root):
             decisions = []
         return R()
 
-    import agentic_detector_config.loop.runner as runner
+    import agentic_configuration_search.loop.runner as runner
     monkeypatch.setattr(runner, "run_rounds", fake_run_rounds)
     rc = cli.main(["run", "--dataset", str(dataset_root), "--planner", "llm",
                    "--rounds", "7", "--out", str(tmp_path / "o"),
@@ -51,7 +51,7 @@ def test_cli_overrides_reach_runner(tmp_path, monkeypatch, dataset_root):
     assert captured["candidates_file"] == str(tmp_path / "c.yaml")
     # The detector is in-process, so it is always wired (model load is lazy). No
     # planner.base_url — llm_chat/caption_fn are None (materialize raises an explicit error).
-    from agentic_detector_config.clients.yoloe import YoloeClient
+    from agentic_configuration_search.clients.yoloe import YoloeClient
     assert isinstance(captured["client"], YoloeClient)
     assert captured["detector_hooks"]["weights_ctl"] == captured["client"].set_weights
     assert captured["llm_chat"] is None and captured["caption_fn"] is None
@@ -76,10 +76,10 @@ def test_cli_wires_clients_from_config(tmp_path, monkeypatch, dataset_root):
             decisions = []
         return R()
 
-    import agentic_detector_config.loop.runner as runner
+    import agentic_configuration_search.loop.runner as runner
     monkeypatch.setattr(runner, "run_rounds", fake_run_rounds)
     cli.main(["run", "--config", str(cfg_yaml)])
-    from agentic_detector_config.clients.yoloe import YoloeClient
+    from agentic_configuration_search.clients.yoloe import YoloeClient
     assert isinstance(captured["client"], YoloeClient)
     assert callable(captured["llm_chat"])
     assert callable(captured["refine_alias_fn"])

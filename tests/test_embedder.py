@@ -8,12 +8,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from agentic_detector_config.infer import embedder
+from agentic_configuration_search.infer import embedder
 
 
 @pytest.fixture(autouse=True)
 def _relative_vllm_venv(monkeypatch):
-    """Pin a tmp-relative path so the real worker venv (absolute, ADC_VLLM_VENV) is
+    """Pin a tmp-relative path so the real worker venv (absolute, ACS_VLLM_VENV) is
     never touched — repo_root(tmp_path) / VLLM_VENV stays inside tmp."""
     monkeypatch.setattr(embedder, "VLLM_VENV", Path("external/vllm-venv"))
 
@@ -233,16 +233,16 @@ def test_encode_crops_builds_worker_command(tmp_path, monkeypatch):
     emb = embedder.encode_crops(tmp_path, crops, "facebook/dinov3-vitl16-pretrain-lvd1689m",
                                 "cuda:3", tmp_path / "logs" / "e.log", popen=fake_popen)
     cmd = captured["cmd"]
-    # runs under the vllm-venv python — agentic_detector_config itself has no torch
+    # runs under the vllm-venv python — agentic_configuration_search itself has no torch
     assert cmd[0].endswith("external/vllm-venv/bin/python")
-    assert cmd[1:3] == ["-m", "agentic_detector_config.workers.dinov3"]
+    assert cmd[1:3] == ["-m", "agentic_configuration_search.workers.dinov3"]
     assert cmd[cmd.index("--device") + 1] == "cuda:3"
     assert cmd[cmd.index("--model") + 1] == "facebook/dinov3-vitl16-pretrain-lvd1689m"
     # the vLLM venv does not have this package installed — PYTHONPATH must be the
     # directory that *contains* the package (src/), not the repo root
-    from agentic_detector_config.services.paths import PACKAGE_PARENT
+    from agentic_configuration_search.services.paths import PACKAGE_PARENT
     assert captured["env"]["PYTHONPATH"] == str(PACKAGE_PARENT)
-    assert (PACKAGE_PARENT / "agentic_detector_config" / "workers").is_dir()
+    assert (PACKAGE_PARENT / "agentic_configuration_search" / "workers").is_dir()
     assert emb.shape == (2, 4)
 
     manifest = Path(cmd[cmd.index("--manifest") + 1])
@@ -283,7 +283,7 @@ def test_encode_crops_worker_failure_raises(tmp_path):
 
 
 def test_encode_crops_missing_venv_raises(tmp_path):
-    with pytest.raises(RuntimeError, match="ADC_VLLM_VENV"):
+    with pytest.raises(RuntimeError, match="ACS_VLLM_VENV"):
         embedder.encode_crops(tmp_path, [tmp_path / "a.jpg"], "m", "cuda:0",
                               tmp_path / "e.log")
 

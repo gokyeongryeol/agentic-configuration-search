@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from agentic_detector_config.clients.llm import LLMClient, _extract_json
+from agentic_configuration_search.clients.llm import LLMClient, _extract_json
 
 
 def test_extract_json_plain_and_wrapped():

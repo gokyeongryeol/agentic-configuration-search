@@ -1,6 +1,6 @@
 """One-shot worker that trains the SigLIP2+LoRA crop classifier.
 
-**Runs with the worker venv python (`services.paths.VLLM_VENV`, env ADC_VLLM_VENV)**,
+**Runs with the worker venv python (`services.paths.VLLM_VENV`, env ACS_VLLM_VENV)**,
 which must have torch, transformers and peft (Apache-2.0). The package proper
 is torch-free, so in-process training is impossible; exiting also releases the
 GPU entirely.

@@ -13,8 +13,8 @@ import shutil
 
 import pytest
 
-from agentic_detector_config.core.coco import ANNOTATIONS_FILENAME
-from agentic_detector_config.core.data import load_dataset
+from agentic_configuration_search.core.coco import ANNOTATIONS_FILENAME
+from agentic_configuration_search.core.data import load_dataset
 
 
 def test_split_is_stratified_fixed_and_exhaustive(dataset_root):

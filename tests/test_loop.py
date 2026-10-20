@@ -11,9 +11,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from agentic_detector_config.core.coco import Split
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.loop.runner import run_rounds
+from agentic_configuration_search.core.coco import Split
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.loop.runner import run_rounds
 from tests.conftest import make_split
 
 
@@ -160,9 +160,9 @@ def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
     """The exemplar_k quantity axis overrides the MineCfg quota — None means the config default."""
     import numpy as np
 
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.core.data import load_dataset
-    from agentic_detector_config.loop.materialize import materialize
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.core.data import load_dataset
+    from agentic_configuration_search.loop.materialize import materialize
 
     cfg = config_from_dict({"dataset": str(big_root)})
     ds = load_dataset(big_root, seed=0, fit_train_ratio=0.8)
@@ -199,7 +199,7 @@ def test_runner_filters_retried_combos_from_any_planner(big_root, tmp_path,
 
 def test_dataset_notes_reach_llm_prompt(big_root, tmp_path, monkeypatch):
     """Wiring: config.dataset_notes -> runner -> LLMPlanner prompt."""
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     # Non-ASCII (Korean) notes on purpose: must reach the prompt unescaped.
@@ -241,7 +241,7 @@ def test_stagnant_counts_adopted_below_epsilon():
     """Saturation rule: stagnant if nothing was accepted, or if accepted with Δ CI lower bound ≤ ε —
     with the default ε=0.0 an acceptance (lo > margin=0.0) never counts as stagnation (same as
     before); only when ε > margin does a marginal acceptance count as stagnation."""
-    from agentic_detector_config.loop.runner import _stagnant
+    from agentic_configuration_search.loop.runner import _stagnant
 
     assert _stagnant({"adopted": False}, 0.0) is True
     win = lambda lo: {"adopted": True, "id": "w",              # noqa: E731
@@ -256,7 +256,7 @@ def test_stagnant_counts_adopted_below_epsilon():
 def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
     """Runner wiring: VLM descriptions are merged into diagnosis["train"]["crop_notes"] and
     only appear in the planner prompt — diagnostic signal only."""
-    from agentic_detector_config.loop import runner as runner_mod
+    from agentic_configuration_search.loop import runner as runner_mod
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     # Non-ASCII (Korean) note on purpose: the prompt JSON must use ensure_ascii=False.
@@ -283,7 +283,7 @@ def test_resume_honors_saturation_and_writes_summary(big_root, tmp_path,
     (ts, dur_s) and run_summary.json are also written."""
     import json as _json
 
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     cfg = config_from_dict({"dataset": str(big_root), "rounds": 2,
@@ -322,7 +322,7 @@ def test_server_state_routing_is_increment_based():
     (1) turning both on at once is rejected as compound (unattributable), (2) a single increment of
     the other axis on top of a champion that already holds one is allowed via that arm (sequential
     composition), (3) pure inheritance uses normal wiring (no needless rerun of the LoRA grid)."""
-    from agentic_detector_config.loop.runner import _route_detector_state
+    from agentic_configuration_search.loop.runner import _route_detector_state
 
     both = {"lora": True, "crop_classifier": True}
     assert _route_detector_state(both, {}) == "compound"
@@ -341,7 +341,7 @@ def test_winner_axes_drop_stale_rescorer_label():
     """Champion label consistency: if the rescorer was not applied when evaluating the winner (the
     winner has no rescorer_path), axes.rescorer=True is a false label — it must be corrected to False
     so a rescorer refit can be re-proposed as a new increment in later rounds."""
-    from agentic_detector_config.loop.runner import _winner_axes
+    from agentic_configuration_search.loop.runner import _winner_axes
 
     ax, dropped = _winner_axes({"axes": {"rescorer": True, "lora": True},
                                 "rescorer_path": None})
@@ -357,7 +357,7 @@ def test_measured_axes_follow_the_refit_outcome():
     """axes must be the **actually measured state**. Upstream arms also refit the rescorer and
     measure with it on, so the label stays True; it is corrected to False only when the refit
     ends as identity — history, dedup and champion treat these axes as ground truth."""
-    from agentic_detector_config.loop.runner import _measured_axes
+    from agentic_configuration_search.loop.runner import _measured_axes
 
     ax = {"lora": True, "rescorer": True, "crop_classifier": True, "alias": "vlm"}
     assert _measured_axes(ax, rescorer=True) == ax          # refit succeeded = unchanged
@@ -369,8 +369,8 @@ def test_measured_axes_follow_the_refit_outcome():
 def test_empty_material_candidate_is_skipped():
     """If an enabled axis has empty material, the candidate equals the baseline — it is rejected
     before spending screen/holdout budget, and that fact is fed back to the planner via history."""
-    from agentic_detector_config.fitting.materials import Materials
-    from agentic_detector_config.loop.runner import _empty_material
+    from agentic_configuration_search.fitting.materials import Materials
+    from agentic_configuration_search.loop.runner import _empty_material
 
     empty = Materials()
     assert _empty_material({"alias": "vlm"}, empty, {}) == "alias"
@@ -394,7 +394,7 @@ def test_missing_llm_hooks_skip_dependent_axes():
     check) to build material. Without them materialize raises in _require, but by then mining
     has already started and round budget is spent — same discipline as filtering out LoRA
     candidates up front when detector_hooks is not injected."""
-    from agentic_detector_config.loop.runner import _missing_hook
+    from agentic_configuration_search.loop.runner import _missing_hook
 
     cap = {"caption_fn": object(), "vlm_caption_fn": object()}   # no LLM refine
     full = {**cap, "refine_alias_fn": object(), "refine_negatives_fn": object()}
@@ -509,8 +509,8 @@ def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
 def test_tiling_variants_follow_axis_grid():
     """screen compares only the grid the candidate chose against tiling off — it no
     longer runs every grid from config (1 + (1+g²) passes per candidate)."""
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.loop.runner import _tiling_variants
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import _tiling_variants
 
     s = config_from_dict({"dataset": "x"}).search
     assert _tiling_variants(s, {"tiling": False}) == ()
@@ -542,7 +542,7 @@ def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypa
     relative to the image: missed at the default cut (0.04), missed_small at a large cut."""
     import json as _json
 
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
 
@@ -564,8 +564,8 @@ def test_untrainable_lora_never_reaches_tail_round(big_root, tmp_path, monkeypat
     as invalid_axes at sanitization and never reaches the tail round (training wiring)."""
     import json as _json
 
-    from agentic_detector_config.config import config_from_dict
-    from agentic_detector_config.loop import tail_round
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop import tail_round
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     monkeypatch.setattr(tail_round, "run_tail_candidate", lambda *a, **k: (
@@ -615,8 +615,8 @@ def test_text_only_tiling_that_does_not_help_is_not_evaluated(big_root, tmp_path
                                                               monkeypatch):
     """If screen picks an untiled config the candidate equals the champion —
     reject it as tiling_unused without holdout evaluation, but keep it as tried."""
-    from agentic_detector_config.planner.axes import validate_axes
-    from agentic_detector_config.planner.deterministic import tried_combos
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.deterministic import tried_combos
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -643,10 +643,10 @@ def test_untiled_setting_is_relabelled_with_request_kept():
     other axes is evaluated, with its label corrected to the measured state (no
     tiling) and the request kept in requested_axes — so the champion never
     carries tiling it does not run, and the same request stays blocked."""
-    from agentic_detector_config.loop.runner import _relabel_untiled, _tiling_record
-    from agentic_detector_config.planner.axes import validate_axes
-    from agentic_detector_config.planner.deterministic import tried_combos
-    from agentic_detector_config.planner.llm import _tried_lines
+    from agentic_configuration_search.loop.runner import _relabel_untiled, _tiling_record
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.deterministic import tried_combos
+    from agentic_configuration_search.planner.llm import _tried_lines
 
     setting = {"configs": [{"config_id": 0, "tiling": None},
                            {"config_id": 1, "tiling": {"grid": 2}}],
@@ -679,7 +679,7 @@ def _setting(groups, tilings):
 def test_setting_forwards_counts_passes_and_tiles():
     """Forwards per image = 1 + g² per (config, modality) pass the setting runs.
     A grid has g² tiles regardless of image size, so the setting alone decides it."""
-    from agentic_detector_config.loop.runner import setting_forwards
+    from agentic_configuration_search.loop.runner import setting_forwards
 
     assert setting_forwards(_setting({1: (0, "text"), 2: (0, "text")}, {0: None})) == 1
     assert setting_forwards(_setting({1: (0, "semantic"), 2: (0, "text")}, {0: None})) == 2

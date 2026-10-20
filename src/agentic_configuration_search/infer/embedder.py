@@ -1,7 +1,7 @@
 """DINOv3 worker invocation + k-center greedy.
 
 Embedding itself runs in `workers/dinov3.py` as a one-shot subprocess in the
-GPU worker venv (`ADC_VLLM_VENV`) — the package proper has no torch. This module only calls the worker,
+GPU worker venv (`ACS_VLLM_VENV`) — the package proper has no torch. This module only calls the worker,
 reads the result, and does k-center selection.
 """
 
@@ -33,7 +33,7 @@ def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: st
 
     python = repo_root / VLLM_VENV / "bin" / "python"
     if not python.exists():
-        raise RuntimeError(f"vLLM venv python not found: {python} — check the ADC_VLLM_VENV env var")
+        raise RuntimeError(f"vLLM venv python not found: {python} — check the ACS_VLLM_VENV env var")
 
     # The worker's cwd is repo_root, not ours — every path crossing the boundary
     # (argv and manifest contents) must be absolute.
@@ -47,11 +47,11 @@ def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: st
     out_npy = log_path.parent / f"{stem}.npy"
     manifest.write_text(json.dumps([str(Path(p).resolve()) for p in crop_paths]))
 
-    cmd = [str(python), "-m", "agentic_detector_config.workers.dinov3",
+    cmd = [str(python), "-m", "agentic_configuration_search.workers.dinov3",
            "--manifest", str(manifest), "--model", model,
            "--device", device, "--out", str(out_npy)]
     log.info("running DINOv3 worker: %d crops on %s (log: %s)", len(crop_paths), device, log_path)
-    # The worker runs as `-m agentic_detector_config.workers.dinov3`, so it needs
+    # The worker runs as `-m agentic_configuration_search.workers.dinov3`, so it needs
     # the package on the path (the package and workers __init__ get imported —
     # hence both stay lightweight).
     env = {**os.environ, "PYTHONPATH": str(PACKAGE_PARENT)}

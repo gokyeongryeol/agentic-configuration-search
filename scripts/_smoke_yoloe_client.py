@@ -4,12 +4,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentic_detector_config.clients.yoloe import YoloeClient
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.core.prompts import PromptBox
-from agentic_detector_config.infer import gateway
-from agentic_detector_config.infer.queries import build_config_queries, text_query_bundle
+from agentic_configuration_search.clients.yoloe import YoloeClient
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.core.prompts import PromptBox
+from agentic_configuration_search.infer import gateway
+from agentic_configuration_search.infer.queries import build_config_queries, text_query_bundle
 
 DEV = sys.argv[1] if len(sys.argv) > 1 else "cuda:4"
 cfg = config_from_dict({"dataset": "demo_data/soccer-players-5fuqs",

@@ -4,11 +4,11 @@ import json
 from pathlib import Path
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Ontology
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.fitting import crop_classifier as cc
-from agentic_detector_config.services import external
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Ontology
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.fitting import crop_classifier as cc
+from agentic_configuration_search.services import external
 from tests.conftest import CATS
 
 CFG = config_from_dict({"dataset": "x"})
@@ -18,7 +18,7 @@ ONTO = Ontology.from_categories(CATS)
 def test_constants_match_worker():
     """fitting cannot import workers (layering rule), so it duplicates the constants —
     if they drift the client cannot rebuild the checkpoint, so drift is blocked here."""
-    from agentic_detector_config.workers import adapt as worker
+    from agentic_configuration_search.workers import adapt as worker
 
     assert cc.MODEL_NAME == worker.MODEL_NAME
     assert cc.LORA_R == worker.LORA_R
@@ -94,22 +94,22 @@ def test_run_adapt_worker_command(tmp_path, monkeypatch):
                               out_path=Path("cls.pt"), device="cuda:1",
                               log_path=Path("w.log"), popen=fake_popen)
     cmd = captured["cmd"]
-    assert cmd[1:3] == ["-m", "agentic_detector_config.workers.adapt"]
+    assert cmd[1:3] == ["-m", "agentic_configuration_search.workers.adapt"]
     assert cmd[cmd.index("--num-classes") + 1] == "3"
     assert os.path.isabs(cmd[cmd.index("--manifest") + 1])   # independent of worker cwd
     # the vLLM venv does not have this package installed — PYTHONPATH must be the
     # directory that *contains* the package (src/), not the repo root
-    from agentic_detector_config.services.paths import PACKAGE_PARENT
+    from agentic_configuration_search.services.paths import PACKAGE_PARENT
     assert captured["env"]["PYTHONPATH"] == str(PACKAGE_PARENT)
-    assert (PACKAGE_PARENT / "agentic_detector_config" / "workers").is_dir()
+    assert (PACKAGE_PARENT / "agentic_configuration_search" / "workers").is_dir()
 
 
 # ------------------------------------------------------- arm decision (unit)
 
 def test_arm_tripwire_skips_training(dataset_root, tmp_path, monkeypatch):
     """Too few crops → skip without training; train_fn is never called."""
-    from agentic_detector_config.infer import gateway
-    from agentic_detector_config.loop.adapt_round import run_classifier_candidate
+    from agentic_configuration_search.infer import gateway
+    from agentic_configuration_search.loop.adapt_round import run_classifier_candidate
 
     ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
     monkeypatch.setattr(gateway, "infer_config",
@@ -125,7 +125,7 @@ def test_arm_tripwire_skips_training(dataset_root, tmp_path, monkeypatch):
                                   "threshold": 0.5, "f_beta": 0.5}},
                 "fit_dev_micro_f_beta": 0.5}
 
-    from agentic_detector_config.fitting.materials import Materials
+    from agentic_configuration_search.fitting.materials import Materials
 
     out = run_classifier_candidate(
         cfg, ds, {"exemplar": "none"}, Materials(),

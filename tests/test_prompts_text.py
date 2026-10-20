@@ -6,7 +6,7 @@ branch. If any box is filled it is silently treated as semantic — pinned via t
 
 import pytest
 
-from agentic_detector_config.core.prompts import build_text_queries
+from agentic_configuration_search.core.prompts import build_text_queries
 
 
 def test_all_boxes_empty_and_no_prompt_image():
@@ -81,7 +81,7 @@ def test_empty_class_names_rejected():
 
 
 def test_parse_prediction_reverses_alias():
-    from agentic_detector_config.clients.wire import parse_prediction
+    from agentic_configuration_search.clients.wire import parse_prediction
     pred = {"text": ["damaged cable"], "boxes": [[1, 2, 3, 4]], "scores": [0.7],
             "labels": [0]}
     dets = parse_prediction(pred, {"cable-damage": 1},

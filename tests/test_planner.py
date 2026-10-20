@@ -2,9 +2,9 @@
 
 import pytest
 
-from agentic_detector_config.planner import deterministic
-from agentic_detector_config.planner.axes import BASELINE, sanitize_candidates, validate_axes
-from agentic_detector_config.planner.llm import LLMPlanner
+from agentic_configuration_search.planner import deterministic
+from agentic_configuration_search.planner.axes import BASELINE, sanitize_candidates, validate_axes
+from agentic_configuration_search.planner.llm import LLMPlanner
 
 
 # ------------------------------------------------------------------- axes
@@ -148,7 +148,7 @@ def test_prompt_omits_image_identifiers_and_merges_crop_notes(tmp_path):
     nothing to join on, and a bare name without coordinates cannot point at anything. No filename leaks either."""
     import json
 
-    from agentic_detector_config.planner.llm import LLMPlanner
+    from agentic_configuration_search.planner.llm import LLMPlanner
 
     name = "cam07/2024-01-02T03_04_05_jpg.rf.deadbeefcafe.jpg"
     fp = [{"kind": "background", "image": name, "box": [1, 2, 16, 46],
@@ -183,7 +183,7 @@ def test_prompt_omits_image_identifiers_and_merges_crop_notes(tmp_path):
 def test_samples_carry_class_name_not_id():
     """Samples must use the same vocabulary (class names) as per_class — with ids only, the prompt
     has no mapping and individual errors cannot be attributed to a class."""
-    from agentic_detector_config.planner.llm import _compact_diagnosis
+    from agentic_configuration_search.planner.llm import _compact_diagnosis
 
     diag = {"train": {
         "n_images": 1, "summary": {"fp": {"background": 1, "duplicate": 0}},
@@ -203,8 +203,8 @@ def test_samples_carry_class_name_not_id():
 def test_leverage_block_is_computed_per_round():
     """Replaces the static "cause -> axis" table: each axis gets the error count it addresses this
     round, listed in descending order. Axis names come from the canonical REMEDY."""
-    from agentic_detector_config.planner.axes import AXES
-    from agentic_detector_config.planner.llm import _leverage_lines
+    from agentic_configuration_search.planner.axes import AXES
+    from agentic_configuration_search.planner.llm import _leverage_lines
 
     diag = {"train": {"summary": {"fn": {"below_threshold": 80, "missed": 2},
                                   "fp": {"class_confusion": 40}}},
@@ -226,7 +226,7 @@ def test_leverage_block_is_computed_per_round():
 def test_dead_axes_survive_the_history_window(tmp_path):
     """Axes with empty material are collected over the full history — once they slide out of the
     history window the model proposes the same axis again (re-proposals did repeat in practice)."""
-    from agentic_detector_config.planner.llm import MAX_HISTORY, LLMPlanner, _dead_axis_lines
+    from agentic_configuration_search.planner.llm import MAX_HISTORY, LLMPlanner, _dead_axis_lines
 
     old = [{"round": 1, "champion": {"axes": BASELINE}, "candidates": [
         {"id": "c1", "axes": {**BASELINE, "alias": "vlm"},
@@ -250,7 +250,7 @@ def test_dead_axes_survive_the_history_window(tmp_path):
 def test_history_window_zero_means_no_history():
     """history[-0:] is the whole list — if the prompt grows back the moment the budget guard shrinks
     the window to 0, the last line of defense becomes the worst case."""
-    from agentic_detector_config.planner.llm import _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history
 
     history = [{"round": i, "champion": {"axes": BASELINE}, "candidates": []}
                for i in range(1, 5)]
@@ -317,7 +317,7 @@ def test_background_proposes_crop_classifier():
 
 
 def test_leverage_counts_background_for_crop_classifier():
-    from agentic_detector_config.planner.llm import _leverage_lines
+    from agentic_configuration_search.planner.llm import _leverage_lines
 
     lines = _leverage_lines({"train": {"summary": {"fp": {"background": 7}}}})
     cc = next(l for l in lines if l.startswith("- crop_classifier:"))
@@ -372,7 +372,7 @@ def test_compact_history_carries_rejection_magnitude():
     holdout score (test_micro_f_beta, legacy name), gate Δ / CI lower bound (decision.evaluated),
     the fit_dev score and the head of the skip reason (note). The LLM must tell a near miss from
     a large regression to decide whether to retry or give up."""
-    from agentic_detector_config.planner.llm import MAX_NOTE, _compact_history
+    from agentic_configuration_search.planner.llm import MAX_NOTE, _compact_history
 
     entry = {
         "round": 3,
@@ -401,7 +401,7 @@ def test_compact_payloads_round_floats_to_4dp():
     """Floats in the prompt are rounded to 4 digits — spurious precision (18-char floats) wastes
     tokens. Why 4: gate Δ/CI decisions at the margin (0.005) scale are decided at the 4th digit
     (with 3 digits, 0.0049 and 0.0051 become equal)."""
-    from agentic_detector_config.planner.llm import _compact_diagnosis, _compact_history
+    from agentic_configuration_search.planner.llm import _compact_diagnosis, _compact_history
 
     entry = {"round": 1,
              "champion": {"axes": dict(BASELINE),
@@ -435,7 +435,7 @@ def test_detail_sample_is_representative():
     """Representative sampling rules: round-robin over kind (cause coverage) + round-robin over
     classes within a kind (avoid skew) + significance order (FP score desc / FN area desc) +
     IMAGE_CAP per image + KIND_CAP per kind. The first N by filename carries no information criterion."""
-    from agentic_detector_config.diagnose.sample import IMAGE_CAP, KIND_CAP, MAX_DETAIL
+    from agentic_configuration_search.diagnose.sample import IMAGE_CAP, KIND_CAP, MAX_DETAIL
 
     fp = ([{"kind": "background", "image": f"a{i}.png", "category_id": 1,
             "score": 0.1 + i * 0.01, "box": [0, 0, 10, 10]} for i in range(10)]
@@ -445,7 +445,7 @@ def test_detail_sample_is_representative():
               "score": 0.5, "box": [0, 0, 10, 10]} for i in range(3)])
     fn = [{"kind": "missed", "image": f"m{i}.png", "category_id": 1,
            "box": [0, 0, 10 * (i + 1), 10]} for i in range(6)]
-    from agentic_detector_config.diagnose.sample import pick_detail
+    from agentic_configuration_search.diagnose.sample import pick_detail
 
     d = {"fp_sample": pick_detail(fp), "fn_sample": pick_detail(fn),
          "fp_total": len(fp)}
@@ -494,7 +494,7 @@ def test_prompt_has_no_rebuild_hint(tmp_path):
 def test_text_negative_source_axis():
     """text_negatives takes the mining source as its value — with FP-crop captions alone, most
     phrases hit the safety rules (own parts, same kind, category name) and material came out empty."""
-    from agentic_detector_config.planner.axes import AXES
+    from agentic_configuration_search.planner.axes import AXES
     assert AXES["text_negatives"] == (False, "fp_crop", "gt_crop", "background")
     for src in ("fp_crop", "gt_crop", "background"):
         full = validate_axes({"text_negatives": src})
@@ -508,7 +508,7 @@ def test_text_negative_source_axis():
 
 def test_alias_captioner_axis():
     """alias takes the crop->text converter as its value — currently only VLM."""
-    from agentic_detector_config.planner.axes import AXES
+    from agentic_configuration_search.planner.axes import AXES
     assert AXES["alias"] == (False, "vlm")
     assert validate_axes({"alias": "vlm"})["alias"] == "vlm"
     with pytest.raises(ValueError, match="alias"):
@@ -521,7 +521,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
     """Already-tried combos are packed compactly into the prompt — if the planner forgets combos
     outside the MAX_HISTORY window and re-proposes them, the runner filter silently drops them and
     only burns candidate budget. They are written as increments over the champion to stay short."""
-    from agentic_detector_config.planner.llm import LLMPlanner, _tried_lines
+    from agentic_configuration_search.planner.llm import LLMPlanner, _tried_lines
 
     champ = validate_axes({**BASELINE, "rescorer": True})
     history = [
@@ -629,7 +629,7 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
 
 # ------------------------------------------------- single class — gt_crop
 
-from agentic_detector_config.planner.axes import DatasetFacts  # noqa: E402
+from agentic_configuration_search.planner.axes import DatasetFacts  # noqa: E402
 
 ONE_CLASS = DatasetFacts(n_classes=1)
 
@@ -692,7 +692,7 @@ def test_llm_prompt_hides_gt_crop_for_single_class(tmp_path):
 def test_tiling_axis_is_grid_value():
     """The tiling value is grid g (g×g tiles, zoom (g-1)(1-o)+1, 1+g² passes) — the
     planner picks the zoom directly and raises it when it falls short. The code sets the range."""
-    from agentic_detector_config.planner.axes import AXES, TILING_GRIDS
+    from agentic_configuration_search.planner.axes import AXES, TILING_GRIDS
     assert AXES["tiling"] == (False, *TILING_GRIDS)
     for g in TILING_GRIDS:
         assert validate_axes({"tiling": g})["tiling"] == g
@@ -730,7 +730,7 @@ def test_llm_prompt_explains_tiling_grid(tmp_path):
 
 
 def test_compact_history_carries_tiling_used():
-    from agentic_detector_config.planner.llm import _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history
 
     champ = validate_axes({})
     hist = [{"round": 1, "champion": {"axes": champ, "micro_f_beta": 0.5},
@@ -758,7 +758,7 @@ def test_lora_invalid_when_fit_train_below_min_images():
 
 
 def test_axis_values_hide_untrainable_lora():
-    from agentic_detector_config.planner.axes import axis_values
+    from agentic_configuration_search.planner.axes import axis_values
     assert axis_values(SMALL)["lora"] == (False,)
     assert axis_values(DatasetFacts())["lora"] == (False, True)
 

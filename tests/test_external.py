@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.services import external
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.services import external
 
 CFG = config_from_dict({"dataset": "x"})
 # owned (non-persistent) server — the path where stop() actually shuts down

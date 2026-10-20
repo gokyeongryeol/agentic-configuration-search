@@ -1,4 +1,4 @@
-# agentic-detector-config
+# agentic-configuration-search
 
 An agentic loop that tunes inference settings of YOLOE (ultralytics'
 open-vocabulary detector) for a target dataset. Each round an LLM planner reads
@@ -22,11 +22,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q
 ## Running
 
 ```bash
-HF_HUB_OFFLINE=1 .venv/bin/adc run --config config/yoloe-soccer.yaml
-.venv/bin/adc run --config config/yoloe-soccer.yaml --resume   # replay, no LLM calls
-.venv/bin/adc run --config ... --rounds 1 --candidates candidates.yaml  # inject your own candidates
-.venv/bin/adc report runs/<ds>/run      # trajectory report (report.md)
-.venv/bin/adc ab runs/a runs/b          # compare two runs (e.g. deterministic vs llm)
+HF_HUB_OFFLINE=1 .venv/bin/acs run --config config/yoloe-soccer.yaml
+.venv/bin/acs run --config config/yoloe-soccer.yaml --resume   # replay, no LLM calls
+.venv/bin/acs run --config ... --rounds 1 --candidates candidates.yaml  # inject your own candidates
+.venv/bin/acs report runs/<ds>/run      # trajectory report (report.md)
+.venv/bin/acs ab runs/a runs/b          # compare two runs (e.g. deterministic vs llm)
 scripts/run_parallel.sh                 # demo datasets in parallel across GPUs
 ```
 
@@ -134,7 +134,7 @@ so keep the run directory in place.
 
 ## Code layout
 
-`src/agentic_detector_config/`, layered
+`src/agentic_configuration_search/`, layered
 `core ← clients ← infer ← fitting ← eval ← diagnose ← planner ← loop ← cli`
 (enforced by `tests/test_architecture.py`). All detector inference goes through
 `infer/gateway.py`; torch code lives only in `workers/`. Guard tests

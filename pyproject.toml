@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentic-detector-config"
+name = "agentic-configuration-search"
 version = "0.1.0"
 description = "Loop that searches YOLOE detector inference settings on train and confirms them on holdout micro F(β) until saturation"
 readme = "README.md"
@@ -28,11 +28,11 @@ dependencies = [
 dev = ["pytest>=7.0"]
 
 [project.scripts]
-adc = "agentic_detector_config.cli:main"
+acs = "agentic_configuration_search.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["agentic_detector_config*"]
+include = ["agentic_configuration_search*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

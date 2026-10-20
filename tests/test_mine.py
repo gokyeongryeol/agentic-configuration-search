@@ -8,11 +8,11 @@ import random
 import numpy as np
 import pytest
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.coco import Split
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.core.prompts import PromptBox
-from agentic_detector_config.fitting import mine
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.coco import Split
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.core.prompts import PromptBox
+from agentic_configuration_search.fitting import mine
 
 PARAMS = config_from_dict({"dataset": "x"}).mine
 
@@ -260,13 +260,13 @@ def test_fn_arm_uses_weaker_trim():
     """The FN arm must also trim outliers — the FN set concentrates truncation, occlusion and label
     errors, so it is noisier than base. But since its purpose is to broadly cover missed
     appearances, it trims less than base (a larger MAD multiple)."""
-    from agentic_detector_config.config import config_from_dict
+    from agentic_configuration_search.config import config_from_dict
 
     cfg = config_from_dict({"dataset": "x"})
     assert (cfg.mine.kcenter_outlier_mad, cfg.mine.fn_kcenter_outlier_mad) == (3.0, 3.5)
     assert cfg.mine.fn_kcenter_outlier_mad > cfg.mine.kcenter_outlier_mad
     import inspect
 
-    from agentic_detector_config.fitting import mine
+    from agentic_configuration_search.fitting import mine
     src = inspect.getsource(mine.fn_exemplar_candidates)
     assert "fn_kcenter_outlier_mad" in src, "fn arm kcenter does not receive the trim criterion"

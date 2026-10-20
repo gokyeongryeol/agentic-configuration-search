@@ -81,7 +81,7 @@ def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
     data_yaml = export_yolo_dataset(fit_train, ontology, out_dir / "dataset")
     tuned = out_dir / "tuned_tail.pt"
-    cmd = [sys.executable, "-m", "agentic_detector_config.workers.yoloe_tail",
+    cmd = [sys.executable, "-m", "agentic_configuration_search.workers.yoloe_tail",
            "--model", str(Path(base_weights).resolve()),
            "--data", str(data_yaml.resolve()),
            "--out", str(tuned.resolve()),

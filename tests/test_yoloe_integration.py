@@ -3,13 +3,13 @@ IoU sweep (neg_eta reinterpreted), hooks client wiring. All CPU."""
 
 import numpy as np
 
-from agentic_detector_config.config import config_from_dict
-from agentic_detector_config.core.data import load_dataset
-from agentic_detector_config.eval.screen import screen_candidate
-from agentic_detector_config.fitting.materials import Materials
-from agentic_detector_config.fitting.rescorer import Rescorer
-from agentic_detector_config.fitting.verifier import GbdtVerifier
-from agentic_detector_config.infer import gateway
+from agentic_configuration_search.config import config_from_dict
+from agentic_configuration_search.core.data import load_dataset
+from agentic_configuration_search.eval.screen import screen_candidate
+from agentic_configuration_search.fitting.materials import Materials
+from agentic_configuration_search.fitting.rescorer import Rescorer
+from agentic_configuration_search.fitting.verifier import GbdtVerifier
+from agentic_configuration_search.infer import gateway
 
 
 # ---------------------------------------------------- rescorer emb_dim=0
@@ -74,8 +74,8 @@ def test_text_only_candidate_sweeps_neg_grid(dataset_root, monkeypatch):
 # ------------------------------------------------------------ hooks wiring
 
 def test_build_hooks_wires_yoloe_client(tmp_path):
-    from agentic_detector_config.clients.yoloe import YoloeClient
-    from agentic_detector_config.loop.hooks import build_hooks
+    from agentic_configuration_search.clients.yoloe import YoloeClient
+    from agentic_configuration_search.loop.hooks import build_hooks
     cfg = config_from_dict({"dataset": "x"})
     hooks = build_hooks(cfg, tmp_path, tmp_path / "out")
     client = hooks["client"]
@@ -88,7 +88,7 @@ def test_build_hooks_wires_yoloe_client(tmp_path):
 
 
 def test_build_hooks_yoloe_caption_fn_requires_llm(tmp_path):
-    from agentic_detector_config.loop.hooks import build_hooks
+    from agentic_configuration_search.loop.hooks import build_hooks
     cfg = config_from_dict({"dataset": "x"})
     hooks = build_hooks(cfg, tmp_path, tmp_path / "out")
     assert hooks["caption_fn"] is None           # no llm_base -> explicit-error path
