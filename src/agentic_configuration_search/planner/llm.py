@@ -274,9 +274,12 @@ def _modality_summary(modality_f: dict) -> dict:
     Carrying the full per-class record (history's modality_f) would make one
     row exceed 1KB on a 19-class dataset, and the budget guard would shrink the
     history window. The planner needs the number of classes text won and the
-    narrowest of those margins (screen picks semantic on a tie)."""
-    margins = [v["text"] - v["semantic"] for v in modality_f.values()
-               if v["text"] > v["semantic"]]
+    narrowest of those margins. Wins follow screen's pick (chosen) — the
+    recorded F is rounded and cannot tell a narrow gap (old records without
+    chosen are counted by F; screen picks semantic on a tie)."""
+    def text_won(v):
+        return v["chosen"] == "text" if v.get("chosen") else v["text"] > v["semantic"]
+    margins = [v["text"] - v["semantic"] for v in modality_f.values() if text_won(v)]
     out = {"text_won": len(margins), "semantic_won": len(modality_f) - len(margins)}
     if margins:
         out["closest_text_margin"] = round(min(margins), 4)
