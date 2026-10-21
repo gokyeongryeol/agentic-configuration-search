@@ -120,6 +120,13 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   them before widening a count axis: tiling used on an adopted grid suggests
   g+1, negatives picked at the low (strongest) end suggest raising
   `visual_negative_k`, and picks at the high end suggest folding the axis.
+  Candidates that ran a semantic pass also record each class's fit_dev F(β)
+  for the semantic and text passes (`modality_f`), including candidates
+  filtered before holdout, so the planner can tell whether exemplar lost
+  narrowly (try another k or fn_arm) or badly. The prompt carries only a
+  summary whose size does not depend on the class count (classes text won and
+  the narrowest margin); the full per-class record would make the budget
+  guard shrink the history window on datasets with many classes.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
   they are not adopted. Once adopted they are not turned off: the state stays

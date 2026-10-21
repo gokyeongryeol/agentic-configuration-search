@@ -267,6 +267,22 @@ def _tried_lines(history: list[dict], champion: dict) -> list[str]:
     return lines
 
 
+def _modality_summary(modality_f: dict) -> dict:
+    """Summary of per-class semantic and text F(β) — its size does not depend on
+    the number of classes.
+
+    Carrying the full per-class record (history's modality_f) would make one
+    row exceed 1KB on a 19-class dataset, and the budget guard would shrink the
+    history window. The planner needs the number of classes text won and the
+    narrowest of those margins (screen picks semantic on a tie)."""
+    margins = [v["text"] - v["semantic"] for v in modality_f.values()
+               if v["text"] > v["semantic"]]
+    out = {"text_won": len(margins), "semantic_won": len(modality_f) - len(margins)}
+    if margins:
+        out["closest_text_margin"] = round(min(margins), 4)
+    return out
+
+
 def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dict]:
     """Per round: trajectory, candidate deltas, and verdicts only — large
     record-like fields are left out.
@@ -307,6 +323,8 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["neg_eta_grid"] = c.get("neg_eta_grid")
             if c.get("unused_axes"):
                 row["unused_axes"] = c["unused_axes"]
+            if c.get("modality_f"):
+                row["modality"] = _modality_summary(c["modality_f"])
             if c.get("gate_passed_but_lost"):
                 row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
             if c.get("note"):
@@ -356,7 +374,12 @@ Rules:
   setting did not use (exemplar: the text pass beat the semantic pass for every
   class; visual_negatives: no semantic class kept a negative config). Other
   variants of such an axis (another k, fn_arm) rarely change the setting
-  while that stays true.
+  while that stays true. A row's modality counts the classes where the text
+  pass beat the semantic (exemplar) pass on fit_dev F (text_won) and the
+  rest (semantic_won); closest_text_margin is the smallest F gap among the
+  classes text won. A small margin means another exemplar_k or fn_arm may
+  flip a class to semantic; a large one means exemplar variants are unlikely
+  to win.
 - A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
   the screen picked for semantic classes) and neg_eta_grid (the thresholds it
   tried). Lower means stronger suppression. Picks at the low end of the grid

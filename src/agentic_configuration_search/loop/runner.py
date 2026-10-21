@@ -513,6 +513,7 @@ class Loop:
                            "earlier round — evaluation skipped"}
         else:
             return False
+        rec |= _modality_record(setting, self.ds.ontology)
         if unused:
             rec.setdefault("unused_axes", unused)
             if "tiling" in unused:
@@ -853,6 +854,7 @@ class Loop:
                             | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
                             | _unused_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
+                            | _modality_record(c["setting"], self.ds.ontology)
                             | {"forwards": setting_forwards(c["setting"])}
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | ({"source": c["source"]} if c.get("source") else {})
@@ -1067,6 +1069,22 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
                        "rescorer": bool(axes.get("rescorer")), "server": server},
                       sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _modality_record(setting: dict, ontology) -> dict:
+    """fit_dev F(β) of the semantic and text passes screen measured per class,
+    keyed by class name.
+
+    Whether exemplar lost narrowly or badly is the evidence for trying another
+    k or fn_arm. A candidate filtered before holdout has no saved setting, so
+    this record is the only evidence left. Candidates with no semantic pass
+    (text only) record nothing."""
+    diag = setting.get("modality_diagnostic") or {}
+    names = {str(c.id): c.name for c in ontology.classes}
+    out = {names.get(cid, cid): {"semantic": round(d["semantic"]["f_beta"], 4),
+                                 "text": round(d["text"]["f_beta"], 4)}
+           for cid, d in diag.items()}
+    return {"modality_f": out} if out else {}
 
 
 def _evaluated_fps(history: list[dict]) -> set[str]:
