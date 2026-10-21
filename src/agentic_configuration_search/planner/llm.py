@@ -363,6 +363,10 @@ Rules:
   mean negatives are pulling hard, so more negatives (raise visual_negative_k)
   may help; picks at the high end mean they barely help, so fold the axis
   rather than raising k.
+- Once "lora" or "crop_classifier" is on in the champion, keep it on: they are
+  detector state (weights / classifier artifact) that stays loaded while
+  other candidates are measured, so a candidate turning one off is rejected as
+  skipped="detector_state_off" without evaluation.
 - If nothing promising remains, return stop=true with no candidates.
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that

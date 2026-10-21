@@ -122,7 +122,10 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   `visual_negative_k`, and picks at the high end suggest folding the axis.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
-  they are not adopted.
+  they are not adopted. Once adopted they are not turned off: the state stays
+  loaded while other candidates are measured, so a candidate turning one off
+  would be measured with it still on. Such candidates are rejected as
+  `detector_state_off` without evaluation.
 
 ### Diagnosis and planner
 

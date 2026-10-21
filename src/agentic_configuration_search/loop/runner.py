@@ -589,7 +589,14 @@ class Loop:
                                         f"for this axis (needs LLM/worker wiring)"})
                 continue
             route = _route_detector_state(c["axes"], champ_axes)
-            if route == "compound":
+            if route == "off":
+                off = [k for k in ("lora", "crop_classifier")
+                       if champ_axes.get(k) and not c["axes"].get(k)]
+                skipped.append({**c, "skipped": "detector_state_off",
+                                "note": f"{off}: the champion's detector-state axes cannot "
+                                        "be measured turned off (the state stays loaded "
+                                        "while measuring) — keep them on"})
+            elif route == "compound":
                 skipped.append({**c, "skipped": "compound_server_state",
                                 "note": "turning on both lora and crop_classifier relative to "
                                         "champion is unsupported (gain cannot be attributed) — "
@@ -1208,7 +1215,15 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
     enabled axes in one candidate cannot be attributed, so it is rejected.
     Sequential combinations (a single increment of one axis on top of a
     champion that holds the other) are allowed via the corresponding arm: the
-    classifier arm runs on the current weights, the lora arm preserves adapt_root."""
+    classifier arm runs on the current weights, the lora arm preserves adapt_root.
+
+    A candidate that turns off an axis the champion holds is "off" — the
+    detector state is not unloaded per candidate, so measuring it through
+    normal wiring would put an off label on a result measured with the state
+    still loaded (and, if adopted, split the label from what is served)."""
+    if any(champion_axes.get(k) and not axes.get(k)
+           for k in ("lora", "crop_classifier")):
+        return "off"
     new_lora = bool(axes.get("lora")) and not champion_axes.get("lora")
     new_cls = (bool(axes.get("crop_classifier"))
                and not champion_axes.get("crop_classifier"))

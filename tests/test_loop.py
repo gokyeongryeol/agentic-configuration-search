@@ -1004,6 +1004,56 @@ def test_compact_history_shows_requested_delta():
     assert row["axes_delta"] == {"tiling": 2} and row["unused_axes"] == ["exemplar"]
 
 
+def test_turning_off_champion_detector_state_is_rejected():
+    """A candidate that turns off the champion's lora or crop_classifier is
+    routed "off" — detector state (weights, artifact) is not unloaded per
+    candidate, so measuring it through normal wiring would put an off label on
+    a result measured with the state loaded."""
+    from agentic_configuration_search.loop.runner import _route_detector_state
+    champ = {"lora": True, "crop_classifier": True}
+    assert _route_detector_state({"lora": False, "crop_classifier": True}, champ) == "off"
+    assert _route_detector_state({"lora": True, "crop_classifier": False}, champ) == "off"
+    # turning off comes before newly turning another axis on
+    assert _route_detector_state({"lora": False, "crop_classifier": True},
+                                 {"lora": True}) == "off"
+    # changing another axis while inheriting them is still normal wiring
+    assert _route_detector_state({**champ, "alias": "vlm"}, champ) == "wired"
+
+
+def test_candidate_turning_off_lora_is_skipped_not_adopted(big_root, tmp_path,
+                                                           monkeypatch):
+    """A candidate with an explicit {lora: false} is rejected as
+    detector_state_off without holdout evaluation, and the champion's lora label
+    and weights stay."""
+    import json as _json
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    run = tmp_path / "run"
+    run_rounds(big_root, out_dir=run, planner="deterministic", rounds=0, **_fakes())
+    ch = _json.loads((run / "champion.json").read_text())
+    ch["axes"]["lora"] = True
+    ch["weights"] = str(tmp_path / "w.pt")
+    (run / "champion.json").write_text(_json.dumps(ch))
+    h = _hist(run)
+    h[0]["champion"]["axes"]["lora"] = True
+    (run / "history.jsonl").write_text("\n".join(_json.dumps(e) for e in h) + "\n")
+    hooks = {"weights_ctl": lambda w: None, "adapt_ctl": lambda a: None,
+             "repo_root": tmp_path, "base_weights": tmp_path / "base.pt"}
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: ex, axes: {exemplar: base, lora: false}}\n")
+    out = run_rounds(big_root, out_dir=run, planner="deterministic", rounds=1,
+                     resume=True, candidates_file=human, detector_hooks=hooks, **_fakes())
+    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["human_ex"]
+    assert rec["skipped"] == "detector_state_off" and "lora" in rec["note"]
+    assert "human_ex" not in (out.decisions[-1].get("evaluated") or {})
+    ch2 = _json.loads((run / "champion.json").read_text())
+    assert ch2["axes"]["lora"] is True and ch2["weights"] == str(tmp_path / "w.pt")
+
+
+def test_prompt_says_detector_state_axes_stay_on():
+    from agentic_configuration_search.planner.llm import PROMPT
+    assert "detector_state_off" in PROMPT
+
+
 def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path,
                                                              monkeypatch):
     """Only a candidate that fully passed screen becomes a served state "seen this
