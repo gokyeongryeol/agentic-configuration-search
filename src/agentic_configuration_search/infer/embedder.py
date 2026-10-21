@@ -7,6 +7,7 @@ reads the result, and does k-center selection.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -65,6 +66,44 @@ def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: st
     if len(emb) != len(crop_paths):
         raise RuntimeError(f"embedding count mismatch: crop {len(crop_paths)} vs emb {len(emb)}")
     return emb
+
+
+def cached_encoder(encode, cache_path: Path):
+    """An encoder for encode(paths, *args) -> (N, D), cached by **crop content hash**.
+
+    GT crops are rewritten into a different folder for every candidate, but the
+    content (same source image, box, JPEG settings) is the same — keying by
+    content rather than path is what lets them be reused across rounds and
+    candidates. Only missing crops go to the real encoder (the DINOv3 worker),
+    and the cache is rewritten atomically to cache_path (npz) so it is read back
+    after resume. When the encoder model changes, the caller must pass another
+    cache_path. Extra args (a log path, ...) are passed through with the misses.
+    """
+    cache_path = Path(cache_path)
+    store: dict[str, np.ndarray] = {}
+    if cache_path.exists():
+        with np.load(cache_path) as z:
+            store = dict(zip(z["keys"].tolist(), z["vecs"]))
+
+    def encode_cached(paths, *args) -> np.ndarray:
+        paths = [Path(p) for p in paths]
+        if not paths:
+            return encode([], *args)
+        keys = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
+        first_path = dict(zip(reversed(keys), reversed(paths)))   # key → first path
+        todo = [k for k in dict.fromkeys(keys) if k not in store]
+        if todo:
+            for k, row in zip(todo, encode([first_path[k] for k in todo], *args)):
+                store[k] = np.asarray(row)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp.npz")
+            np.savez(tmp, keys=np.array(list(store)), vecs=np.stack(list(store.values())))
+            tmp.replace(cache_path)
+            log.info("embedding cache: %d computed, %d reused (%s)",
+                     len(todo), len(keys) - len(todo), cache_path.name)
+        return np.stack([store[k] for k in keys])
+
+    return encode_cached
 
 
 # MAD → normal σ conversion factor. If the MAD is 0 (more than half the distances

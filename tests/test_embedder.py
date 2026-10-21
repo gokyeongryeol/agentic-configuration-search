@@ -307,3 +307,60 @@ def test_select_indices_dispatch_matches_primitives():
     assert r1 == r2 and len(r1) == 3               # seed determinism + k cap
     with pytest.raises(ValueError, match="exemplar_selection"):
         embedder.select_indices("magic", 2, 5, embeddings=emb)
+
+
+# --- per-run embedding cache — the same crop is not re-embedded every round and candidate
+
+def test_cached_encoder_reuses_by_content(tmp_path):
+    """The key is crop content, not path — the same crop is rewritten into a
+    different folder for every candidate. Only misses go to the real encoder,
+    and the order follows the input."""
+    calls = []
+
+    def encode(paths):
+        calls.append([p.name for p in paths])
+        return np.array([[float(p.read_bytes()[0]), 1.0] for p in paths])
+
+    (tmp_path / "r1").mkdir(); (tmp_path / "r2").mkdir()
+    a1, b1 = tmp_path / "r1" / "a.jpg", tmp_path / "r1" / "b.jpg"
+    a1.write_bytes(b"\x01aa"); b1.write_bytes(b"\x02bb")
+    a2, c2 = tmp_path / "r2" / "a.jpg", tmp_path / "r2" / "c.jpg"
+    a2.write_bytes(b"\x01aa"); c2.write_bytes(b"\x03cc")
+
+    enc = embedder.cached_encoder(encode, tmp_path / "cache.npz")
+    first = enc([a1, b1])
+    second = enc([c2, a2])                       # a has the same content — cache hit
+    assert calls == [["a.jpg", "b.jpg"], ["c.jpg"]]
+    assert second[1].tolist() == first[0].tolist()
+    assert second[0].tolist() == [3.0, 1.0]
+
+
+def test_cached_encoder_persists_across_instances(tmp_path):
+    """A new process after resume reads the cache back."""
+    p = tmp_path / "x.jpg"; p.write_bytes(b"\x07xx")
+    calls = []
+
+    def encode(paths):
+        calls.append(len(paths))
+        return np.ones((len(paths), 3))
+
+    embedder.cached_encoder(encode, tmp_path / "c.npz")([p])
+    out = embedder.cached_encoder(encode, tmp_path / "c.npz")([p])
+    assert calls == [1] and out.shape == (1, 3)
+    assert embedder.cached_encoder(encode, tmp_path / "c.npz")([]).shape[0] == 0
+
+
+def test_cached_encoder_passes_extra_args_on_miss(tmp_path):
+    """Extra args (the per-call log path) are passed through when misses are
+    sent — worker outputs stay split per class for later analysis."""
+    p = tmp_path / "x.jpg"; p.write_bytes(b"\x01")
+    seen = []
+
+    def encode(paths, log_path):
+        seen.append(log_path)
+        return np.ones((len(paths), 2))
+
+    enc = embedder.cached_encoder(encode, tmp_path / "c.npz")
+    enc([p], "embed_c1.log")
+    enc([p], "embed_c2.log")                      # hit — the encoder is not called
+    assert seen == ["embed_c1.log"]
