@@ -141,7 +141,12 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
         return {n: bs for n, bs in gt_selection.items() if bs}
 
     if "exemplars" in inherited:
-        exemplars = dict(parent_mat.exemplars)
+        # exemplar=none while the parent's materials hold exemplars means a
+        # relabelled champion (screen did not use exemplar) — screen runs the
+        # semantic pass whenever exemplars exist, so inheriting them would split
+        # the label from what is served
+        if axes["exemplar"] != "none":
+            exemplars = dict(parent_mat.exemplars)
     elif axes["exemplar"] != "none":
         cache = mine.CropCache(train, onto, out_dir / "gt_crops")
         exemplars, chosen = mine.gt_exemplars(train, onto, cache, params,

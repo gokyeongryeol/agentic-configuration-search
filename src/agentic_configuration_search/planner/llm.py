@@ -291,13 +291,19 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                        else None) or e.get("champion", {}).get("axes") or {})
         cands = []
         for c in e.get("candidates", []):
+            # a relabelled candidate shows its requested increment — against the
+            # corrected label, an inherited axis that went unused would look
+            # turned off
             row = {"id": c.get("id"),
-                   "axes_delta": _delta_axes(c.get("axes"), champ_axes),
+                   "axes_delta": _delta_axes(c.get("requested_axes") or c.get("axes"),
+                                             champ_axes),
                    "adopted": c.get("adopted"), "skipped": c.get("skipped")}
             if c.get("fit_dev_micro_f_beta") is not None:
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
+            if c.get("unused_axes"):
+                row["unused_axes"] = c["unused_axes"]
             if c.get("gate_passed_but_lost"):
                 row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
             if c.get("note"):
@@ -343,6 +349,11 @@ Rules:
   time. A history row with tiling_used=false means no class benefited from that
   grid on fit_dev (the setting fell back to no tiling); tiling_used=true on an
   adopted grid while small-object misses remain suggests trying g+1.
+- A row with unused_axes lists axes the candidate had on that the screened
+  setting did not use (exemplar: the text pass beat the semantic pass for every
+  class; visual_negatives: no semantic class kept a negative config). Other
+  variants of such an axis (another k, fn_arm) rarely change the setting
+  while that stays true.
 - If nothing promising remains, return stop=true with no candidates.
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that

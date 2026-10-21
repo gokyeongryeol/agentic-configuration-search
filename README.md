@@ -101,6 +101,18 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   champion, and holdout is not reused within the round. Carried candidates go
   through the same filters as planner and human candidates, whichever planner
   is used.
+- The same setting is not evaluated twice. After screen, a candidate's served
+  state (per class: config content and modality, the materials that modality
+  uses, rescorer on/off, server state) is compared with the champion, its
+  siblings in the round, and candidates evaluated on holdout before; a match
+  is rejected without holdout evaluation. Axis labels are not compared,
+  because materials can differ under the same label. If an axis the candidate
+  turned on (tiling, exemplar, visual_negatives) went unused and that made it
+  equal the champion, the reason is `axis_unused` (which axes in
+  `unused_axes`); otherwise `same_setting`. Rescorer candidates are judged
+  before the discriminator refit, the most expensive step. An evaluated
+  candidate with an unused axis gets its label corrected to the measured state,
+  with the request kept in `requested_axes`.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
   they are not adopted.

@@ -111,7 +111,11 @@ def carryover(history: list[dict], disabled_axes=(), disabled_values=None, *,
     for c in last.get("candidates", []):
         if not c.get("gate_passed_but_lost"):
             continue
-        delta = {k: v for k, v in (c.get("axes") or {}).items() if base.get(k) != v}
+        # if an unused axis got the label corrected, carry the requested
+        # increment — reading the corrected label (exemplar=none, ...) as the
+        # increment would turn the new champion's axis off
+        asked = c.get("requested_axes") or c.get("axes") or {}
+        delta = {k: v for k, v in asked.items() if base.get(k) != v}
         try:
             # an increment merge, not an overwrite — also clears champion axes
             # tied to an axis the increment turned off

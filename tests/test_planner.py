@@ -829,6 +829,25 @@ def test_carryover_skips_invalid_identical_or_disabled():
     assert deterministic.carryover([]) == []
 
 
+def test_carryover_uses_requested_axes_not_relabel():
+    """A candidate whose label was corrected for an unused axis is carried with
+    its requested increment — reading the corrected label (exemplar=none) as the
+    increment would turn the new champion's exemplar off."""
+    champ0 = validate_axes({"exemplar": "base"})
+    win = validate_axes({"exemplar": "base", "tiling": 2})
+    requested = validate_axes({"exemplar": "base", "text_negatives": "fp_crop"})
+    measured = validate_axes({"text_negatives": "fp_crop"})
+    hist = [{"round": 1, "champion": {"axes": champ0}, "candidates": []},
+            {"round": 2, "champion": {"axes": win},
+             "candidates": [{"id": "w", "axes": win, "adopted": True},
+                            {"id": "l", "axes": measured, "requested_axes": requested,
+                             "unused_axes": ["exemplar"], "adopted": False,
+                             "gate_passed_but_lost": True}]}]
+    out = deterministic.carryover(hist)
+    assert [c["axes"] for c in out] == [
+        validate_axes({"exemplar": "base", "tiling": 2, "text_negatives": "fp_crop"})]
+
+
 def test_carryover_resets_dependent_axes_on_new_champion():
     """Carried increments are applied with merge_onto too — if the new champion
     turned on an axis tied to exemplar (visual_negatives) and the losing

@@ -126,7 +126,10 @@ def test_human_candidates_are_injected(big_root, tmp_path, monkeypatch):
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     cand_file = tmp_path / "candidates.yaml"
     cand_file.write_text(
-        "- id: my_idea\n  axes: {exemplar: fn_arm}\n  rationale: human-injected\n")
+        # with the stub there are no FNs, so fn_arm serves the same setting as
+        # base (same_setting) — check injection with an increment no planner
+        # candidate shares
+        "- id: my_idea\n  axes: {exemplar: base, exemplar_k: 2}\n  rationale: human-injected\n")
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
     screened = out.decisions[1]["screened"]
@@ -435,7 +438,7 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["bad_fn_k"]["skipped"] == "invalid_axes"
     assert "fn_k" in rec["bad_fn_k"].get("note", "")
-    # a valid candidate passes sanitization — it may still be rejected later (tiling_unused etc.)
+    # a valid candidate passes sanitization — it may still be rejected later (axis_unused etc.)
     assert "ok_tiling" in rec and rec["ok_tiling"].get("skipped") != "invalid_axes"
 
 
@@ -614,7 +617,7 @@ def _hist(run_dir):
 def test_text_only_tiling_that_does_not_help_is_not_evaluated(big_root, tmp_path,
                                                               monkeypatch):
     """If screen picks an untiled config the candidate equals the champion —
-    reject it as tiling_unused without holdout evaluation, but keep it as tried."""
+    reject it as axis_unused without holdout evaluation, but keep it as tried."""
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.deterministic import tried_combos
 
@@ -622,7 +625,8 @@ def test_text_only_tiling_that_does_not_help_is_not_evaluated(big_root, tmp_path
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=_llm_tiling, rounds=1, **_fakes())
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
-    assert rec["skipped"] == "tiling_unused" and rec["tiling_used"] is False
+    assert rec["skipped"] == "axis_unused" and rec["unused_axes"] == ["tiling"]
+    assert rec["tiling_used"] is False
     assert "t2" not in (out.decisions[1].get("evaluated") or {})
     key = tuple(sorted(validate_axes({"tiling": 2}).items()))
     assert key in tried_combos(_hist(tmp_path / "run"))
@@ -643,7 +647,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
     other axes is evaluated, with its label corrected to the measured state (no
     tiling) and the request kept in requested_axes — so the champion never
     carries tiling it does not run, and the same request stays blocked."""
-    from agentic_configuration_search.loop.runner import _relabel_untiled, _tiling_record
+    from agentic_configuration_search.loop.runner import _relabel_unused as _relabel_untiled, _tiling_record
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.deterministic import tried_combos
     from agentic_configuration_search.planner.llm import _tried_lines
@@ -734,3 +738,221 @@ def test_human_candidates_are_relative_to_champion(tmp_path):
     champ = validate_axes({"rescorer": True})
     cands, dropped = _load_candidates_file(f, base=champ)
     assert not dropped and cands[0]["axes"] == validate_axes({"rescorer": True, "tiling": 2})
+
+
+# --- axes with no effect (exemplar, visual_negatives, tiling) — filtered before holdout
+
+def _st(per_class, configs):
+    return {"configs": [{"config_id": i, **c} for i, c in configs.items()],
+            "per_class": per_class}
+
+
+def test_unused_axes_reads_the_screened_setting():
+    """Axes the candidate turned on that the screened setting does not use.
+    exemplar is unused if no class picks semantic, visual_negatives if no
+    semantic class's config has negatives."""
+    from agentic_configuration_search.loop.runner import _unused_axes
+    from agentic_configuration_search.planner.axes import validate_axes
+
+    cfgs = {0: {"visual_negatives": False, "tiling": None},
+            1: {"visual_negatives": True, "tiling": None}}
+    ex = validate_axes({"exemplar": "base", "visual_negatives": True})
+    text_only = _st({1: {"config_id": 0, "modality": "text"}}, cfgs)
+    assert _unused_axes(ex, text_only) == ["exemplar", "visual_negatives"]
+    sem_no_neg = _st({1: {"config_id": 0, "modality": "semantic"}}, cfgs)
+    assert _unused_axes(ex, sem_no_neg) == ["visual_negatives"]
+    sem_neg = _st({1: {"config_id": 1, "modality": "semantic"}}, cfgs)
+    assert _unused_axes(ex, sem_neg) == []
+
+
+def _text_beats_semantic_infer(by_path):
+    """The semantic (exemplar) pass finds nothing; the text pass finds everything."""
+    def fake(ctx, client, config, queries, ontology, image_paths,
+             alias_to_name=None, **kw):
+        semantic = bool(queries) and any("prompt_image" in q for q in queries)
+        return [[] if semantic else
+                [{"box": list(a.bbox_xyxy), "score": 0.9,
+                  "category_id": a.category_id, "sources": ["full"]}
+                 for a in by_path[str(p)].annotations] for p in image_paths]
+    return fake
+
+
+def test_unused_exemplar_is_not_evaluated(big_root, tmp_path, monkeypatch):
+    """With exemplar on but text winning for every class, the setting equals the
+    champion's — rejected as axis_unused without holdout evaluation, with
+    unused_axes recorded."""
+    monkeypatch.setattr(gateway, "infer_config",
+                        _text_beats_semantic_infer(_gt_lookup(big_root)))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "ex", "axes": {"exemplar": "base"},
+                                "rationale": "x"}], "stop": False}
+
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+                     llm_chat=llm, rounds=1, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["ex"]
+    assert rec["skipped"] == "axis_unused" and rec["unused_axes"] == ["exemplar"]
+    assert "ex" not in (out.decisions[1].get("evaluated") or {})
+
+
+def test_compact_history_carries_unused_axes():
+    from agentic_configuration_search.planner.llm import _compact_history
+    from agentic_configuration_search.planner.axes import validate_axes
+
+    b = validate_axes({})
+    hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
+            {"round": 1, "champion": {"axes": b},
+             "candidates": [{"id": "ex", "axes": validate_axes({"exemplar": "base"}),
+                             "skipped": "axis_unused", "unused_axes": ["exemplar"]}]}]
+    row = _compact_history(hist)[1]["candidates"][0]
+    assert row["unused_axes"] == ["exemplar"]
+
+
+def test_unused_record_is_shared_by_all_candidate_paths():
+    """Plain candidates and the lora and classifier arms all record unused_axes
+    through the same helper."""
+    import inspect
+    from agentic_configuration_search.loop import runner
+
+    assert runner._unused_record({"unused_axes": ["exemplar"]}) == {"unused_axes": ["exemplar"]}
+    assert runner._unused_record({}) == {}
+    assert inspect.getsource(runner.Loop.run_round).count("_unused_record(") == 3
+
+
+def _semantic_fp_infer(by_path):
+    """The semantic pass returns GT plus one FP per class and the text pass is
+    exact — text wins for every class and the exemplar pass's FP pool is not
+    empty."""
+    def fake(ctx, client, config, queries, ontology, image_paths,
+             alias_to_name=None, **kw):
+        semantic = bool(queries) and any("prompt_image" in q for q in queries)
+        out = []
+        for p in image_paths:
+            dets = [{"box": list(a.bbox_xyxy), "score": 0.9,
+                     "category_id": a.category_id, "sources": ["full"]}
+                    for a in by_path[str(p)].annotations]
+            if semantic:
+                dets += [{"box": [60.0, 50.0, 90.0, 75.0], "score": 0.95,
+                          "category_id": 1, "sources": ["full"]},
+                         {"box": [60.0, 5.0, 90.0, 30.0], "score": 0.95,
+                          "category_id": 2, "sources": ["full"]}]
+            out.append(dets)
+        return out
+    return fake
+
+
+def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,
+                                                           monkeypatch):
+    """A label equal to the champion's is not the same setting when the served
+    materials differ — a candidate with exemplar on re-mines text negatives from
+    the exemplar pass's FPs, so its suppression phrases differ from the
+    champion's even when exemplar goes unused. It must be evaluated."""
+    import json as _json
+    monkeypatch.setattr(gateway, "infer_config", _semantic_fp_infer(_gt_lookup(big_root)))
+    run = tmp_path / "run"
+    run_rounds(big_root, out_dir=run, planner="deterministic", rounds=0, **_fakes())
+    # switch the champion to text_negatives=fp_crop (different suppression phrases)
+    ch = _json.loads((run / "champion.json").read_text())
+    ch["axes"]["text_negatives"] = "fp_crop"
+    md = Path(ch["materials_dir"])
+    (md / "text_negatives.json").write_text(_json.dumps({"cat a": ["old phrase"]}))
+    (run / "champion.json").write_text(_json.dumps(ch))
+    h = _hist(run)
+    h[0]["champion"]["axes"]["text_negatives"] = "fp_crop"
+    (run / "history.jsonl").write_text("\n".join(_json.dumps(e) for e in h) + "\n")
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: ex, axes: {exemplar: base}}\n")
+    run_rounds(big_root, out_dir=run, planner="deterministic", rounds=1,
+               resume=True, candidates_file=human, **_fakes())
+    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["human_ex"]
+    assert rec.get("skipped") is None, rec.get("note")
+    assert rec["unused_axes"] == ["exemplar"]          # the label is still corrected
+
+
+def test_same_served_setting_as_sibling_is_not_reevaluated(big_root, tmp_path,
+                                                           monkeypatch):
+    """If label correction makes a candidate's served state equal another
+    candidate's in the same round, holdout is not used twice."""
+    monkeypatch.setattr(gateway, "infer_config",
+                        _text_beats_semantic_infer(_gt_lookup(big_root)))
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: a, axes: {text_negatives: gt_crop}}\n"
+                     "- {id: b, axes: {text_negatives: gt_crop, exemplar: base}}\n")
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+                     rounds=1, candidates_file=human, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
+    evaluated = set(out.decisions[1].get("evaluated") or {})
+    assert len({"human_a", "human_b"} & evaluated) <= 1
+    dup = [k for k in ("human_a", "human_b") if rec[k].get("skipped") == "same_setting"]
+    assert dup == ["human_b"], {k: rec[k].get("skipped") for k in ("human_a", "human_b")}
+
+
+def test_served_fingerprint_reads_content_not_config_ids():
+    """Config ids differ across candidates because each has its own grid, even
+    for the same config — compare content. Only the materials of the modality
+    the setting actually uses count."""
+    from agentic_configuration_search.fitting.materials import Materials
+    from agentic_configuration_search.loop.runner import _served_fp
+
+    cfg0 = {"visual_negatives": False, "neg_eta": None, "tiling": None}
+    a = {"configs": [{"config_id": 0, **cfg0}],
+         "per_class": {1: {"config_id": 0, "modality": "text"}}}
+    b = {"configs": [{"config_id": 3, **cfg0}],
+         "per_class": {"1": {"config_id": 3, "modality": "text"}}}
+    m = Materials(text_negatives={"cat a": ["x"]})
+    m_ex = Materials(text_negatives={"cat a": ["x"]},
+                     exemplars={"cat a": []})              # a text setting ignores exemplars
+    server = {"weights": None, "adapt_root": None}
+    assert _served_fp(a, m, {}, server) == _served_fp(b, m_ex, {}, server)
+    assert _served_fp(a, m, {}, server) != _served_fp(
+        a, Materials(text_negatives={"cat a": ["y"]}), {}, server)
+    assert _served_fp(a, m, {}, server) != _served_fp(a, m, {"rescorer": True}, server)
+    assert _served_fp(a, m, {}, server) != _served_fp(
+        a, m, {}, {"weights": "w.pt", "adapt_root": None})
+
+
+def test_compact_history_shows_requested_delta():
+    """A relabelled candidate shows its requested increment — against the
+    corrected label, an inherited axis that went unused would look turned off."""
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.llm import _compact_history
+
+    champ = validate_axes({"exemplar": "base"})
+    req = validate_axes({"exemplar": "base", "tiling": 2})
+    measured = validate_axes({"tiling": 2})
+    hist = [{"round": 0, "champion": {"axes": champ}, "candidates": []},
+            {"round": 1, "champion": {"axes": champ},
+             "candidates": [{"id": "t", "axes": measured, "requested_axes": req,
+                             "unused_axes": ["exemplar"]}]}]
+    row = _compact_history(hist)[1]["candidates"][0]
+    assert row["axes_delta"] == {"tiling": 2} and row["unused_axes"] == ["exemplar"]
+
+
+def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path,
+                                                             monkeypatch):
+    """Only a candidate that fully passed screen becomes a served state "seen this
+    round" — if one whose discriminator refit failed on a transient error
+    blocked a sibling in the same state as same_setting, the combination would
+    be blocked for good with nothing measured on holdout."""
+    from agentic_configuration_search.loop import rescore
+    monkeypatch.setattr(gateway, "infer_config",
+                        _text_beats_semantic_infer(_gt_lookup(big_root)))
+    calls = []
+    real = rescore.fit_for_setting
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient HTTP 503")
+        return real(*a, **k)
+
+    monkeypatch.setattr(rescore, "fit_for_setting", flaky)
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: a, axes: {rescorer: true}}\n"
+                     "- {id: b, axes: {rescorer: true, exemplar: base}}\n")
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+               rounds=1, candidates_file=human, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
+    assert rec["human_a"]["skipped"] == "error"
+    assert rec["human_b"].get("skipped") != "same_setting", rec["human_b"].get("note")
+    assert len(calls) == 2                  # b got as far as the discriminator refit
