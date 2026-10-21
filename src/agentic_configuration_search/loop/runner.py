@@ -36,6 +36,7 @@ from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
 from ..eval.screen import screen_candidate
 from ..fitting.materials import Materials
+from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
@@ -119,7 +120,10 @@ class Loop:
         # detector_hooks: {"weights_ctl": fn(weights|None), "adapt_ctl": fn(root|None),
         #             "repo_root": Path, "base_weights": Path}
         #   — without it, lora/crop_classifier candidates are skipped
-        self.detector_hooks = detector_hooks
+        # controls that change the detector state empty the pass cache — the
+        # same input becomes a different inference
+        self.detector_hooks = (_invalidating_hooks(detector_hooks) if detector_hooks
+                               else detector_hooks)
         # validated here because config is a leaf — no silent absorption of typos (see config.py)
         bad = sorted(set(cfg.search.disabled_axes) - set(AXES))
         if bad:
@@ -889,39 +893,42 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 candidates_file=candidates_file, detector_hooks=detector_hooks)
     result = RunResult(out_dir=Path(out_dir))
 
-    history = loop._read_history() if resume else []
-    if history:
-        champion = loop._load_champion()
-        loop._restore_detector_state(champion)
-        start = history[-1]["round"] + 1
-        result.decisions = [e["decision"] for e in history]
-    else:
-        loop.out_dir.mkdir(parents=True, exist_ok=True)
-        (loop.out_dir / "history.jsonl").write_text("")
-        champion = loop.baseline()
-        history = loop._read_history()
-        result.decisions = [history[-1]["decision"]]
-        start = 1
-
-    # if resume reset the counter to 0, an already-saturated run would spend more
-    # rounds — restore the trailing stagnant count from history and continue it.
-    stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
-    if stagnant_rounds >= cfg.saturation.rounds:
-        result.stopped = "saturation"
-    else:
-        for r in range(start, rounds + 1):
-            decision, champion = loop.run_round(r, champion, history)
+    # inference for the same input under the same request conditions is reused
+    # for the run (gateway.pass_cache)
+    with gateway.pass_cache():
+        history = loop._read_history() if resume else []
+        if history:
+            champion = loop._load_champion()
+            loop._restore_detector_state(champion)
+            start = history[-1]["round"] + 1
+            result.decisions = [e["decision"] for e in history]
+        else:
+            loop.out_dir.mkdir(parents=True, exist_ok=True)
+            (loop.out_dir / "history.jsonl").write_text("")
+            champion = loop.baseline()
             history = loop._read_history()
-            result.decisions.append(decision)
-            if decision.get("kind") == "planner_stop":
-                result.stopped = "planner_stop"
-                break
-            stagnant_rounds = (stagnant_rounds + 1
-                               if _stagnant(decision, cfg.saturation.epsilon)
-                               else 0)
-            if stagnant_rounds >= cfg.saturation.rounds:
-                result.stopped = "saturation"
-                break
+            result.decisions = [history[-1]["decision"]]
+            start = 1
+
+        # if resume reset the counter to 0, an already-saturated run would spend more
+        # rounds — restore the trailing stagnant count from history and continue it.
+        stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
+        if stagnant_rounds >= cfg.saturation.rounds:
+            result.stopped = "saturation"
+        else:
+            for r in range(start, rounds + 1):
+                decision, champion = loop.run_round(r, champion, history)
+                history = loop._read_history()
+                result.decisions.append(decision)
+                if decision.get("kind") == "planner_stop":
+                    result.stopped = "planner_stop"
+                    break
+                stagnant_rounds = (stagnant_rounds + 1
+                                   if _stagnant(decision, cfg.saturation.epsilon)
+                                   else 0)
+                if stagnant_rounds >= cfg.saturation.rounds:
+                    result.stopped = "saturation"
+                    break
 
     _write(loop.out_dir / "run_summary.json", {
         "stopped": result.stopped,
@@ -938,6 +945,25 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
     result.history = history
     result.champion = champion
     return result
+
+
+def _invalidating_hooks(hooks: dict) -> dict:
+    """Wrap the detector-state controls (weights_ctl, adapt_ctl) to empty the pass
+    cache on every call. Once weights or the artifact change, the same input is
+    a different inference — every state change goes through these controls
+    (_restore_detector_state, the lora arm, the classifier arm), so one place
+    covers them."""
+    out = dict(hooks)
+    for key in ("weights_ctl", "adapt_ctl"):
+        fn = hooks.get(key)
+        if fn is not None:
+            def wrapped(*a, _fn=fn, **kw):
+                try:
+                    return _fn(*a, **kw)
+                finally:
+                    gateway.invalidate_pass_cache()
+            out[key] = wrapped
+    return out
 
 
 def _tiling_variants(search, axes: dict) -> tuple:

@@ -10,10 +10,14 @@ eval/runner.py; this module holds only the seam.
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 import numpy as np
 
@@ -55,11 +59,17 @@ def _tile_pieces(image_paths, tile_cfg: dict, plans: list):
     degenerate, size). The detector runs each image of a call on its own, so
     how pieces are grouped does not change results (same as per-image run_tiled)."""
     for path in image_paths:
+        # opened the way the detector opens a path (Pillow + EXIF orientation,
+        # Ultralytics' handling of a source list) — tiles and merge geometry
+        # share the frame of the untiled pass and of the full piece below
         with Image.open(path) as im:
-            im = im.convert("RGB")
+            im = ImageOps.exif_transpose(im).convert("RGB")
         tiles, degenerate = tiling.tile_plan(im.width, im.height, tile_cfg)
         plans.append((tiles, degenerate, (im.width, im.height)))
-        yield im
+        # the full image goes in as the file path, the same input as the
+        # untiled pass — the detector gets the same pixels, and the pass cache
+        # reuses the untiled inference
+        yield str(path)
         if not degenerate:
             for t in tiles:
                 yield im.crop(t)
@@ -101,6 +111,90 @@ def dedup_class_duplicates(dets: list[dict], iou_thr: float) -> list[dict]:
     return kept
 
 
+# ---------------------------------------------------------------- pass cache
+# Reuses inference for the same input under the same request conditions. Exact
+# only while the detector runs each image of a call on its own (the YOLOE
+# backend predicts with batch=1); batched forwards could shift scores with the
+# batch composition. Keys hash what the detector actually receives (file bytes
+# for a path, the pixel buffer for an in-memory image), so a changed file under
+# the same path is a different key. When the detector state (weights, artifact)
+# changes, invalidate_pass_cache() empties it — the runner wraps the
+# detector_hooks controls. Embedding requests are not cached.
+PASS_CACHE_MAX = 8192            # entry cap (pieces) — responses kept as JSON strings
+_pass_cache: OrderedDict | None = None
+
+
+@contextmanager
+def pass_cache(max_entries: int = PASS_CACHE_MAX):
+    """Reuse infer_config results inside this block (outside it, nothing changes)."""
+    global _pass_cache, PASS_CACHE_MAX
+    if max_entries < 0:
+        raise ValueError(f"pass_cache max_entries must be >= 0 (got {max_entries})")
+    prev, prev_max = _pass_cache, PASS_CACHE_MAX
+    _pass_cache, PASS_CACHE_MAX = OrderedDict(), max_entries
+    try:
+        yield
+    finally:
+        _pass_cache, PASS_CACHE_MAX = prev, prev_max
+
+
+def invalidate_pass_cache() -> None:
+    """The detector state changed — the same input is a different inference."""
+    if _pass_cache is not None:
+        _pass_cache.clear()
+
+
+def _content_key(image) -> str:
+    """Hash of what the detector receives for one image argument."""
+    h = hashlib.sha256()
+    if isinstance(image, Image.Image):
+        h.update(f"pil:{image.mode}:{image.size}:".encode())
+        h.update(image.tobytes())
+    else:
+        h.update(b"file:")
+        h.update(Path(image).read_bytes())
+    return h.hexdigest()
+
+
+def _request_signature(queries, kw: dict) -> str | None:
+    """Hash of the request conditions — the whole argument bundle passed to the
+    detector (kw) and the queries, with exemplar prompt images counted by
+    content. None if something does not serialize to JSON (not cached — so no
+    repr with a memory address ends up in a key)."""
+    try:
+        enc = [{**q, "prompt_image": _content_key(q["prompt_image"])}
+               if q.get("prompt_image") is not None else q for q in (queries or [])]
+        blob = json.dumps([enc, kw], sort_keys=True)
+    except (TypeError, OSError):
+        return None
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _cached_predict_images(client, batch, queries, sig, **kw) -> list:
+    """Send only the pieces of a batch missing from the cache (a duplicate within
+    the batch once).
+
+    This batch's responses are gathered in a local dict first, and entries over
+    the cap are evicted at the end — evicting while storing could drop a hit of
+    the same batch and raise KeyError on read."""
+    cache = _pass_cache
+    keys = [sig + _content_key(im) for im in batch]
+    got = {}
+    for k in dict.fromkeys(keys):
+        if k in cache:
+            cache.move_to_end(k)
+            got[k] = cache[k]
+    todo = [k for k in dict.fromkeys(keys) if k not in got]
+    if todo:
+        first = {k: im for k, im in zip(reversed(keys), reversed(batch))}
+        for k, p in zip(todo, client.predict_images([first[k] for k in todo],
+                                                    queries, **kw)):
+            got[k] = cache[k] = json.dumps(p)
+    while len(cache) > PASS_CACHE_MAX:
+        cache.popitem(last=False)
+    return [json.loads(got[k]) for k in keys]
+
+
 def make_predictor(ctx, client, config: dict, queries, ontology,
                    alias_to_name=None, return_embeddings: bool = False):
     """Image list → per-image detection lists. The single gate for all detector
@@ -116,12 +210,19 @@ def make_predictor(ctx, client, config: dict, queries, ontology,
     if return_embeddings:
         neg_kwargs["return_embeddings"] = True
 
+    # the argument bundle sent to the detector — the cache key is built from it
+    # too (so a new argument cannot be left out of the key)
+    kw = dict(apply_topk=z.apply_topk, iou_threshold=z.iou_threshold, **neg_kwargs)
+    sig = (_request_signature(queries, kw)
+           if _pass_cache is not None and not return_embeddings else None)
+
     def predict(images) -> list[list[dict]]:
         out: list[list[dict]] = []
         for batch in _prefetched(images):
-            preds = client.predict_images(batch, queries,
-                                          apply_topk=z.apply_topk,
-                                          iou_threshold=z.iou_threshold, **neg_kwargs)
+            if sig is not None and _pass_cache is not None:
+                preds = _cached_predict_images(client, batch, queries, sig, **kw)
+            else:
+                preds = client.predict_images(batch, queries, **kw)
             # Class resolution uses text (name) only — labels (flat prompt
             # indices) are unused (see clients.wire.parse_prediction)
             parsed = [parse_prediction(p, ontology.name_to_id,
