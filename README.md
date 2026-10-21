@@ -148,7 +148,10 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   Prompts and responses are saved, so `--resume` replays them without the LLM.
   The prompt is rebuilt every round; when it exceeds the estimated-token budget
   (server context − output cap), the history window shrinks first. Response
-  length is bounded by the schema (rationale, id, candidate count).
+  length is bounded by the schema (rationale, id, candidate count). One call
+  per round, plus at most one follow-up in the same conversation when the
+  planner repeats carried candidates: those are dropped as
+  `carried_duplicate` and the freed slots are asked for again.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 

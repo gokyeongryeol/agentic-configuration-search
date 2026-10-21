@@ -1176,3 +1176,22 @@ def test_modality_record_keeps_screen_choice_and_unique_keys():
     assert mf["bolt#1"]["chosen"] == "text"
     assert _modality_summary(mf)["text_won"] == 2
     assert _modality_record(None, onto) == {}
+
+
+def test_filtered_candidates_are_not_logged_as_unwired(big_root, tmp_path, monkeypatch,
+                                                       caplog):
+    """Candidates removed by the sanitizer or combination filter are not
+    "cannot be wired" — the warning counts only candidates dropped at wiring
+    (carried candidates filtered as duplicates were logged as unwired)."""
+    import logging
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: bad, axes: {fn_k: 2}}\n")       # filtered as invalid_axes
+    with caplog.at_level(logging.WARNING,
+                         logger="agentic_configuration_search.loop.runner"):
+        run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+                   rounds=1, candidates_file=human, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
+    assert rec["human_bad"]["skipped"] == "invalid_axes"
+    unwired = [r.message for r in caplog.records if "cannot be wired" in r.message]
+    assert all("human_bad" not in m for m in unwired), unwired

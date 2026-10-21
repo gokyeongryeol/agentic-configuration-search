@@ -581,6 +581,7 @@ class Loop:
 
         wired, lora_cands, classifier_cands = [], [], []
         skipped = list(proposal.get("dropped", []))   # include combo_tried records
+        n_filtered = len(skipped)                     # up to here: filter drops, not wiring
         champ_axes = champion.get("axes") or {}
         for c in proposal["candidates"]:
             miss = _missing_hook(c["axes"], self._mat_kw)
@@ -618,9 +619,10 @@ class Loop:
                     classifier_cands.append(c)
             else:
                 wired.append(c)
-        if skipped:
-            log.warning("skipped %d candidates that cannot be wired: %s", len(skipped),
-                        [c["id"] for c in skipped])
+        if len(skipped) > n_filtered:
+            log.warning("skipped %d candidates that cannot be wired: %s",
+                        len(skipped) - n_filtered,
+                        [c["id"] for c in skipped[n_filtered:]])
 
         if not wired and not lora_cands and not classifier_cands:
             decision = {"round": r, "adopted": False,
