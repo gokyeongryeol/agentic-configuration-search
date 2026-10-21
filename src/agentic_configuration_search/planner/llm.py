@@ -69,11 +69,14 @@ RATIONALE_MAX_CHARS = SCHEMA["schema"]["properties"]["candidates"]["items"][
     "properties"]["rationale"]["maxLength"]
 OUTPUT_MAX_TOKENS = 4096
 # Prompt token estimate — counted generously without the server tokenizer.
-# ASCII uses the worst ratio measured with the planner tokenizer (number-heavy
-# JSON fragments at 1.85 chars/token; whole planner prompts never went below
-# 2.68), and other characters (Hangul, Han, ...) count 1.5 tokens each — a
-# character budget overflowed the server context on CJK-heavy prompts (around
-# 1.8 chars/token).
+# ASCII counts at 1.85 chars/token (whole planner prompts measured no lower than
+# 2.68; number-heavy JSON fragments about 1.85), and other characters (Hangul,
+# Han, ...) count 1.5 tokens each — a character budget overflowed the server
+# context on CJK-heavy prompts (around 1.8 chars/token). It is not a bound:
+# text that is a long run of digits tokenizes below it, since the Qwen
+# tokenizer splits digits one by one (synthetic numeric JSON about 1.2). Real
+# prompts mix in prose, and on all measured planner prompts the estimate came
+# out above the actual count.
 ASCII_CHARS_PER_TOKEN = 1.85
 NON_ASCII_TOKENS = 1.5
 CONTEXT_MARGIN = 256      # chat template tokens etc.

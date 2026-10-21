@@ -146,6 +146,9 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   silently off.
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
   Prompts and responses are saved, so `--resume` replays them without the LLM.
+  The prompt is rebuilt every round; when it exceeds the estimated-token budget
+  (server context − output cap), the history window shrinks first. Response
+  length is bounded by the schema (rationale, id, candidate count).
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 
