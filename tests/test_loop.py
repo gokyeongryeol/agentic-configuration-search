@@ -1098,7 +1098,7 @@ def test_modality_record_names_classes_and_rounds():
               "text": {"f_beta": 0.262136, "threshold": 0.2},
               "union": {"f_beta": 0.25, "threshold": 0.2}}}}
     assert _modality_record(setting, onto) == {
-        "modality_f": {"cat a": {"semantic": 0.1235, "text": 0.2621}}}
+        "modality_f": {"cat a": {"semantic": 0.1235, "text": 0.2621, "chosen": "text"}}}
     # candidates with no semantic pass (text only) record nothing
     assert _modality_record({"modality_diagnostic": {}}, onto) == {}
 
@@ -1155,3 +1155,24 @@ def test_modality_summary_size_does_not_grow_with_classes():
     assert b["text_won"] + b["semantic_won"] == 19
     assert b["closest_text_margin"] == 0.05
     assert len(_json.dumps(b)) < 80
+
+
+def test_modality_record_keeps_screen_choice_and_unique_keys():
+    """Wins are counted by the modality screen picked (chosen) — counting from
+    rounded F would count a text win by less than 5e-5 as semantic. Classes with
+    the same name get their id appended instead of overwriting each other."""
+    from agentic_configuration_search.core.coco import Ontology
+    from agentic_configuration_search.loop.runner import _modality_record
+    from agentic_configuration_search.planner.llm import _modality_summary
+
+    onto = Ontology.from_categories([{"id": 1, "name": "bolt"}, {"id": 2, "name": "bolt"},
+                                     {"id": 3, "name": "nut"}])
+    d = lambda s, t, ch: {"chosen": ch, "semantic": {"f_beta": s}, "text": {"f_beta": t}}  # noqa: E731
+    setting = {"modality_diagnostic": {"1": d(0.50001, 0.50004, "text"),
+                                       "2": d(0.3, 0.2, "semantic"),
+                                       "3": d(0.1, 0.4, "text")}}
+    mf = _modality_record(setting, onto)["modality_f"]
+    assert set(mf) == {"bolt#1", "bolt#2", "nut"}
+    assert mf["bolt#1"]["chosen"] == "text"
+    assert _modality_summary(mf)["text_won"] == 2
+    assert _modality_record(None, onto) == {}

@@ -1079,10 +1079,19 @@ def _modality_record(setting: dict, ontology) -> dict:
     k or fn_arm. A candidate filtered before holdout has no saved setting, so
     this record is the only evidence left. Candidates with no semantic pass
     (text only) record nothing."""
-    diag = setting.get("modality_diagnostic") or {}
-    names = {str(c.id): c.name for c in ontology.classes}
+    diag = (setting or {}).get("modality_diagnostic") or {}
+    # classes sharing a name get their id appended — if name keys overwrote
+    # each other the counts would be wrong
+    counts: dict[str, int] = {}
+    for c in ontology.classes:
+        counts[c.name] = counts.get(c.name, 0) + 1
+    names = {str(c.id): (c.name if counts[c.name] == 1 else f"{c.name}#{c.id}")
+             for c in ontology.classes}
+    # chosen is screen's actual pick — recounting wins from rounded F would
+    # count a narrow text win as semantic
     out = {names.get(cid, cid): {"semantic": round(d["semantic"]["f_beta"], 4),
-                                 "text": round(d["text"]["f_beta"], 4)}
+                                 "text": round(d["text"]["f_beta"], 4),
+                                 "chosen": d.get("chosen")}
            for cid, d in diag.items()}
     return {"modality_f": out} if out else {}
 
