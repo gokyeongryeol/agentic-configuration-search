@@ -279,19 +279,34 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
     note prefix — so a near miss can be told from a clear regression."""
     out = []
     # window=0 means "no history" — history[-0:] is the whole list in Python.
-    for e in (history[-window:] if window > 0 else []):
+    start = max(len(history) - window, 0) if window > 0 else len(history)
+    for i in range(start, len(history)):
+        e = history[i]
         d = e.get("decision", {})
         evaluated = d.get("evaluated") or {}
-        champ_axes = e.get("champion", {}).get("axes") or {}
+        # deltas are against the champion at the **start** of the round — the
+        # row's champion is the one after it, so comparing with that would mix
+        # in the axes adopted that round
+        champ_axes = ((history[i - 1].get("champion", {}).get("axes") if i > 0
+                       else None) or e.get("champion", {}).get("axes") or {})
         cands = []
         for c in e.get("candidates", []):
+            # a relabelled candidate shows its requested increment — against the
+            # corrected label, an inherited axis that went unused would look
+            # turned off
             row = {"id": c.get("id"),
-                   "axes_delta": _delta_axes(c.get("axes"), champ_axes),
+                   "axes_delta": _delta_axes(c.get("requested_axes") or c.get("axes"),
+                                             champ_axes),
                    "adopted": c.get("adopted"), "skipped": c.get("skipped")}
             if c.get("fit_dev_micro_f_beta") is not None:
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
+            if "neg_eta_used" in c:
+                row["neg_eta_used"] = c["neg_eta_used"]
+                row["neg_eta_grid"] = c.get("neg_eta_grid")
+            if c.get("unused_axes"):
+                row["unused_axes"] = c["unused_axes"]
             if c.get("gate_passed_but_lost"):
                 row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
             if c.get("note"):
@@ -321,7 +336,9 @@ it).** Each candidate toggles axes from the current champion:
 
 Rules:
 - Change as FEW axes as possible per candidate (single increments attribute
-  gains cleanly). "visual_negatives" requires exemplar != "none".
+  gains cleanly). List only the axes you change: omitted axes keep the
+  champion's value; to turn an axis off, set it to false explicitly.
+  "visual_negatives" requires exemplar != "none".
 - Materials are mined from the train split only; adoption is decided by a
   held-out gate afterwards — propose boldly, the gate filters.
 - The gate adopts only if a paired-bootstrap LOWER BOUND on the holdout delta
@@ -335,6 +352,21 @@ Rules:
   time. A history row with tiling_used=false means no class benefited from that
   grid on fit_dev (the setting fell back to no tiling); tiling_used=true on an
   adopted grid while small-object misses remain suggests trying g+1.
+- A row with unused_axes lists axes the candidate had on that the screened
+  setting did not use (exemplar: the text pass beat the semantic pass for every
+  class; visual_negatives: no semantic class kept a negative config). Other
+  variants of such an axis (another k, fn_arm) rarely change the setting
+  while that stays true.
+- A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
+  the screen picked for semantic classes) and neg_eta_grid (the thresholds it
+  tried). Lower means stronger suppression. Picks at the low end of the grid
+  mean negatives are pulling hard, so more negatives (raise visual_negative_k)
+  may help; picks at the high end mean they barely help, so fold the axis
+  rather than raising k.
+- Once "lora" or "crop_classifier" is on in the champion, keep it on: they are
+  detector state (weights / classifier artifact) that stays loaded while
+  other candidates are measured, so a candidate turning one off is rejected as
+  skipped="detector_state_off" without evaluation.
 - If nothing promising remains, return stop=true with no candidates.
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that

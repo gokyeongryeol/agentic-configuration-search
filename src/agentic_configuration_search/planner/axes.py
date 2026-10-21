@@ -166,12 +166,45 @@ def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None,
                for a, vals in (disabled_values or {}).items())
 
 
+def merge_onto(base: dict, delta: dict) -> dict:
+    """Apply a candidate increment (delta) on top of base (the current champion).
+
+    When a feature axis is turned off or changed, the dependent and count axes
+    the delta does not name go back to their safe point — if the champion's
+    stayed, validate_axes' dependency rules (e.g. fn_k only with
+    exemplar=fn_arm) would drop the whole candidate."""
+    out = {**BASELINE, **(base or {}), **delta}
+
+    def reset(key, value):
+        if key not in delta:
+            out[key] = value
+
+    if "exemplar" in delta:
+        if out["exemplar"] == "none":
+            for key in ("exemplar_k", "fn_k", "visual_negative_k"):
+                reset(key, None)
+            reset("visual_negatives", False)
+        elif out["exemplar"] != "fn_arm":
+            reset("fn_k", None)
+    if "visual_negatives" in delta and not out["visual_negatives"]:
+        reset("visual_negative_k", None)
+    if "text_negatives" in delta and not out["text_negatives"]:
+        reset("text_negative_k", None)
+    return out
+
+
 def sanitize_candidates(raw, *, max_candidates: int,
                         dropped: list | None = None,
                         disabled_axes=(), disabled_values=None,
                         base: dict | None = None,
                         facts: DatasetFacts | None = None) -> list[dict]:
     """Filter the planner's (especially the LLM's) candidate list against the contract.
+
+    Given base (the current champion's axes), candidate axes are read as an
+    **increment** over it — omitted axes keep the champion's value, and turning
+    one off takes an explicit False. Without base, omitted axes are BASELINE
+    (the old behavior: an LLM listing only the axes it changes silently turned
+    the champion's axes off).
 
     Invalid candidates are removed — the planner only proposes and the gate
     adopts, so leniency here is harmless while propagating errors kills the loop.
@@ -181,17 +214,27 @@ def sanitize_candidates(raw, *, max_candidates: int,
     rejected" from "never evaluated" and resubmits the same candidate. The
     runner's combo_tried follows the same principle.
 
-    Four reasons: invalid_axes (contract violation) · disabled_axes (axis/value
+    Five reasons: invalid_axes (contract violation) · disabled_axes (axis/value
     banned for this run, unless inherited from base — the champion's axes) ·
-    duplicate_axes (repeat within one response) · max_candidates (over quota).
+    no_change (same as base, no increment to evaluate) · duplicate_axes (repeat
+    within one response) · max_candidates (over quota).
     """
     out, seen = [], set()
+    merge_base = None
+    if base:
+        try:
+            merge_base = validate_axes(base)
+        except ValueError:              # old-format record — read axes as-is
+            merge_base = None
 
-    def _drop(i, c, why: str, note: str) -> None:
+    def _drop(i, c, why: str, note: str, merged: dict | None = None) -> None:
+        # a candidate merged onto base is recorded with the merged axes — so
+        # tried_combos does not fill the increment from BASELINE and block a
+        # combination that was never tried
         if dropped is None:
             return
         cand = c if isinstance(c, dict) else {}
-        axes = cand.get("axes")
+        axes = merged or cand.get("axes")
         dropped.append({"id": str(cand.get("id") or f"cand_{i}"),
                         "axes": axes if isinstance(axes, dict) else {},
                         "rationale": str(cand.get("rationale", "")),
@@ -202,21 +245,28 @@ def sanitize_candidates(raw, *, max_candidates: int,
             _drop(i, c, "invalid_axes", "not a candidate — an axes dict is required")
             continue
         try:
-            axes = validate_axes(c["axes"], facts=facts)
+            axes = validate_axes(merge_onto(merge_base, c["axes"]) if merge_base
+                                 else c["axes"], facts=facts)
         except ValueError as exc:
             # Carry the ValueError message verbatim — it goes back into the next
             # round's prompt and is the only signal that stops the same violation.
             _drop(i, c, "invalid_axes", str(exc))
             continue
         if uses_disabled_axes(axes, disabled_axes, disabled_values, base=base):
-            _drop(i, c, "disabled_axes", "uses an axis/value disabled for this run")
+            _drop(i, c, "disabled_axes", "uses an axis/value disabled for this run", axes)
+            continue
+        if merge_base and axes == merge_base:
+            _drop(i, c, "no_change", "same combination as the current champion — "
+                                     "no increment to evaluate", axes)
             continue
         key = tuple(sorted(axes.items()))
         if key in seen:
-            _drop(i, c, "duplicate_axes", "duplicate combination within the same response")
+            _drop(i, c, "duplicate_axes", "duplicate combination within the same response",
+                  axes)
             continue
         if len(out) >= max_candidates:
-            _drop(i, c, "max_candidates", f"exceeds the cap of {max_candidates} candidates")
+            _drop(i, c, "max_candidates", f"exceeds the cap of {max_candidates} candidates",
+                  axes)
             continue
         seen.add(key)
         out.append({"id": str(c.get("id") or f"cand_{i}"), "axes": axes,

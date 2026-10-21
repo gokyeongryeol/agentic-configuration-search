@@ -94,3 +94,25 @@ def test_changed_axis_is_remined(dataset_root, tmp_path):
     n0 = sum(len(v) for v in m0.exemplars.values())
     n1 = sum(len(v) for v in m1.exemplars.values())
     assert n1 > n0                                   # re-mined with k=2
+
+
+def test_relabeled_exemplar_none_does_not_inherit_exemplars(dataset_root, tmp_path):
+    """When screen did not use exemplar and the champion label was corrected to
+    exemplar=none, the parent's materials still hold exemplars. An exemplar=none
+    candidate on top must not inherit them — screen would run the semantic pass
+    again and the label would split from what is served."""
+    cfg = config_from_dict({"dataset": str(dataset_root)})
+    ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
+    fakes = dict(encode_fn=lambda cid, p: np.array(
+                     [[float(i), 0.0] for i in range(len(p))]),
+                 caption_fn=lambda rows: {r["id"]: ["x look"] for r in rows},
+                 vlm_caption_fn=lambda rows: {r["id"]: ["x look"] for r in rows},
+                 refine_alias_fn=lambda n, cn, p, o: {"alias": p[0], "reason": "t"})
+    parent = tmp_path / "p"
+    m0 = materialize(cfg, ds, _ax(exemplar="base"), parent, seed=0, **fakes)
+    assert any(m0.exemplars.values())
+    relabeled = _ax()                                # the corrected champion label
+    cand = _ax(alias="vlm")
+    m1 = materialize(cfg, ds, cand, tmp_path / "c", seed=0,
+                     parent=parent, parent_axes=relabeled, **fakes)
+    assert not any(m1.exemplars.values())

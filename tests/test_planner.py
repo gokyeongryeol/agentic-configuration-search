@@ -829,6 +829,42 @@ def test_carryover_skips_invalid_identical_or_disabled():
     assert deterministic.carryover([]) == []
 
 
+def test_carryover_uses_requested_axes_not_relabel():
+    """A candidate whose label was corrected for an unused axis is carried with
+    its requested increment — reading the corrected label (exemplar=none) as the
+    increment would turn the new champion's exemplar off."""
+    champ0 = validate_axes({"exemplar": "base"})
+    win = validate_axes({"exemplar": "base", "tiling": 2})
+    requested = validate_axes({"exemplar": "base", "text_negatives": "fp_crop"})
+    measured = validate_axes({"text_negatives": "fp_crop"})
+    hist = [{"round": 1, "champion": {"axes": champ0}, "candidates": []},
+            {"round": 2, "champion": {"axes": win},
+             "candidates": [{"id": "w", "axes": win, "adopted": True},
+                            {"id": "l", "axes": measured, "requested_axes": requested,
+                             "unused_axes": ["exemplar"], "adopted": False,
+                             "gate_passed_but_lost": True}]}]
+    out = deterministic.carryover(hist)
+    assert [c["axes"] for c in out] == [
+        validate_axes({"exemplar": "base", "tiling": 2, "text_negatives": "fp_crop"})]
+
+
+def test_carryover_resets_dependent_axes_on_new_champion():
+    """Carried increments are applied with merge_onto too — if the new champion
+    turned on an axis tied to exemplar (visual_negatives) and the losing
+    candidate turned exemplar off, an overwrite would be a contract-violating
+    combination and the gate passer would vanish without a record."""
+    prev = validate_axes({"exemplar": "base"})
+    win = validate_axes({"exemplar": "base", "visual_negatives": True})
+    lost = validate_axes({"alias": "vlm"})          # turned exemplar off and alias on
+    hist = [{"round": 1, "champion": {"axes": prev}, "candidates": []},
+            {"round": 2, "champion": {"axes": win},
+             "candidates": [{"id": "w", "axes": win, "adopted": True},
+                            {"id": "l", "axes": lost, "adopted": False,
+                             "gate_passed_but_lost": True}]}]
+    out = deterministic.carryover(hist)
+    assert [c["axes"] for c in out] == [validate_axes({"alias": "vlm"})]
+
+
 def test_llm_prompt_lists_carried_candidates_only_when_present(tmp_path):
     seen = {}
 
@@ -842,3 +878,105 @@ def test_llm_prompt_lists_carried_candidates_only_when_present(tmp_path):
     assert "rescorer=True" in seen["p"].split("Re-queued automatically", 1)[1][:400]
     LLMPlanner(chat=chat, artifact_dir=tmp_path / "b").propose(hist[:1], {})
     assert "Re-queued automatically" not in seen["p"]
+
+
+# ------------------------------------- candidate axes are relative to the champion
+
+def test_sanitize_merges_candidate_over_champion():
+    """The planner lists only the axes it changes — omitted axes keep the
+    champion's value. They used to be filled from BASELINE, silently turning the
+    champion's axes (rescorer, lora, ...) off."""
+    champ = validate_axes({"rescorer": True, "lora": True})
+    out = sanitize_candidates([{"id": "t", "axes": {"tiling": 2}},
+                               {"id": "off", "axes": {"rescorer": False}}],
+                              max_candidates=3, base=champ)
+    assert out[0]["axes"] == validate_axes({"rescorer": True, "lora": True, "tiling": 2})
+    assert out[1]["axes"]["rescorer"] is False and out[1]["axes"]["lora"] is True
+
+
+def test_llm_candidates_keep_champion_axes(tmp_path):
+    champ = validate_axes({"rescorer": True, "crop_classifier": True})
+    hist = [{"round": 0, "champion": {"axes": champ}, "candidates": []}]
+
+    def chat(messages, **kw):
+        return {"candidates": [{"id": "t", "axes": {"tiling": 2}, "rationale": "x"}],
+                "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    assert out["candidates"][0]["axes"] == validate_axes(
+        {"rescorer": True, "crop_classifier": True, "tiling": 2})
+
+
+def test_compact_history_delta_is_against_pre_round_champion():
+    """History axes_delta is against the champion at the **start** of the round —
+    comparing with the champion after it mixes in the axes adopted that round as
+    if they were turned off."""
+    from agentic_configuration_search.planner.llm import _compact_history
+
+    base = validate_axes({})
+    after = validate_axes({"rescorer": True})
+    hist = [{"round": 0, "champion": {"axes": base}, "candidates": []},
+            {"round": 1, "champion": {"axes": after},
+             "candidates": [{"id": "r", "axes": after, "adopted": True},
+                            {"id": "e", "axes": validate_axes({"exemplar": "base"}),
+                             "adopted": False}]}]
+    rows = {c["id"]: c for c in _compact_history(hist)[1]["candidates"]}
+    assert rows["e"]["axes_delta"] == {"exemplar": "base"}
+    assert rows["r"]["axes_delta"] == {"rescorer": True}
+
+
+def test_merge_resets_dependents_of_a_changed_feature_axis():
+    """Turning a feature axis off or changing it resets the dependent and count
+    axes the candidate does not name — if the champion's stayed, the validation
+    rules would drop the whole candidate."""
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 4, "fn_k": 2,
+                           "visual_negatives": True, "visual_negative_k": 2,
+                           "text_negatives": "fp_crop", "text_negative_k": 2,
+                           "rescorer": True})
+    def one(ax):
+        out = sanitize_candidates([{"id": "c", "axes": ax}], max_candidates=1, base=champ)
+        assert out, f"{ax} was dropped"
+        return out[0]["axes"]
+    off = one({"exemplar": "none"})
+    assert off["exemplar_k"] is None and off["fn_k"] is None
+    assert off["visual_negatives"] is False and off["visual_negative_k"] is None
+    assert off["rescorer"] is True and off["text_negatives"] == "fp_crop"
+    base = one({"exemplar": "base"})
+    assert base["fn_k"] is None and base["exemplar_k"] == 4 and base["visual_negatives"]
+    assert one({"visual_negatives": False})["visual_negative_k"] is None
+    assert one({"text_negatives": False})["text_negative_k"] is None
+    # an explicit value is used as given
+    assert one({"exemplar": "base", "exemplar_k": 8})["exemplar_k"] == 8
+
+
+def test_candidate_identical_to_champion_is_dropped():
+    champ = validate_axes({"rescorer": True})
+    dropped: list = []
+    out = sanitize_candidates([{"id": "same", "axes": {}},
+                               {"id": "same2", "axes": {"rescorer": True}}],
+                              max_candidates=3, dropped=dropped, base=champ)
+    assert out == [] and {d["skipped"] for d in dropped} == {"no_change"}
+
+
+def test_legacy_invalid_base_falls_back_to_absolute_axes():
+    """A champion that does not validate under the current contract (an old run's
+    tiling: True, say) as base does not kill the round — candidate axes are read
+    as-is, without the increment."""
+    legacy = {**BASELINE, "tiling": True}
+    dropped: list = []
+    out = sanitize_candidates([{"id": "c", "axes": {"tiling": 2}}],
+                              max_candidates=3, dropped=dropped, base=legacy)
+    assert [c["axes"]["tiling"] for c in out] == [2] and dropped == []
+
+
+def test_dropped_rows_record_merged_axes():
+    """A candidate dropped after merging onto base is recorded with the merged
+    axes — left as the increment, tried_combos would fill it from BASELINE and
+    block a combination that was never tried."""
+    champ = validate_axes({"exemplar": "base"})
+    dropped: list = []
+    sanitize_candidates([{"id": "a", "axes": {"tiling": 2}},
+                         {"id": "b", "axes": {"tiling": 2}}],
+                        max_candidates=3, dropped=dropped, base=champ)
+    assert [d["skipped"] for d in dropped] == ["duplicate_axes"]
+    assert dropped[0]["axes"] == validate_axes({"exemplar": "base", "tiling": 2})

@@ -17,6 +17,7 @@ are not adopted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -440,9 +441,17 @@ class Loop:
             if self._guard_material(c, materials, skipped):
                 return
             setting0 = self._screen(materials, base_axes)
+            # judge sameness **before** the refit — if the served state equals the
+            # champion's, a sibling's or an already-evaluated candidate's, skip
+            # the discriminator refit (train re-inference) and holdout altogether
+            if self._skip_same(c, entry, setting0, materials, skipped):
+                return
             rescorer, info, dev_preds = rescore.fit_for_setting(
                 self.cfg, self.client, self.ds, setting0, materials, mat_dir)
             if rescorer is None or not rescorer.active:
+                # the identity verdict is deterministic — a sibling in the same
+                # state gets the same result, so block it
+                self._seen_fps.add(entry["setting_fp"])
                 skipped.append({**c, "skipped": "rescorer_identity",
                                 "note": "rescorer skipped or α=0 for all classes — "
                                         "identical to champion, evaluation skipped"})
@@ -458,30 +467,77 @@ class Loop:
             if self._guard_material(c, materials, skipped):
                 return
             setting = self._screen(materials, c["axes"])
-        if self._tiling_unused(c, entry, setting, skipped):
-            return
+            if self._skip_same(c, entry, setting, materials, skipped):
+                return
         entry.update({"setting": setting,
                       "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
                       "_materials": materials})
-        _relabel_untiled(entry)
+        _relabel_unused(entry)
+        # only once screen has fully passed is this a served state "seen this
+        # round" — a candidate that failed earlier (e.g. a transient error during
+        # the refit) blocking a sibling in the same state would make tried_combos
+        # block a combination for good with nothing measured
+        self._seen_fps.add(entry["setting_fp"])
         screened.append(entry)
 
-    def _tiling_unused(self, c: dict, entry: dict, setting: dict,
-                       skipped: list) -> bool:
-        """Tiling was requested but screen picked an untiled config, which makes
-        the setting equal the champion's — reject without holdout evaluation
-        (True). It still counts as tried: the skipped row keeps the requested
-        axes, so tried_combos blocks it."""
-        if not entry["axes"].get("tiling") or _uses_tiling(setting):
+    def _skip_same(self, c: dict, entry: dict, setting: dict, materials: Materials,
+                   skipped: list) -> bool:
+        """Reject without holdout evaluation (True) if the served state
+        (_served_fp) equals the champion's, a sibling's in the same round, or a
+        candidate evaluated on holdout before — the same state gives the same
+        holdout predictions. Axis labels are not compared because materials can
+        differ under the same label (a candidate with exemplar on re-mines text
+        negatives from the exemplar pass's FPs).
+
+        Same as the champion with an unused axis → axis_unused (which axes in
+        unused_axes); otherwise same_setting. It still counts as tried: the
+        skipped row keeps the requested axes, so tried_combos blocks it."""
+        fp = _served_fp(setting, materials, entry["axes"], self._served_state(entry))
+        entry["setting_fp"] = fp
+        unused = _unused_axes(entry["axes"], setting)
+        if fp == self._champion_fp():
+            if unused:
+                rec = {**c, "skipped": "axis_unused", "unused_axes": unused,
+                       "note": f"{unused}: the screened setting does not use this axis — "
+                               "same setting as champion, evaluation skipped"}
+            else:
+                rec = {**c, "skipped": "same_setting",
+                       "note": "served state equals the champion's — evaluation skipped"}
+        elif fp in self._seen_fps:
+            rec = {**c, "skipped": "same_setting",
+                   "note": "served state equals another candidate's in this round — "
+                           "evaluation skipped"}
+        elif fp in self._tried_fps:
+            rec = {**c, "skipped": "same_setting",
+                   "note": "served state equals a setting evaluated on holdout in an "
+                           "earlier round — evaluation skipped"}
+        else:
             return False
-        champ = (getattr(self, "_champion", None) or {}).get("axes")
-        if champ is None or {**entry["axes"], "tiling": False} != champ:
-            return False
-        log.info("candidate %s: screen picked an untiled config — same as champion", c["id"])
-        skipped.append({**c, "skipped": "tiling_unused", "tiling_used": False,
-                        "note": f"tiling={entry['axes']['tiling']}: screen picked an "
-                                "untiled config — same setting as champion, evaluation skipped"})
+        if unused:
+            rec.setdefault("unused_axes", unused)
+            if "tiling" in unused:
+                rec["tiling_used"] = False
+        log.info("candidate %s: %s", c["id"], rec["note"])
+        skipped.append(rec)
         return True
+
+    def _served_state(self, entry: dict) -> dict:
+        """Server state a wired candidate is served with — the champion's weights
+        and artifact (or the prompt dictionary alias widened, if any)."""
+        ch = getattr(self, "_champion", None) or {}
+        return {"weights": ch.get("weights"),
+                "adapt_root": entry.get("_adapt_root", ch.get("adapt_root"))}
+
+    def _champion_fp(self) -> str | None:
+        ch = getattr(self, "_champion", None) or {}
+        if "_fp" not in ch:
+            fp = None
+            if ch.get("setting") and ch.get("materials_dir") \
+                    and Path(ch["materials_dir"]).exists():
+                fp = _served_fp(ch["setting"], Materials.load(Path(ch["materials_dir"])),
+                                ch.get("axes") or {}, self._served_state(ch))
+            ch["_fp"] = fp
+        return ch["_fp"]
 
     # ------------------------------------------------------------- rounds
 
@@ -513,6 +569,9 @@ class Loop:
         """One round — returns (decision, champion)."""
         self._round_t0 = time.monotonic()
         self._champion = champion          # parent for material inheritance
+        self._champion.pop("_fp", None)
+        self._seen_fps: set[str] = set()     # served states that passed screen this round
+        self._tried_fps = _evaluated_fps(history)
         rd = self._round_dir(r)
         rd.mkdir(parents=True, exist_ok=True)
         diagnosis = self._diagnosis(champion, rd)
@@ -530,7 +589,14 @@ class Loop:
                                         f"for this axis (needs LLM/worker wiring)"})
                 continue
             route = _route_detector_state(c["axes"], champ_axes)
-            if route == "compound":
+            if route == "off":
+                off = [k for k in ("lora", "crop_classifier")
+                       if champ_axes.get(k) and not c["axes"].get(k)]
+                skipped.append({**c, "skipped": "detector_state_off",
+                                "note": f"{off}: the champion's detector-state axes cannot "
+                                        "be measured turned off (the state stays loaded "
+                                        "while measuring) — keep them on"})
+            elif route == "compound":
                 skipped.append({**c, "skipped": "compound_server_state",
                                 "note": "turning on both lora and crop_classifier relative to "
                                         "champion is unsupported (gain cannot be attributed) — "
@@ -641,11 +707,11 @@ class Loop:
                      "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
                                              default=0.0),
                      "lora": res["decision"]}
-            _relabel_untiled(entry)
+            _relabel_unused(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
-                            | _requested(entry))
+                            | _requested(entry) | _unused_record(entry))
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", "")})
@@ -703,12 +769,12 @@ class Loop:
                      "fit_dev_micro_f_beta":
                          res["setting"]["fit_dev_micro_f_beta"],
                      "crop_classifier": res["decision"]}
-            _relabel_untiled(entry)
+            _relabel_unused(entry)
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")}
                             | {"crop_classifier": res["decision"]}
-                            | _requested(entry))
+                            | _requested(entry) | _unused_record(entry))
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -784,7 +850,9 @@ class Loop:
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
-                            | _tiling_record(c) | _requested(c)
+                            | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
+                            | _unused_record(c)
+                            | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
                             | {"forwards": setting_forwards(c["setting"])}
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | ({"source": c["source"]} if c.get("source") else {})
@@ -920,19 +988,126 @@ def _tiling_record(c: dict) -> dict:
     return {"tiling_used": _uses_tiling(c["setting"])}
 
 
-def _relabel_untiled(entry: dict) -> None:
-    """Tiling was requested but the setting uses no tile — correct axes to the
-    measured state (no tiling) and keep the request in requested_axes. A
-    champion labelled with tiling it never runs would credit other axes' gains
-    to tiling, and the next round's step-up would start from an unused zoom.
-    Same principle as the rescorer identity-refit relabel (_measured_axes)."""
-    if entry["axes"].get("tiling") and not _uses_tiling(entry["setting"]):
+def _neg_eta_record(c: dict) -> dict:
+    """For a candidate that requested visual negatives, the neg_eta values screen
+    picked for semantic classes (neg_eta_used) and the grid it searched
+    (neg_eta_grid) — a sizing signal like tiling_used. neg_eta is the
+    suppression IoU threshold, so lower means stronger suppression: picks at the
+    low end of the grid point the planner toward more negatives
+    (visual_negative_k), picks at the high end toward folding the axis. An empty
+    list means no class picked a negative config."""
+    requested = c.get("requested_axes") or c["axes"]
+    if not requested.get("visual_negatives") or not c.get("setting"):
+        return {}
+    configs = {cf["config_id"]: cf for cf in c["setting"].get("configs", [])}
+    used = {configs[e["config_id"]]["neg_eta"]
+            for e in (c["setting"].get("per_class") or {}).values()
+            if e.get("modality", "semantic") == "semantic"
+            and configs.get(e["config_id"], {}).get("visual_negatives")}
+    grid = {cf["neg_eta"] for cf in configs.values() if cf.get("visual_negatives")}
+    return {"neg_eta_used": sorted(used), "neg_eta_grid": sorted(grid)}
+
+
+# Measured state with an unused axis turned off — when exemplar is unused, the
+# semantic-only axis tied to it (visual negatives) and the count axes go back to
+# their safe point too
+_UNUSED_OFF = {
+    "tiling": {"tiling": False},
+    "exemplar": {"exemplar": "none", "exemplar_k": None, "fn_k": None,
+                 "visual_negatives": False, "visual_negative_k": None},
+    "visual_negatives": {"visual_negatives": False, "visual_negative_k": None},
+}
+
+
+def _unused_axes(axes: dict, setting: dict) -> list[str]:
+    """Axes the candidate turned on that the setting does not actually use.
+
+    exemplar is unused when no class picks the semantic modality (text wins for
+    every class), visual_negatives when no semantic class's config has
+    negatives, and tiling when no class uses a tile config."""
+    configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
+    semantic = [e for e in (setting.get("per_class") or {}).values()
+                if e.get("modality", "semantic") == "semantic"]
+    out = []
+    if axes.get("tiling") and not _uses_tiling(setting):
+        out.append("tiling")
+    if axes.get("exemplar") not in (None, "none") and not semantic:
+        out.append("exemplar")
+    if axes.get("visual_negatives") and not any(
+            configs.get(e["config_id"], {}).get("visual_negatives") for e in semantic):
+        out.append("visual_negatives")
+    return out
+
+
+def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) -> str:
+    """Fingerprint of the served state — equal fingerprints give equal holdout
+    predictions.
+
+    Per class (config content, modality) — config ids differ across candidates
+    because each has its own grid, so content is compared —, the materials of
+    the modalities the setting uses (text: aliases and suppression phrases;
+    semantic: exemplars, plus visual negatives if a negative config is used),
+    whether the rescorer is on, and the server state (weights, artifact).
+    Thresholds are left out — they are re-estimated on holdout."""
+    configs = {cf["config_id"]: {k: v for k, v in cf.items() if k != "config_id"}
+               for cf in setting.get("configs", [])}
+    per = {str(cid): [configs.get(e["config_id"]), e.get("modality", "semantic")]
+           for cid, e in (setting.get("per_class") or {}).items()}
+    mods = {m for _, m in per.values()}
+    mat = materials.fingerprint()
+    served = {}
+    if "text" in mods:
+        served |= {"aliases": mat["aliases"], "text_negatives": mat["text_negatives"]}
+    if "semantic" in mods:
+        served["exemplars"] = mat["exemplars"]
+        if any(cf and cf.get("visual_negatives") for cf, m in per.values()
+               if m == "semantic"):
+            served["visual_negatives"] = mat["visual_negatives"]
+    blob = json.dumps({"per_class": per, "materials": served,
+                       "rescorer": bool(axes.get("rescorer")), "server": server},
+                      sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _evaluated_fps(history: list[dict]) -> set[str]:
+    """Served states of candidates earlier rounds evaluated on holdout — the
+    champion only improves, so the same state evaluated again cannot pass the
+    gate."""
+    out = set()
+    for e in history:
+        evaluated = (e.get("decision") or {}).get("evaluated") or {}
+        out |= {c["setting_fp"] for c in e.get("candidates", [])
+                if c.get("setting_fp") and c.get("id") in evaluated}
+    return out
+
+
+def _measured_unused(axes: dict, unused: list[str]) -> dict:
+    out = dict(axes)
+    for axis in unused:
+        out.update(_UNUSED_OFF[axis])
+    return out
+
+
+def _relabel_unused(entry: dict) -> None:
+    """If the setting does not use a requested axis, correct axes to the measured
+    state and keep the request in requested_axes. A champion labelled with an
+    axis it never uses would credit other axes' gains to that axis. Same
+    principle as the rescorer identity-refit relabel (_measured_axes)."""
+    unused = _unused_axes(entry["axes"], entry["setting"])
+    if unused:
         entry["requested_axes"] = dict(entry["axes"])
-        entry["axes"] = {**entry["axes"], "tiling": False}
+        entry["axes"] = _measured_unused(entry["axes"], unused)
+        entry["unused_axes"] = unused
 
 
 def _requested(c: dict) -> dict:
     return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
+
+
+def _unused_record(c: dict) -> dict:
+    """Unused axes to keep on the history row — shared by plain candidates and
+    the lora and classifier arms."""
+    return {"unused_axes": c["unused_axes"]} if c.get("unused_axes") else {}
 
 
 def _stagnant(decision: dict, epsilon: float) -> bool:
@@ -1040,7 +1215,15 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
     enabled axes in one candidate cannot be attributed, so it is rejected.
     Sequential combinations (a single increment of one axis on top of a
     champion that holds the other) are allowed via the corresponding arm: the
-    classifier arm runs on the current weights, the lora arm preserves adapt_root."""
+    classifier arm runs on the current weights, the lora arm preserves adapt_root.
+
+    A candidate that turns off an axis the champion holds is "off" — the
+    detector state is not unloaded per candidate, so measuring it through
+    normal wiring would put an off label on a result measured with the state
+    still loaded (and, if adopted, split the label from what is served)."""
+    if any(champion_axes.get(k) and not axes.get(k)
+           for k in ("lora", "crop_classifier")):
+        return "off"
     new_lora = bool(axes.get("lora")) and not champion_axes.get("lora")
     new_cls = (bool(axes.get("crop_classifier"))
                and not champion_axes.get("crop_classifier"))

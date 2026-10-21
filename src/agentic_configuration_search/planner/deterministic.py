@@ -7,7 +7,8 @@ cause→remedy mapping.
 
 from __future__ import annotations
 
-from .axes import BASELINE, TILING_GRIDS, DatasetFacts, uses_disabled_axes, validate_axes
+from .axes import (BASELINE, TILING_GRIDS, DatasetFacts, merge_onto, uses_disabled_axes,
+                   validate_axes)
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -110,9 +111,15 @@ def carryover(history: list[dict], disabled_axes=(), disabled_values=None, *,
     for c in last.get("candidates", []):
         if not c.get("gate_passed_but_lost"):
             continue
-        delta = {k: v for k, v in (c.get("axes") or {}).items() if base.get(k) != v}
+        # if an unused axis got the label corrected, carry the requested
+        # increment — reading the corrected label (exemplar=none, ...) as the
+        # increment would turn the new champion's axis off
+        asked = c.get("requested_axes") or c.get("axes") or {}
+        delta = {k: v for k, v in asked.items() if base.get(k) != v}
         try:
-            axes = validate_axes({**champ, **delta}, facts=facts)
+            # an increment merge, not an overwrite — also clears champion axes
+            # tied to an axis the increment turned off
+            axes = validate_axes(merge_onto(champ, delta), facts=facts)
         except ValueError:
             continue
         if not delta or axes == champ:

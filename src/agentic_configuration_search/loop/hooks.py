@@ -78,11 +78,18 @@ def build_hooks(cfg: Config, repo_root: Path, out_dir: Path, *,
 
     from ..infer import embedder
 
+    # cache per run so the same GT crops are not re-embedded every round and
+    # candidate (keyed by crop content hash, one file per model) — reused after
+    # resume too
+    model_slug = cfg.mine.embedder_model.replace("/", "--")
+    cached = embedder.cached_encoder(
+        lambda paths, log_path: embedder.encode_crops(
+            repo_root, list(paths), cfg.mine.embedder_model, cfg.mine.device,
+            log_path),
+        out_dir / "_cache" / f"embed_{model_slug}.npz")
+
     def encode_fn(cid, paths):
-        log_dir = out_dir / "_logs"
-        return embedder.encode_crops(repo_root, list(paths),
-                                     cfg.mine.embedder_model, cfg.mine.device,
-                                     log_dir / f"embed_c{cid}.log")
+        return cached(paths, out_dir / "_logs" / f"embed_c{cid}.log")
     hooks["encode_fn"] = encode_fn
 
     # Caption mining (including all three text_negatives sources) goes through

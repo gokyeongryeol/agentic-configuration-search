@@ -101,15 +101,42 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   champion, and holdout is not reused within the round. Carried candidates go
   through the same filters as planner and human candidates, whichever planner
   is used.
+- The same setting is not evaluated twice. After screen, a candidate's served
+  state (per class: config content and modality, the materials that modality
+  uses, rescorer on/off, server state) is compared with the champion, its
+  siblings in the round, and candidates evaluated on holdout before; a match
+  is rejected without holdout evaluation. Axis labels are not compared,
+  because materials can differ under the same label. If an axis the candidate
+  turned on (tiling, exemplar, visual_negatives) went unused and that made it
+  equal the champion, the reason is `axis_unused` (which axes in
+  `unused_axes`); otherwise `same_setting`. Rescorer candidates are judged
+  before the discriminator refit, the most expensive step. An evaluated
+  candidate with an unused axis gets its label corrected to the measured state,
+  with the request kept in `requested_axes`.
+- Sizing signals are recorded in history: for tiling candidates, whether
+  screen actually picked a tile config (`tiling_used`); for visual-negative
+  candidates, the suppression IoU thresholds picked for semantic classes
+  (`neg_eta_used`) and the grid searched (`neg_eta_grid`). The planner reads
+  them before widening a count axis: tiling used on an adopted grid suggests
+  g+1, negatives picked at the low (strongest) end suggest raising
+  `visual_negative_k`, and picks at the high end suggest folding the axis.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
-  they are not adopted.
+  they are not adopted. Once adopted they are not turned off: the state stays
+  loaded while other candidates are measured, so a candidate turning one off
+  would be measured with it still on. Such candidates are rejected as
+  `detector_state_off` without evaluation.
 
 ### Diagnosis and planner
 
 - Every round classifies train and holdout errors (missed, below threshold,
   misclassified, localization, background FP, duplicate); this is the planner's
   only input. Holdout is exposed as aggregates only.
+- Candidate axes are read as an increment over the current champion. The LLM
+  planner and human candidates list only the axes they change; omitted axes
+  keep the champion's value (turning one off takes an explicit `false`).
+  Filling them from the baseline would evaluate the champion with its axes
+  silently off.
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
   Prompts and responses are saved, so `--resume` replays them without the LLM.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
