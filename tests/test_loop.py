@@ -723,3 +723,14 @@ def test_gate_passer_that_lost_is_carried_to_next_round(big_root, tmp_path, monk
     champ = hist[1]["champion"]["axes"]
     assert all(carried["axes"][k] == v for k, v in champ.items()
                if k not in ("tiling", "exemplar", "exemplar_k"))
+
+
+def test_human_candidates_are_relative_to_champion(tmp_path):
+    from agentic_configuration_search.loop.runner import _load_candidates_file
+    from agentic_configuration_search.planner.axes import validate_axes
+
+    f = tmp_path / "c.yaml"
+    f.write_text("- {id: t, axes: {tiling: 2}}\n")
+    champ = validate_axes({"rescorer": True})
+    cands, dropped = _load_candidates_file(f, base=champ)
+    assert not dropped and cands[0]["axes"] == validate_axes({"rescorer": True, "tiling": 2})

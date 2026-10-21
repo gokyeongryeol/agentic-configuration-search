@@ -279,10 +279,16 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
     note prefix — so a near miss can be told from a clear regression."""
     out = []
     # window=0 means "no history" — history[-0:] is the whole list in Python.
-    for e in (history[-window:] if window > 0 else []):
+    start = max(len(history) - window, 0) if window > 0 else len(history)
+    for i in range(start, len(history)):
+        e = history[i]
         d = e.get("decision", {})
         evaluated = d.get("evaluated") or {}
-        champ_axes = e.get("champion", {}).get("axes") or {}
+        # deltas are against the champion at the **start** of the round — the
+        # row's champion is the one after it, so comparing with that would mix
+        # in the axes adopted that round
+        champ_axes = ((history[i - 1].get("champion", {}).get("axes") if i > 0
+                       else None) or e.get("champion", {}).get("axes") or {})
         cands = []
         for c in e.get("candidates", []):
             row = {"id": c.get("id"),
@@ -321,7 +327,9 @@ it).** Each candidate toggles axes from the current champion:
 
 Rules:
 - Change as FEW axes as possible per candidate (single increments attribute
-  gains cleanly). "visual_negatives" requires exemplar != "none".
+  gains cleanly). List only the axes you change: omitted axes keep the
+  champion's value; to turn an axis off, set it to false explicitly.
+  "visual_negatives" requires exemplar != "none".
 - Materials are mined from the train split only; adoption is decided by a
   held-out gate afterwards — propose boldly, the gate filters.
 - The gate adopts only if a paired-bootstrap LOWER BOUND on the holdout delta

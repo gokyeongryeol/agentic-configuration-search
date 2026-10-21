@@ -110,6 +110,11 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 - Every round classifies train and holdout errors (missed, below threshold,
   misclassified, localization, background FP, duplicate); this is the planner's
   only input. Holdout is exposed as aggregates only.
+- Candidate axes are read as an increment over the current champion. The LLM
+  planner and human candidates list only the axes they change; omitted axes
+  keep the champion's value (turning one off takes an explicit `false`).
+  Filling them from the baseline would evaluate the champion with its axes
+  silently off.
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
   Prompts and responses are saved, so `--resume` replays them without the LLM.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
