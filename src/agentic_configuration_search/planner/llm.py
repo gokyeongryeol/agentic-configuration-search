@@ -58,23 +58,29 @@ SCHEMA = {
 
 # Caps on diagnosis detail and history in the prompt — the first defense against
 # overflowing the server context. The last is the budget guard that measures the
-# assembled prompt (DEFAULT_CHAR_BUDGET).
+# assembled prompt (DEFAULT_TOKEN_BUDGET).
 MAX_HISTORY = 8          # recent rounds in the prompt (the budget guard may cut further)
-# Response cap — the schema bounds the longest response (candidates ≤
+# Response cap — the schema bounds the response length (candidates ≤
 # max_candidates, rationale ≤ RATIONALE_MAX_CHARS characters, id ≤ 64) and this
-# is set above that longest response. A truncated response breaks the JSON and
-# the planner silently falls back to deterministic.
+# is set above the longest English response (axes is a free object and is not
+# bounded — see _schema). A truncated response breaks the JSON and the planner
+# silently falls back to deterministic.
 RATIONALE_MAX_CHARS = SCHEMA["schema"]["properties"]["candidates"]["items"][
     "properties"]["rationale"]["maxLength"]
 OUTPUT_MAX_TOKENS = 4096
-# Chars/token ratio — planner prompts measured with the planner tokenizer go no
-# lower than 2.68.
-CHARS_PER_TOKEN = 2.5
-# Prompt character budget — overflow is fixed by shrinking history. Derived
-# from max_model_len 16384 − the output cap, at the ratio above with 0.9 slack
-# (the same formula as runner._char_budget). Overflow makes vLLM return 400 and
-# the planner silently falls back to deterministic.
-DEFAULT_CHAR_BUDGET = int((16384 - OUTPUT_MAX_TOKENS) * CHARS_PER_TOKEN * 0.9)
+# Prompt token estimate — counted generously without the server tokenizer.
+# ASCII uses the worst ratio measured with the planner tokenizer (number-heavy
+# JSON fragments at 1.85 chars/token; whole planner prompts never went below
+# 2.68), and other characters (Hangul, Han, ...) count 1.5 tokens each — a
+# character budget overflowed the server context on CJK-heavy prompts (around
+# 1.8 chars/token).
+ASCII_CHARS_PER_TOKEN = 1.85
+NON_ASCII_TOKENS = 1.5
+CONTEXT_MARGIN = 256      # chat template tokens etc.
+# Prompt token budget — overflow is fixed by shrinking history (the same
+# formula as runner._token_budget). Overflow makes vLLM return 400 and the
+# planner silently falls back to deterministic.
+DEFAULT_TOKEN_BUDGET = 16384 - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
 MAX_NOTE = 80            # prefix length of the skip note carried in the prompt
 NDIGITS = 4              # float digits in the prompt — at margin scale (0.005) the
                          # gate Δ/CI verdict turns on the 4th digit (3 is too few)
@@ -283,8 +289,11 @@ def _tried_lines(history: list[dict], champion: dict) -> list[str]:
 
 
 def _schema(max_candidates: int) -> dict:
-    """The schema with the candidate cap — keeps the longest response within
-    OUTPUT_MAX_TOKENS."""
+    """The schema with the candidate cap. With rationale, id and the candidate
+    count bounded, the longest English response fits within OUTPUT_MAX_TOKENS —
+    axes is a free object and is not bounded, and a rationale written in CJK
+    takes more tokens per character and can reach the cap (a warning is logged
+    then)."""
     out = copy.deepcopy(SCHEMA)
     out["schema"]["properties"]["candidates"]["maxItems"] = max_candidates
     return out
@@ -488,10 +497,14 @@ Unavailable in this run (never turn these on; the champion keeps any it already 
 """
 
 
-def _chars(messages: list[dict]) -> int:
-    return sum(len(m["content"]) if isinstance(m.get("content"), str)
-               else sum(len(str(x)) for x in m.get("content", []))
-               for m in messages)
+def _est_tokens(messages: list[dict]) -> int:
+    """A generous estimate of prompt tokens (ASCII_CHARS_PER_TOKEN, NON_ASCII_TOKENS)."""
+    text = "".join(m["content"] if isinstance(m.get("content"), str)
+                   else "".join(str(x) for x in m.get("content", []))
+                   for m in messages)
+    n_ascii = sum(1 for ch in text if ord(ch) < 128)
+    return round(n_ascii / ASCII_CHARS_PER_TOKEN
+                 + (len(text) - n_ascii) * NON_ASCII_TOKENS)
 
 
 def _strip_samples(diag: dict) -> dict:
@@ -504,14 +517,14 @@ class LLMPlanner:
     partial application of clients.llm.LLMClient.chat_json."""
 
     def __init__(self, chat, artifact_dir: Path, *, max_candidates: int = 3,
-                 notes: str = "", char_budget: int = DEFAULT_CHAR_BUDGET,
+                 notes: str = "", token_budget: int = DEFAULT_TOKEN_BUDGET,
                  disabled_axes=(), disabled_values=None,
                  facts: DatasetFacts | None = None):
         self.chat = chat
         self.artifact_dir = Path(artifact_dir)
         self.max_candidates = max_candidates
         self.notes = notes or ""
-        self.char_budget = char_budget
+        self.token_budget = token_budget
         self.disabled_axes = tuple(disabled_axes or ())
         self.disabled_values = {k: tuple(v) for k, v in
                                 (disabled_values or {}).items() if v}
@@ -587,16 +600,16 @@ class LLMPlanner:
         # window=0, strip diagnosis samples as the last line of defense.
         window = MAX_HISTORY
         messages = build(window)
-        while _chars(messages) > self.char_budget and window > 0:
+        while _est_tokens(messages) > self.token_budget and window > 0:
             window -= 1
             messages = build(window)
-        if _chars(messages) > self.char_budget:
+        if _est_tokens(messages) > self.token_budget:
             diag_json = json.dumps(_strip_samples(compact),
                                    ensure_ascii=False, default=str)
             messages = build(0)
         if window < MAX_HISTORY:
-            log.info("prompt budget (%d chars) — history window shrunk %d→%d rounds",
-                     self.char_budget, MAX_HISTORY, window)
+            log.info("prompt budget (estimated %d tokens) — history window shrunk %d→%d rounds",
+                     self.token_budget, MAX_HISTORY, window)
         raw, error = None, None
         try:
             raw = self.chat(messages, schema=_schema(self.max_candidates),

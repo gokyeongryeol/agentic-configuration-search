@@ -1010,16 +1010,21 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
     assert worst / 2.0 < L.OUTPUT_MAX_TOKENS
 
 
-def test_char_budget_reserves_output_and_keeps_input_budget():
-    """Raising the output reserve to OUTPUT_MAX_TOKENS keeps the input budget —
-    the chars/token ratio is set to 2.5 to match the measured minimum (2.68)."""
+def test_token_budget_is_language_aware_and_fits_context():
+    """The input budget is in estimated tokens — a character budget plus the
+    output share overflowed the server context on CJK-heavy prompts (around 1.8
+    chars/token). ASCII counts at the worst measured ratio (1.85 chars/token),
+    other characters generously at 1.5 tokens each."""
     from agentic_configuration_search.config import config_from_dict
-    from agentic_configuration_search.loop.runner import _char_budget
+    from agentic_configuration_search.loop.runner import _token_budget
     from agentic_configuration_search.planner import llm as L
 
+    est = lambda text: L._est_tokens([{"role": "user", "content": text}])  # noqa: E731
+    assert est("a" * 1850) == 1000
+    assert est("가" * 100) == 150
     cfg = config_from_dict({"dataset": "x"})
     ctx = cfg.planner.launch.max_model_len
-    assert _char_budget(cfg) == int((ctx - L.OUTPUT_MAX_TOKENS) * 2.5 * 0.9)
-    assert _char_budget(cfg) >= 27_000
-    # even a full budget fits in the server context at the measured minimum ratio (2.68)
-    assert _char_budget(cfg) / 2.68 + L.OUTPUT_MAX_TOKENS < ctx
+    assert _token_budget(cfg) == ctx - L.OUTPUT_MAX_TOKENS - L.CONTEXT_MARGIN
+    assert _token_budget(cfg) == L.DEFAULT_TOKEN_BUDGET
+    # a long, mostly-ASCII prompt (about 21,000 characters) fits without shrinking history
+    assert est("a" * 21_003) < _token_budget(cfg)

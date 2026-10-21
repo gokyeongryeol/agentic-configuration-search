@@ -39,7 +39,7 @@ from ..fitting.materials import Materials
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
-from ..planner.llm import CHARS_PER_TOKEN, OUTPUT_MAX_TOKENS, LLMPlanner
+from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
 
@@ -318,7 +318,7 @@ class Loop:
                                  "an injected llm_chat")
             proposal = LLMPlanner(chat=chat, artifact_dir=round_dir,
                                   notes=self.cfg.dataset_notes,
-                                  char_budget=_char_budget(self.cfg),
+                                  token_budget=_token_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
                                   disabled_values=self.disabled_values,
                                   facts=self._facts()).propose(
@@ -1175,13 +1175,13 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
     return None
 
 
-def _char_budget(cfg) -> int:
-    """Prompt character budget — derived from the vLLM server context.
-    (max_model_len − planner output cap) × chars/token × 0.9 slack.
-    Even when attached to an external server via base_url (actual context
-    unknown), the launch value is the reference."""
+def _token_budget(cfg) -> int:
+    """Prompt token budget (by the estimate) — the vLLM server context minus
+    the planner output cap and template slack. Even when attached to an
+    external server via base_url (actual context unknown), the launch value is
+    the reference."""
     ctx = getattr(cfg.planner.launch, "max_model_len", 8192)
-    return max(4000, int((ctx - OUTPUT_MAX_TOKENS) * CHARS_PER_TOKEN * 0.9))
+    return ctx - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
 
 
 def _winner_axes(winner: dict) -> tuple[dict, bool]:
