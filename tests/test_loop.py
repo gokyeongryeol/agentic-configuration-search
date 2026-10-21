@@ -1082,3 +1082,116 @@ def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path
     assert rec["human_a"]["skipped"] == "error"
     assert rec["human_b"].get("skipped") != "same_setting", rec["human_b"].get("note")
     assert len(calls) == 2                  # b got as far as the discriminator refit
+
+
+def test_modality_record_names_classes_and_rounds():
+    """The semantic and text fit_dev F(β) screen measured per class are recorded
+    by class name — whether exemplar lost narrowly or badly is the planner's
+    evidence for adjusting k."""
+    from agentic_configuration_search.core.coco import Ontology
+    from agentic_configuration_search.loop.runner import _modality_record
+    from tests.conftest import CATS
+
+    onto = Ontology.from_categories(CATS)
+    setting = {"modality_diagnostic": {
+        "1": {"chosen": "text", "semantic": {"f_beta": 0.123456, "threshold": 0.3},
+              "text": {"f_beta": 0.262136, "threshold": 0.2},
+              "union": {"f_beta": 0.25, "threshold": 0.2}}}}
+    assert _modality_record(setting, onto) == {
+        "modality_f": {"cat a": {"semantic": 0.1235, "text": 0.2621, "chosen": "text"}}}
+    # candidates with no semantic pass (text only) record nothing
+    assert _modality_record({"modality_diagnostic": {}}, onto) == {}
+
+
+def test_skipped_unused_exemplar_keeps_modality_scores(big_root, tmp_path,
+                                                       monkeypatch):
+    """A candidate filtered before holdout still records its screen scores — the
+    filtered row has no saved setting, so nothing else is left as evidence."""
+    monkeypatch.setattr(gateway, "infer_config",
+                        _text_beats_semantic_infer(_gt_lookup(big_root)))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "ex", "axes": {"exemplar": "base"},
+                                "rationale": "x"}], "stop": False}
+
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+               llm_chat=llm, rounds=1, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["ex"]
+    assert rec["skipped"] == "axis_unused"
+    mf = rec["modality_f"]
+    assert set(mf) == {"cat a", "cat b"}
+    assert all(v["semantic"] < v["text"] for v in mf.values())
+
+
+def test_compact_history_and_prompt_carry_modality_scores():
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+
+    b = validate_axes({})
+    hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
+            {"round": 1, "champion": {"axes": b},
+             "candidates": [{"id": "ex", "axes": validate_axes({"exemplar": "base"}),
+                             "skipped": "axis_unused", "unused_axes": ["exemplar"],
+                             "modality_f": {"cat a": {"semantic": 0.1, "text": 0.3}}}]}]
+    row = _compact_history(hist)[1]["candidates"][0]
+    assert row["modality"] == {"text_won": 1, "semantic_won": 0,
+                               "closest_text_margin": 0.2}
+    assert "modality_f" not in row          # the full per-class record stays in the history file
+    assert "closest_text_margin" in PROMPT
+
+
+def test_modality_summary_size_does_not_grow_with_classes():
+    """The prompt's modality summary has a size independent of the class count —
+    the full per-class record would make one row exceed 1KB on a 19-class
+    dataset and the budget guard would shrink the history window."""
+    import json as _json
+    from agentic_configuration_search.planner.llm import _modality_summary
+
+    small = {"a": {"semantic": 0.5, "text": 0.4}}
+    big = {f"class name {i:02d}": {"semantic": 0.1 * (i % 3), "text": 0.15}
+           for i in range(19)}
+    s, b = _modality_summary(small), _modality_summary(big)
+    assert s == {"text_won": 0, "semantic_won": 1}          # a tie or semantic win counts as semantic
+    assert b["text_won"] + b["semantic_won"] == 19
+    assert b["closest_text_margin"] == 0.05
+    assert len(_json.dumps(b)) < 80
+
+
+def test_modality_record_keeps_screen_choice_and_unique_keys():
+    """Wins are counted by the modality screen picked (chosen) — counting from
+    rounded F would count a text win by less than 5e-5 as semantic. Classes with
+    the same name get their id appended instead of overwriting each other."""
+    from agentic_configuration_search.core.coco import Ontology
+    from agentic_configuration_search.loop.runner import _modality_record
+    from agentic_configuration_search.planner.llm import _modality_summary
+
+    onto = Ontology.from_categories([{"id": 1, "name": "bolt"}, {"id": 2, "name": "bolt"},
+                                     {"id": 3, "name": "nut"}])
+    d = lambda s, t, ch: {"chosen": ch, "semantic": {"f_beta": s}, "text": {"f_beta": t}}  # noqa: E731
+    setting = {"modality_diagnostic": {"1": d(0.50001, 0.50004, "text"),
+                                       "2": d(0.3, 0.2, "semantic"),
+                                       "3": d(0.1, 0.4, "text")}}
+    mf = _modality_record(setting, onto)["modality_f"]
+    assert set(mf) == {"bolt#1", "bolt#2", "nut"}
+    assert mf["bolt#1"]["chosen"] == "text"
+    assert _modality_summary(mf)["text_won"] == 2
+    assert _modality_record(None, onto) == {}
+
+
+def test_filtered_candidates_are_not_logged_as_unwired(big_root, tmp_path, monkeypatch,
+                                                       caplog):
+    """Candidates removed by the sanitizer or combination filter are not
+    "cannot be wired" — the warning counts only candidates dropped at wiring
+    (carried candidates filtered as duplicates were logged as unwired)."""
+    import logging
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    human = tmp_path / "c.yaml"
+    human.write_text("- {id: bad, axes: {fn_k: 2}}\n")       # filtered as invalid_axes
+    with caplog.at_level(logging.WARNING,
+                         logger="agentic_configuration_search.loop.runner"):
+        run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+                   rounds=1, candidates_file=human, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
+    assert rec["human_bad"]["skipped"] == "invalid_axes"
+    unwired = [r.message for r in caplog.records if "cannot be wired" in r.message]
+    assert all("human_bad" not in m for m in unwired), unwired

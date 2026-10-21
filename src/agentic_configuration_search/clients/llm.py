@@ -90,7 +90,12 @@ class LLMClient:
             payload["response_format"] = {"type": "json_schema", "json_schema": schema}
         resp = post_with_retry(self.session, f"{self.base_url}/v1/chat/completions",
                                payload, timeout=self.timeout)
-        return resp.json()["choices"][0]["message"]["content"] or ""
+        choice = resp.json()["choices"][0]
+        if choice.get("finish_reason") == "length":
+            # a truncated response — as JSON it turns into a parse failure that
+            # hides the cause
+            log.warning("LLM response was cut off at max_tokens (%d)", max_tokens)
+        return choice["message"]["content"] or ""
 
     def chat_json(self, messages: list[dict], *, max_tokens: int = 1024,
                   temperature: float = 0.0, schema: Optional[dict] = None) -> dict:

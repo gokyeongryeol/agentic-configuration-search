@@ -36,10 +36,11 @@ from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
 from ..eval.screen import screen_candidate
 from ..fitting.materials import Materials
+from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
-from ..planner.llm import LLMPlanner
+from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
 
@@ -119,7 +120,10 @@ class Loop:
         # detector_hooks: {"weights_ctl": fn(weights|None), "adapt_ctl": fn(root|None),
         #             "repo_root": Path, "base_weights": Path}
         #   — without it, lora/crop_classifier candidates are skipped
-        self.detector_hooks = detector_hooks
+        # controls that change the detector state empty the pass cache — the
+        # same input becomes a different inference
+        self.detector_hooks = (_invalidating_hooks(detector_hooks) if detector_hooks
+                               else detector_hooks)
         # validated here because config is a leaf — no silent absorption of typos (see config.py)
         bad = sorted(set(cfg.search.disabled_axes) - set(AXES))
         if bad:
@@ -318,7 +322,7 @@ class Loop:
                                  "an injected llm_chat")
             proposal = LLMPlanner(chat=chat, artifact_dir=round_dir,
                                   notes=self.cfg.dataset_notes,
-                                  char_budget=_char_budget(self.cfg),
+                                  token_budget=_token_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
                                   disabled_values=self.disabled_values,
                                   facts=self._facts()).propose(
@@ -513,6 +517,7 @@ class Loop:
                            "earlier round — evaluation skipped"}
         else:
             return False
+        rec |= _modality_record(setting, self.ds.ontology)
         if unused:
             rec.setdefault("unused_axes", unused)
             if "tiling" in unused:
@@ -580,6 +585,7 @@ class Loop:
 
         wired, lora_cands, classifier_cands = [], [], []
         skipped = list(proposal.get("dropped", []))   # include combo_tried records
+        n_filtered = len(skipped)                     # up to here: filter drops, not wiring
         champ_axes = champion.get("axes") or {}
         for c in proposal["candidates"]:
             miss = _missing_hook(c["axes"], self._mat_kw)
@@ -617,9 +623,10 @@ class Loop:
                     classifier_cands.append(c)
             else:
                 wired.append(c)
-        if skipped:
-            log.warning("skipped %d candidates that cannot be wired: %s", len(skipped),
-                        [c["id"] for c in skipped])
+        if len(skipped) > n_filtered:
+            log.warning("skipped %d candidates that cannot be wired: %s",
+                        len(skipped) - n_filtered,
+                        [c["id"] for c in skipped[n_filtered:]])
 
         if not wired and not lora_cands and not classifier_cands:
             decision = {"round": r, "adopted": False,
@@ -853,6 +860,7 @@ class Loop:
                             | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
                             | _unused_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
+                            | _modality_record(c["setting"], self.ds.ontology)
                             | {"forwards": setting_forwards(c["setting"])}
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | ({"source": c["source"]} if c.get("source") else {})
@@ -885,39 +893,42 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 candidates_file=candidates_file, detector_hooks=detector_hooks)
     result = RunResult(out_dir=Path(out_dir))
 
-    history = loop._read_history() if resume else []
-    if history:
-        champion = loop._load_champion()
-        loop._restore_detector_state(champion)
-        start = history[-1]["round"] + 1
-        result.decisions = [e["decision"] for e in history]
-    else:
-        loop.out_dir.mkdir(parents=True, exist_ok=True)
-        (loop.out_dir / "history.jsonl").write_text("")
-        champion = loop.baseline()
-        history = loop._read_history()
-        result.decisions = [history[-1]["decision"]]
-        start = 1
-
-    # if resume reset the counter to 0, an already-saturated run would spend more
-    # rounds — restore the trailing stagnant count from history and continue it.
-    stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
-    if stagnant_rounds >= cfg.saturation.rounds:
-        result.stopped = "saturation"
-    else:
-        for r in range(start, rounds + 1):
-            decision, champion = loop.run_round(r, champion, history)
+    # inference for the same input under the same request conditions is reused
+    # for the run (gateway.pass_cache)
+    with gateway.pass_cache():
+        history = loop._read_history() if resume else []
+        if history:
+            champion = loop._load_champion()
+            loop._restore_detector_state(champion)
+            start = history[-1]["round"] + 1
+            result.decisions = [e["decision"] for e in history]
+        else:
+            loop.out_dir.mkdir(parents=True, exist_ok=True)
+            (loop.out_dir / "history.jsonl").write_text("")
+            champion = loop.baseline()
             history = loop._read_history()
-            result.decisions.append(decision)
-            if decision.get("kind") == "planner_stop":
-                result.stopped = "planner_stop"
-                break
-            stagnant_rounds = (stagnant_rounds + 1
-                               if _stagnant(decision, cfg.saturation.epsilon)
-                               else 0)
-            if stagnant_rounds >= cfg.saturation.rounds:
-                result.stopped = "saturation"
-                break
+            result.decisions = [history[-1]["decision"]]
+            start = 1
+
+        # if resume reset the counter to 0, an already-saturated run would spend more
+        # rounds — restore the trailing stagnant count from history and continue it.
+        stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
+        if stagnant_rounds >= cfg.saturation.rounds:
+            result.stopped = "saturation"
+        else:
+            for r in range(start, rounds + 1):
+                decision, champion = loop.run_round(r, champion, history)
+                history = loop._read_history()
+                result.decisions.append(decision)
+                if decision.get("kind") == "planner_stop":
+                    result.stopped = "planner_stop"
+                    break
+                stagnant_rounds = (stagnant_rounds + 1
+                                   if _stagnant(decision, cfg.saturation.epsilon)
+                                   else 0)
+                if stagnant_rounds >= cfg.saturation.rounds:
+                    result.stopped = "saturation"
+                    break
 
     _write(loop.out_dir / "run_summary.json", {
         "stopped": result.stopped,
@@ -934,6 +945,25 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
     result.history = history
     result.champion = champion
     return result
+
+
+def _invalidating_hooks(hooks: dict) -> dict:
+    """Wrap the detector-state controls (weights_ctl, adapt_ctl) to empty the pass
+    cache on every call. Once weights or the artifact change, the same input is
+    a different inference — every state change goes through these controls
+    (_restore_detector_state, the lora arm, the classifier arm), so one place
+    covers them."""
+    out = dict(hooks)
+    for key in ("weights_ctl", "adapt_ctl"):
+        fn = hooks.get(key)
+        if fn is not None:
+            def wrapped(*a, _fn=fn, **kw):
+                try:
+                    return _fn(*a, **kw)
+                finally:
+                    gateway.invalidate_pass_cache()
+            out[key] = wrapped
+    return out
 
 
 def _tiling_variants(search, axes: dict) -> tuple:
@@ -1069,6 +1099,31 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _modality_record(setting: dict, ontology) -> dict:
+    """fit_dev F(β) of the semantic and text passes screen measured per class,
+    keyed by class name.
+
+    Whether exemplar lost narrowly or badly is the evidence for trying another
+    k or fn_arm. A candidate filtered before holdout has no saved setting, so
+    this record is the only evidence left. Candidates with no semantic pass
+    (text only) record nothing."""
+    diag = (setting or {}).get("modality_diagnostic") or {}
+    # classes sharing a name get their id appended — if name keys overwrote
+    # each other the counts would be wrong
+    counts: dict[str, int] = {}
+    for c in ontology.classes:
+        counts[c.name] = counts.get(c.name, 0) + 1
+    names = {str(c.id): (c.name if counts[c.name] == 1 else f"{c.name}#{c.id}")
+             for c in ontology.classes}
+    # chosen is screen's actual pick — recounting wins from rounded F would
+    # count a narrow text win as semantic
+    out = {names.get(cid, cid): {"semantic": round(d["semantic"]["f_beta"], 4),
+                                 "text": round(d["text"]["f_beta"], 4),
+                                 "chosen": d.get("chosen")}
+           for cid, d in diag.items()}
+    return {"modality_f": out} if out else {}
+
+
 def _evaluated_fps(history: list[dict]) -> set[str]:
     """Served states of candidates earlier rounds evaluated on holdout — the
     champion only improves, so the same state evaluated again cannot pass the
@@ -1148,13 +1203,13 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
     return None
 
 
-def _char_budget(cfg) -> int:
-    """Prompt character budget — derived from the vLLM server context.
-    (max_model_len − output reserve) × chars/token (conservative 2.0) × 0.9 slack.
-    Even when attached to an external server via base_url (actual context
-    unknown), the launch value is the reference."""
+def _token_budget(cfg) -> int:
+    """Prompt token budget (by the estimate) — the vLLM server context minus
+    the planner output cap and template slack. Even when attached to an
+    external server via base_url (actual context unknown), the launch value is
+    the reference."""
     ctx = getattr(cfg.planner.launch, "max_model_len", 8192)
-    return max(4000, int((ctx - 1024) * 2.0 * 0.9))
+    return ctx - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
 
 
 def _winner_axes(winner: dict) -> tuple[dict, bool]:

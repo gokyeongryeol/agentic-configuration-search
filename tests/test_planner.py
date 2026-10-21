@@ -1,5 +1,7 @@
 """planner — axes contract, deterministic cause -> remedy, LLM hygiene and fallback."""
 
+import json
+
 import pytest
 
 from agentic_configuration_search.planner import deterministic
@@ -980,3 +982,222 @@ def test_dropped_rows_record_merged_axes():
                         max_candidates=3, dropped=dropped, base=champ)
     assert [d["skipped"] for d in dropped] == ["duplicate_axes"]
     assert dropped[0]["axes"] == validate_axes({"exemplar": "base", "tiling": 2})
+
+
+def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
+    """The schema bounds the longest response (rationale and id length, number of
+    candidates) and the output cap sits above it — at a 1024-token cap a
+    rationale that kept running truncated the response and the planner silently
+    fell back to deterministic."""
+    from agentic_configuration_search.planner import llm as L
+
+    seen = {}
+
+    def chat(messages, **kw):
+        seen.update(kw)
+        return {"candidates": [], "stop": True}
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path, max_candidates=3).propose(
+        [{"round": 0, "champion": {"axes": validate_axes({})}, "candidates": []}], {})
+    assert seen["max_tokens"] == L.OUTPUT_MAX_TOKENS
+    cands = seen["schema"]["schema"]["properties"]["candidates"]
+    assert cands["maxItems"] == 3
+    props = cands["items"]["properties"]
+    assert props["rationale"]["maxLength"] == L.RATIONALE_MAX_CHARS
+    assert props["id"]["maxLength"] <= 80
+    # the longest response the schema allows fits under the cap — at 2.0
+    # chars/token (more conservative than the measured minimum of 2.68), with
+    # 600 characters per candidate for axes (12 enumerated keys)
+    worst = 3 * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"] + 600)
+    assert worst / 2.0 < L.OUTPUT_MAX_TOKENS
+
+
+def test_token_budget_is_language_aware_and_fits_context():
+    """The input budget is in estimated tokens — a character budget plus the
+    output share overflowed the server context on CJK-heavy prompts (around 1.8
+    chars/token). ASCII counts at the worst measured ratio (1.85 chars/token),
+    other characters generously at 1.5 tokens each."""
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import _token_budget
+    from agentic_configuration_search.planner import llm as L
+
+    est = lambda text: L._est_tokens([{"role": "user", "content": text}])  # noqa: E731
+    assert est("a" * 1850) == 1000
+    assert est("가" * 100) == 150
+    cfg = config_from_dict({"dataset": "x"})
+    ctx = cfg.planner.launch.max_model_len
+    assert _token_budget(cfg) == ctx - L.OUTPUT_MAX_TOKENS - L.CONTEXT_MARGIN
+    assert _token_budget(cfg) == L.DEFAULT_TOKEN_BUDGET
+    # a long, mostly-ASCII prompt (about 21,000 characters) fits without shrinking history
+    assert est("a" * 21_003) < _token_budget(cfg)
+
+
+# ------------------------------- candidates equal to carried ones take no slot
+
+def _scripted_chat(*responses):
+    """Returns the next response on each planner call."""
+    calls = []
+
+    def chat(messages, **kw):
+        calls.append(messages)
+        return responses[len(calls) - 1]
+    return chat, calls
+
+
+def test_candidates_repeating_carried_ones_are_dropped_and_slots_refilled(tmp_path):
+    """When the planner repeats carried candidates, they are dropped as
+    duplicates and the freed slots are asked for once more — even with the
+    prompt saying not to spend slots on them, the planner can fill most of its
+    slots with carried candidates."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    chat, calls = _scripted_chat(
+        {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"},
+                        {"id": "new", "axes": {"alias": "vlm"}, "rationale": "r"}],
+         "stop": False},
+        {"candidates": [{"id": "more", "axes": {"tiling": 2}, "rationale": "r"},
+                        {"id": "dup2", "axes": {"rescorer": True}, "rationale": "r"}],
+         "stop": False})
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    assert [c["id"] for c in out["candidates"]] == ["new", "more"]
+    assert {d["id"]: d["skipped"] for d in out["dropped"]} == {
+        "dup": "carried_duplicate", "dup2": "carried_duplicate"}
+    assert len(calls) == 2                               # asked again only once
+    follow = calls[1][-1]["content"]
+    assert "rescorer=True" in follow and "up to 2" in follow
+    assert "Kept from your answer: alias=vlm" in follow     # so kept ones are not repeated
+    assert calls[1][-2]["role"] == "assistant"           # continues the conversation
+    stored = json.loads((tmp_path / "proposal.json").read_text())
+    assert stored["followup"]["response"]["candidates"][0]["id"] == "more"
+
+
+def test_no_refill_without_carried_duplicates(tmp_path):
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    chat, calls = _scripted_chat(
+        {"candidates": [{"id": "new", "axes": {"alias": "vlm"}, "rationale": "r"}],
+         "stop": False})
+    LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    assert len(calls) == 1
+
+
+def test_only_carried_duplicates_do_not_trigger_deterministic_fallback(tmp_path):
+    """If every candidate equals a carried one and the follow-up fails too, the
+    proposal is empty — the runner runs the carried candidates anyway, so the
+    deterministic fallback does not fill it."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+
+    def chat(messages, **kw):
+        if len(messages) > 2:
+            raise RuntimeError("follow-up failed")
+        return {"candidates": [{"id": "dup", "axes": {"rescorer": True},
+                                "rationale": "r"}], "stop": False}
+
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    assert out["candidates"] == [] and out["stop"] is False
+    stored = json.loads((tmp_path / "proposal.json").read_text())
+    assert stored["fallback"] is None and "follow-up failed" in stored["followup"]["error"]
+
+
+def test_refill_ids_never_collide_with_dropped_or_carried_ids(tmp_path):
+    """Ids of refilled candidates collide with neither kept nor dropped nor
+    carried candidates — two rows with one id in a round would make the next
+    round's history attach the evaluation score to the dropped row, and the
+    planner would read the dropped combination as evaluated at that score."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    chat, _ = _scripted_chat(
+        {"candidates": [{"id": "a", "axes": {"alias": "vlm"}, "rationale": "r"},
+                        {"id": "a_2", "axes": {"text_negatives": "fp_crop"}, "rationale": "r"},
+                        {"id": "c2", "axes": {"rescorer": True}, "rationale": "r"}],
+         "stop": False},
+        {"candidates": [{"id": "c2", "axes": {"tiling": 2}, "rationale": "r"}],
+         "stop": False})
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    ids = [c["id"] for c in out["candidates"]] + [d["id"] for d in out["dropped"]]
+    assert len(ids) == len(set(ids)), ids
+    assert "carry_l" not in [c["id"] for c in out["candidates"]]
+
+
+def test_refill_renames_until_free():
+    from agentic_configuration_search.planner.llm import _free_id
+    assert _free_id("a", {"b"}) == "a"
+    assert _free_id("a", {"a", "a_2"}) == "a_3"
+
+
+def test_stop_with_only_carried_duplicates_keeps_running(tmp_path):
+    """stop=True with only carried candidates is not a stop — proposing them
+    means looking at the carry-overs further, and before this change those
+    candidates stayed, so it was not a stop either."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    chat, calls = _scripted_chat(
+        {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"}],
+         "stop": True})
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
+    assert out["candidates"] == [] and out["stop"] is False
+    assert len(calls) == 1                               # no follow-up on stop
+
+
+def test_prompt_explains_carried_duplicate():
+    from agentic_configuration_search.planner.llm import PROMPT
+    assert "carried_duplicate" in PROMPT
+
+
+def test_refill_shrinks_history_to_fit_instead_of_skipping(tmp_path):
+    """The follow-up conversation is longer by the first response and the
+    follow-up message — if the first prompt nearly filled the budget, shrink
+    the history window to fit instead of skipping the follow-up."""
+    from agentic_configuration_search.planner.llm import MAX_HISTORY, _est_tokens
+
+    filler = [{"round": i, "champion": {"axes": validate_axes({})},   # the carry's previous champion
+               "candidates": [{"id": f"f{i}_{j}", "axes": validate_axes(
+                   {"exemplar": "base", "exemplar_k": 2}),
+                   "skipped": "no_material", "note": "x" * 80} for j in range(4)]}
+              for i in range(1, 9)]
+    carry = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    hist = [carry[0]] + filler + [{**carry[1], "round": 9}]
+    first = {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"}],
+             "stop": False}
+    seen = []
+
+    def probe(messages, **kw):
+        seen.append(messages)
+        return first
+    LLMPlanner(chat=probe, artifact_dir=tmp_path / "p").propose(hist, {})
+    budget = _est_tokens(seen[0]) + 20          # the first prompt fits without shrinking
+
+    chat, calls = _scripted_chat(
+        first, {"candidates": [{"id": "n", "axes": {"tiling": 2}, "rationale": "r"}],
+                "stop": False})
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path / "a",
+                     token_budget=budget).propose(hist, {})
+    assert len(calls) == 2, "the follow-up was skipped"
+    assert _est_tokens(calls[1]) <= budget
+    assert [c["id"] for c in out["candidates"]] == ["n"]
+    stored = json.loads((tmp_path / "a" / "proposal.json").read_text())
+    assert stored["followup"]["window"] < MAX_HISTORY
+
+
+def test_carried_duplicate_note_does_not_claim_evaluation():
+    """A carry-over can still be filtered in the runner — the note must not
+    claim it will be evaluated."""
+    from agentic_configuration_search.planner.llm import PROMPT, _drop_carried
+    dropped: list = []
+    _drop_carried([{"id": "x", "axes": validate_axes({})}],
+                  {tuple(sorted(validate_axes({}).items()))}, dropped)
+    assert "evaluated" not in dropped[0]["note"] and "carry_" in dropped[0]["note"]
+    assert "evaluated anyway" not in PROMPT
+
+
+def test_refill_respects_disabled_axes(tmp_path):
+    """Refilled candidates go through the same per-run bans as the first
+    response — a disabled axis cannot slip in through the follow-up."""
+    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
+    chat, calls = _scripted_chat(
+        {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"}],
+         "stop": False},
+        {"candidates": [{"id": "t", "axes": {"tiling": 2}, "rationale": "r"},
+                        {"id": "v", "axes": {"alias": "vlm"}, "rationale": "r"}],
+         "stop": False})
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path,
+                     disabled_axes=("tiling",)).propose(hist, {})
+    assert len(calls) == 2
+    assert [c["id"] for c in out["candidates"]] == ["v"]
+    assert {d["id"]: d["skipped"] for d in out["dropped"]}["t"] == "disabled_axes"

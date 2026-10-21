@@ -13,6 +13,7 @@ failure never kills the loop (the gate protects against poor proposals).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -39,9 +40,12 @@ SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        "id": {"type": "string", "maxLength": 64},
                         "axes": {"type": "object"},
-                        "rationale": {"type": "string"},
+                        # rationales run to about 1,700 characters at most
+                        # (p99 about 1,050). Without a cap one rationale could
+                        # run on until the response hit the output cap
+                        "rationale": {"type": "string", "maxLength": 2000},
                     },
                     "required": ["axes", "rationale"],
                 },
@@ -54,12 +58,32 @@ SCHEMA = {
 
 # Caps on diagnosis detail and history in the prompt — the first defense against
 # overflowing the server context. The last is the budget guard that measures the
-# assembled prompt (DEFAULT_CHAR_BUDGET).
+# assembled prompt (DEFAULT_TOKEN_BUDGET).
 MAX_HISTORY = 8          # recent rounds in the prompt (the budget guard may cut further)
-# Prompt character budget — overflow is fixed by shrinking history. Derived
-# from max_model_len 16384 − 1024 output − slack, at 2.0 chars/token. Overflow
-# makes vLLM return 400 and the planner silently falls back to deterministic.
-DEFAULT_CHAR_BUDGET = 28_000
+# Response cap — the schema bounds the response length (candidates ≤
+# max_candidates, rationale ≤ RATIONALE_MAX_CHARS characters, id ≤ 64) and this
+# is set above the longest English response (axes is a free object and is not
+# bounded — see _schema). A truncated response breaks the JSON and the planner
+# silently falls back to deterministic.
+RATIONALE_MAX_CHARS = SCHEMA["schema"]["properties"]["candidates"]["items"][
+    "properties"]["rationale"]["maxLength"]
+OUTPUT_MAX_TOKENS = 4096
+# Prompt token estimate — counted generously without the server tokenizer.
+# ASCII counts at 1.85 chars/token (whole planner prompts measured no lower than
+# 2.68; number-heavy JSON fragments about 1.85), and other characters (Hangul,
+# Han, ...) count 1.5 tokens each — a character budget overflowed the server
+# context on CJK-heavy prompts (around 1.8 chars/token). It is not a bound:
+# text that is a long run of digits tokenizes below it, since the Qwen
+# tokenizer splits digits one by one (synthetic numeric JSON about 1.2). Real
+# prompts mix in prose, and on all measured planner prompts the estimate came
+# out above the actual count.
+ASCII_CHARS_PER_TOKEN = 1.85
+NON_ASCII_TOKENS = 1.5
+CONTEXT_MARGIN = 256      # chat template tokens etc.
+# Prompt token budget — overflow is fixed by shrinking history (the same
+# formula as runner._token_budget). Overflow makes vLLM return 400 and the
+# planner silently falls back to deterministic.
+DEFAULT_TOKEN_BUDGET = 16384 - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
 MAX_NOTE = 80            # prefix length of the skip note carried in the prompt
 NDIGITS = 4              # float digits in the prompt — at margin scale (0.005) the
                          # gate Δ/CI verdict turns on the 4th digit (3 is too few)
@@ -267,6 +291,67 @@ def _tried_lines(history: list[dict], champion: dict) -> list[str]:
     return lines
 
 
+def _schema(max_candidates: int) -> dict:
+    """The schema with the candidate cap. With rationale, id and the candidate
+    count bounded, the longest English response fits within OUTPUT_MAX_TOKENS —
+    axes is a free object and is not bounded, and a rationale written in CJK
+    takes more tokens per character and can reach the cap (a warning is logged
+    then)."""
+    out = copy.deepcopy(SCHEMA)
+    out["schema"]["properties"]["candidates"]["maxItems"] = max_candidates
+    return out
+
+
+def _modality_summary(modality_f: dict) -> dict:
+    """Summary of per-class semantic and text F(β) — its size does not depend on
+    the number of classes.
+
+    Carrying the full per-class record (history's modality_f) would make one
+    row exceed 1KB on a 19-class dataset, and the budget guard would shrink the
+    history window. The planner needs the number of classes text won and the
+    narrowest of those margins. Wins follow screen's pick (chosen) — the
+    recorded F is rounded and cannot tell a narrow gap (old records without
+    chosen are counted by F; screen picks semantic on a tie)."""
+    def text_won(v):
+        return v["chosen"] == "text" if v.get("chosen") else v["text"] > v["semantic"]
+    margins = [v["text"] - v["semantic"] for v in modality_f.values() if text_won(v)]
+    out = {"text_won": len(margins), "semantic_won": len(modality_f) - len(margins)}
+    if margins:
+        out["closest_text_margin"] = round(min(margins), 4)
+    return out
+
+
+def _free_id(base: str, taken: set) -> str:
+    """An id not in taken — appends _2, _3, ... on a clash."""
+    if base not in taken:
+        return base
+    n = 2
+    while f"{base}_{n}" in taken:
+        n += 1
+    return f"{base}_{n}"
+
+
+def _axes_key(axes: dict) -> tuple:
+    return tuple(sorted(axes.items()))
+
+
+def _drop_carried(candidates: list[dict], carried_keys: set,
+                  dropped: list) -> tuple[list[dict], list[dict]]:
+    """Drop combinations equal to a carried candidate — (kept, dropped). The
+    dropped ones are recorded in dropped."""
+    keep, dups = [], []
+    for c in candidates:
+        if _axes_key(c["axes"]) in carried_keys:
+            dups.append(c)
+            dropped.append({**c, "skipped": "carried_duplicate",
+                            "note": "same combination as an automatically carried "
+                                    "candidate — handled as the carry-over (see the "
+                                    "carry_<id> row)"})
+        else:
+            keep.append(c)
+    return keep, dups
+
+
 def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dict]:
     """Per round: trajectory, candidate deltas, and verdicts only — large
     record-like fields are left out.
@@ -307,6 +392,8 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["neg_eta_grid"] = c.get("neg_eta_grid")
             if c.get("unused_axes"):
                 row["unused_axes"] = c["unused_axes"]
+            if c.get("modality_f"):
+                row["modality"] = _modality_summary(c["modality_f"])
             if c.get("gate_passed_but_lost"):
                 row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
             if c.get("note"):
@@ -356,7 +443,12 @@ Rules:
   setting did not use (exemplar: the text pass beat the semantic pass for every
   class; visual_negatives: no semantic class kept a negative config). Other
   variants of such an axis (another k, fn_arm) rarely change the setting
-  while that stays true.
+  while that stays true. A row's modality counts the classes where the text
+  pass beat the semantic (exemplar) pass on fit_dev F (text_won) and the
+  rest (semantic_won); closest_text_margin is the smallest F gap among the
+  classes text won. A small margin means another exemplar_k or fn_arm may
+  flip a class to semantic; a large one means exemplar variants are unlikely
+  to win.
 - A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
   the screen picked for semantic classes) and neg_eta_grid (the thresholds it
   tried). Lower means stronger suppression. Picks at the low end of the grid
@@ -371,7 +463,8 @@ Rules:
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that
   exact axes combination was already tried — never repeat it verbatim; vary it
-  or move on.
+  or move on. skipped="carried_duplicate" means it repeated a re-queued
+  candidate; that combination is handled by the carry_<id> row instead.
 
 Current champion axes (only axes that are ON are listed; an empty object means
 the baseline — every axis at its safe point):
@@ -419,9 +512,16 @@ different source value, or after the champion has changed:
 CARRY_BLOCK = """
 Re-queued automatically this round — each passed the gate last round but lost
 to the adopted candidate, so it is retried on top of the new champion (listed
-as its difference from the current champion). Do not spend a slot on these:
+as its difference from the current champion). Do not spend a slot on these —
+a candidate repeating one is dropped as a duplicate:
 {carried}
 """
+
+# Follow-up message asking again for the slots freed when the planner repeated
+# carried candidates.
+FOLLOWUP = """{n} of your candidates repeated re-queued ones that are queued anyway ({dups}),
+so they were dropped. Kept from your answer: {kept}. Propose up to {k} further
+candidates that differ from both, under the same rules, in the same JSON format."""
 
 # Inserted only when dataset_notes (config) is set — otherwise notes_block=""
 # and the prompt is byte-identical to the no-notes form (pinned by
@@ -439,10 +539,14 @@ Unavailable in this run (never turn these on; the champion keeps any it already 
 """
 
 
-def _chars(messages: list[dict]) -> int:
-    return sum(len(m["content"]) if isinstance(m.get("content"), str)
-               else sum(len(str(x)) for x in m.get("content", []))
-               for m in messages)
+def _est_tokens(messages: list[dict]) -> int:
+    """A generous estimate of prompt tokens (ASCII_CHARS_PER_TOKEN, NON_ASCII_TOKENS)."""
+    text = "".join(m["content"] if isinstance(m.get("content"), str)
+                   else "".join(str(x) for x in m.get("content", []))
+                   for m in messages)
+    n_ascii = sum(1 for ch in text if ord(ch) < 128)
+    return round(n_ascii / ASCII_CHARS_PER_TOKEN
+                 + (len(text) - n_ascii) * NON_ASCII_TOKENS)
 
 
 def _strip_samples(diag: dict) -> dict:
@@ -455,14 +559,14 @@ class LLMPlanner:
     partial application of clients.llm.LLMClient.chat_json."""
 
     def __init__(self, chat, artifact_dir: Path, *, max_candidates: int = 3,
-                 notes: str = "", char_budget: int = DEFAULT_CHAR_BUDGET,
+                 notes: str = "", token_budget: int = DEFAULT_TOKEN_BUDGET,
                  disabled_axes=(), disabled_values=None,
                  facts: DatasetFacts | None = None):
         self.chat = chat
         self.artifact_dir = Path(artifact_dir)
         self.max_candidates = max_candidates
         self.notes = notes or ""
-        self.char_budget = char_budget
+        self.token_budget = token_budget
         self.disabled_axes = tuple(disabled_axes or ())
         self.disabled_values = {k: tuple(v) for k, v in
                                 (disabled_values or {}).items() if v}
@@ -470,6 +574,67 @@ class LLMPlanner:
         # lora whose training would be skipped) are left out of the prompt and
         # filtered from the response — None means the full value space
         self.facts = facts
+
+    def _refill(self, build, window, raw, dups, candidates, champion, carried_keys,
+                dropped, carried_ids) -> dict:
+        """Ask once more, in the same conversation, for the slots freed by
+        candidates that repeated carried ones (extends candidates and dropped in
+        place). Returns the record kept in the artifact.
+
+        The conversation grows by the first response and the follow-up message —
+        if the first prompt nearly filled the budget, shrink the history window
+        (build) to fit. With dups present there is at least one free slot."""
+        k = self.max_candidates - len(candidates)
+
+        def delta(c):
+            return ", ".join(f"{a}={v}" for a, v in
+                             sorted(_delta_axes(c["axes"], champion).items()))
+        note = FOLLOWUP.format(n=len(dups), dups="; ".join(delta(c) for c in dups),
+                               kept="; ".join(delta(c) for c in candidates) or "none",
+                               k=k)
+        tail = [{"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
+                {"role": "user", "content": note}]
+        msgs = build(window) + tail
+        while _est_tokens(msgs) > self.token_budget and window > 0:
+            window -= 1
+            msgs = build(window) + tail
+        record = {"message": note, "response": None, "error": None, "window": window}
+        if _est_tokens(msgs) > self.token_budget:
+            record["error"] = "over the prompt budget — not asking again"
+            return record
+        try:
+            raw2 = self.chat(msgs, schema=_schema(k), max_tokens=OUTPUT_MAX_TOKENS)
+        except Exception as exc:  # noqa: BLE001 — the follow-up is a bonus
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            log.warning("follow-up after carried duplicates failed (%s) — using the "
+                        "first response only", record["error"])
+            return record
+        record["response"] = raw2
+        # ids are fixed before filtering — an id equal to a kept, dropped or
+        # carried candidate's would put two rows in one round, and the next
+        # round's history would attach the evaluation score to the dropped row too
+        taken = ({c["id"] for c in candidates} | {d["id"] for d in dropped}
+                 | set(carried_ids))
+        renamed = []
+        for i, c in enumerate((raw2 or {}).get("candidates") or []):
+            if isinstance(c, dict):
+                c = {**c, "id": _free_id(str(c.get("id") or f"cand_{i}"), taken)}
+                taken.add(c["id"])
+            renamed.append(c)
+        more = sanitize_candidates(renamed, max_candidates=k, dropped=dropped,
+                                   disabled_axes=self.disabled_axes,
+                                   disabled_values=self.disabled_values,
+                                   base=champion or None, facts=self.facts)
+        more, _ = _drop_carried(more, carried_keys, dropped)
+        seen = {_axes_key(c["axes"]) for c in candidates}
+        for c in more:
+            if _axes_key(c["axes"]) in seen:
+                dropped.append({**c, "skipped": "duplicate_axes",
+                                "note": "same combination as a candidate in the first response"})
+                continue
+            seen.add(_axes_key(c["axes"]))
+            candidates.append(c)
+        return record
 
     @property
     def artifact_path(self) -> Path:
@@ -538,19 +703,20 @@ class LLMPlanner:
         # window=0, strip diagnosis samples as the last line of defense.
         window = MAX_HISTORY
         messages = build(window)
-        while _chars(messages) > self.char_budget and window > 0:
+        while _est_tokens(messages) > self.token_budget and window > 0:
             window -= 1
             messages = build(window)
-        if _chars(messages) > self.char_budget:
+        if _est_tokens(messages) > self.token_budget:
             diag_json = json.dumps(_strip_samples(compact),
                                    ensure_ascii=False, default=str)
             messages = build(0)
         if window < MAX_HISTORY:
-            log.info("prompt budget (%d chars) — history window shrunk %d→%d rounds",
-                     self.char_budget, MAX_HISTORY, window)
+            log.info("prompt budget (estimated %d tokens) — history window shrunk %d→%d rounds",
+                     self.token_budget, MAX_HISTORY, window)
         raw, error = None, None
         try:
-            raw = self.chat(messages, schema=SCHEMA)
+            raw = self.chat(messages, schema=_schema(self.max_candidates),
+                            max_tokens=OUTPUT_MAX_TOKENS)
         except Exception as exc:  # noqa: BLE001 — falling back is the contract
             error = f"{type(exc).__name__}: {exc}"
             log.warning("LLM planner call failed (%s) — falling back to deterministic", error)
@@ -563,12 +729,27 @@ class LLMPlanner:
                                          disabled_values=self.disabled_values,
                                          base=champion or None,
                                          facts=self.facts)
+        # a candidate equal to a carried one does not take a slot — the runner
+        # runs the carry-overs anyway, so candidates repeated against the
+        # prompt's instruction are dropped and the freed slots asked for again
+        carried_keys = {_axes_key(c["axes"]) for c in carried}
+        candidates, dups = _drop_carried(candidates, carried_keys, dropped)
+        followup = None
+        if dups and raw is not None and not raw.get("stop"):
+            followup = self._refill(build, window, raw, dups, candidates, champion,
+                                    carried_keys, dropped,
+                                    [c["id"] for c in carried])
         if dropped:
             log.info("sanitizer dropped %d candidates: %s", len(dropped),
                      [(c["id"], c["skipped"]) for c in dropped])
-        stop = bool((raw or {}).get("stop")) and not candidates
+        # proposing only carried candidates is still proposing — not a stop
+        # (same as before)
+        stop = bool((raw or {}).get("stop")) and not candidates and not dups
         fallback = None
-        if raw is None or (not candidates and not (raw or {}).get("stop")):
+        # proposing only carried candidates makes an empty proposal correct (the
+        # runner runs the carry-overs) — no fallback
+        if raw is None or (not candidates and not (raw or {}).get("stop")
+                           and not dups):
             # Call failed or every candidate invalid — fill this round deterministically
             det = deterministic.propose(history, diagnosis,
                                         max_candidates=self.max_candidates,
@@ -583,6 +764,6 @@ class LLMPlanner:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_path.write_text(json.dumps(
             {**proposal, "prompt": messages, "response": raw,
-             "fallback": fallback, "error": error},
+             "fallback": fallback, "error": error, "followup": followup},
             indent=2, ensure_ascii=False, default=str))
         return proposal

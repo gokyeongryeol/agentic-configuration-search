@@ -64,24 +64,33 @@ the run records this as `holdout_split` in `run_summary.json`.
 
 ### Search space
 
-A setting combines the axes below. Every axis has an "off" value that equals
-the baseline behavior.
+A setting combines the 8 axes below. Every axis has an "off" value (the first
+line) that equals the baseline behavior exactly.
 
 | axis | values |
 |---|---|
-| alias | class name only / VLM-proposed alias from crops |
-| visual exemplar | text only / GT-crop exemplars (`base`, `fn_arm`) |
-| visual_negatives, neg_eta | negative crops emulated by IoU suppression × threshold grid |
-| text_negatives | off / `fp_crop` / `gt_crop` (other classes' GT — not on single-class datasets) / `background` |
-| tiling | off / grid g ∈ 2–6 (image-relative g×g, zoom (g−1)(1−overlap)+1, 1+g² passes per image) — the planner raises it one step at a time |
-| rescorer | per-class score calibration α_c (α=0 is off) |
-| lora | YOLOE tail fine-tune with λ interpolation (λ=0 is the base) |
-| crop_classifier | SigLIP2+LoRA re-classification of detections |
-| counts k | how many exemplars/negatives to use |
+| `alias` — Prompt alias | `false`: class name only (manual aliases in `mine.text_aliases` are always included)<br>`vlm`: alias proposed by a multimodal LLM that looks at the crops |
+| `exemplar` — Visual exemplar | `none`: text prompts only<br>`base`: GT crops as image prompts (by default chosen for diversity by embedding k-center — `mine.exemplar_selection`)<br>`fn_arm`: `base` + crops of GT objects missed when train is inferred with the `base` exemplars<br>counts `exemplar_k` ∈ {1, 2, 4, 8} (default 4), `fn_k` ∈ {1, 2, 4} (default 2) |
+| `text_negatives` — Negative text | `false`: no suppression phrases<br>`fp_crop`: phrases from false-positive crops of the mining pass — the mining pass infers train with the candidate's exemplars only (a GT k-center selection if it has none), without tiling or negatives<br>`gt_crop`: phrases from other classes' GT crops (suppress confusion — not valid on single-class datasets)<br>`background`: phrases from the same mining pass's false positives that overlap no GT of any class (suppress background)<br>count `text_negative_k` ∈ {1, 2, 4} (default 1) |
+| `visual_negatives` — Negative visual | `false`: no suppression crops<br>`true`: false-positive crops of the mining pass (the same as `fp_crop`) as negative image prompts (needs `exemplar`), emulated as IoU suppression. The suppression IoU threshold is chosen on fit_dev by screen, one config shared across classes, among a config without negatives and `search.neg_eta_grid` (0.25, 0.35, 0.5, 0.65, 0.75 — lower suppresses more)<br>count `visual_negative_k` ∈ {1, 2, 4} (default 1) |
+| `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
+| `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
+| `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility |
+| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges. Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner is told to raise it one step at a time |
 
-Axes not to search on a dataset go in `search.disabled_axes` (e.g. `[lora, tiling]`;
-`search.disabled_values` bans single values). Only candidates that newly turn one
-on are blocked — a value the champion already has is kept.
+An axis that is on may still go unused by the setting — screen picks whichever
+is better on fit_dev (exemplar against text prompts per class, tiling against
+the untiled config).
+
+Axes not to search on a dataset go in `search.disabled_axes` by the axis keys
+in the table (e.g. `[lora, tiling]`). The count keys (`exemplar_k`, `fn_k`,
+`text_negative_k`, `visual_negative_k`) can be disabled on their own too (the
+count stays at its default or the champion's value), and
+`search.disabled_values` bans single values (e.g. `{text_negatives: [gt_crop]}`).
+An unknown key or value fails at the start of the run. Disabled axes and values
+are left out of the planner's value list, and candidates that turn them on or
+change them away from the champion's value are rejected — candidates that turn
+them off or inherit the champion's value are kept.
 
 ### Round loop
 
@@ -120,6 +129,13 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   them before widening a count axis: tiling used on an adopted grid suggests
   g+1, negatives picked at the low (strongest) end suggest raising
   `visual_negative_k`, and picks at the high end suggest folding the axis.
+  Candidates that ran a semantic pass also record each class's fit_dev F(β)
+  for the semantic and text passes (`modality_f`), including candidates
+  filtered before holdout, so the planner can tell whether exemplar lost
+  narrowly (try another k or fn_arm) or badly. The prompt carries only a
+  summary whose size does not depend on the class count (classes text won and
+  the narrowest margin); the full per-class record would make the budget
+  guard shrink the history window on datasets with many classes.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
   they are not adopted. Once adopted they are not turned off: the state stays
@@ -139,6 +155,12 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   silently off.
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
   Prompts and responses are saved, so `--resume` replays them without the LLM.
+  The prompt is rebuilt every round; when it exceeds the estimated-token budget
+  (server context − output cap), the history window shrinks first. Response
+  length is bounded by the schema (rationale, id, candidate count). One call
+  per round, plus at most one follow-up in the same conversation when the
+  planner repeats carried candidates: those are dropped as
+  `carried_duplicate` and the freed slots are asked for again.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 
