@@ -302,6 +302,9 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
+            if "neg_eta_used" in c:
+                row["neg_eta_used"] = c["neg_eta_used"]
+                row["neg_eta_grid"] = c.get("neg_eta_grid")
             if c.get("unused_axes"):
                 row["unused_axes"] = c["unused_axes"]
             if c.get("gate_passed_but_lost"):
@@ -354,6 +357,12 @@ Rules:
   class; visual_negatives: no semantic class kept a negative config). Other
   variants of such an axis (another k, fn_arm) rarely change the setting
   while that stays true.
+- A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
+  the screen picked for semantic classes) and neg_eta_grid (the thresholds it
+  tried). Lower means stronger suppression. Picks at the low end of the grid
+  mean negatives are pulling hard, so more negatives (raise visual_negative_k)
+  may help; picks at the high end mean they barely help, so fold the axis
+  rather than raising k.
 - If nothing promising remains, return stop=true with no candidates.
 - History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
   a rejected candidate came) and a skip note. skipped="combo_tried" means that

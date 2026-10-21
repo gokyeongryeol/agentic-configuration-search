@@ -819,6 +819,48 @@ def test_unused_record_is_shared_by_all_candidate_paths():
     assert inspect.getsource(runner.Loop.run_round).count("_unused_record(") == 3
 
 
+def test_neg_eta_record_reads_the_screened_setting():
+    """A visual-negative candidate records the neg_eta screen picked
+    (neg_eta_used) and the grid it searched (neg_eta_grid) — the signal the
+    planner reads to raise or fold negatives. Only semantic classes count (the
+    text pass carries no visual negatives)."""
+    from agentic_configuration_search.loop.runner import _neg_eta_record
+    from agentic_configuration_search.planner.axes import validate_axes
+
+    setting = {"configs": [{"config_id": 0, "visual_negatives": False, "neg_eta": None},
+                           {"config_id": 1, "visual_negatives": True, "neg_eta": 0.25},
+                           {"config_id": 2, "visual_negatives": True, "neg_eta": 0.5},
+                           {"config_id": 3, "visual_negatives": True, "neg_eta": 0.75}],
+               "per_class": {1: {"config_id": 1, "modality": "semantic"},
+                             2: {"config_id": 2, "modality": "text"}}}
+    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    assert _neg_eta_record({"axes": vn, "setting": setting}) == {
+        "neg_eta_used": [0.25], "neg_eta_grid": [0.25, 0.5, 0.75]}
+    # recorded against the request even after relabelling — negatives going
+    # unused is a signal too
+    off = validate_axes({"exemplar": "base"})
+    setting0 = {**setting, "per_class": {1: {"config_id": 0, "modality": "semantic"}}}
+    assert _neg_eta_record({"axes": off, "requested_axes": vn, "setting": setting0}) == {
+        "neg_eta_used": [], "neg_eta_grid": [0.25, 0.5, 0.75]}
+    # nothing is recorded for a candidate that did not request visual negatives
+    assert _neg_eta_record({"axes": off, "setting": setting}) == {}
+
+
+def _fp_semantic_infer(by_path):
+    """_fake_infer plus one false positive outside GT from the semantic pass
+    (negative material)."""
+    base = _fake_infer(by_path)
+
+    def fake(ctx, client, config, queries, ontology, image_paths, **kw):
+        out = base(ctx, client, config, queries, ontology, image_paths, **kw)
+        if bool(queries) and any("prompt_image" in q for q in queries):
+            for dets in out:
+                dets.append({"box": [60.0, 50.0, 90.0, 75.0], "score": 0.5,
+                             "category_id": 1, "sources": ["full"]})
+        return out
+    return fake
+
+
 def _semantic_fp_infer(by_path):
     """The semantic pass returns GT plus one FP per class and the text pass is
     exact — text wins for every class and the exemplar pass's FP pool is not
@@ -839,6 +881,40 @@ def _semantic_fp_infer(by_path):
             out.append(dets)
         return out
     return fake
+
+
+def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_path,
+                                                                 monkeypatch):
+    from agentic_configuration_search.config import SearchCfg
+
+    monkeypatch.setattr(gateway, "infer_config", _fp_semantic_infer(_gt_lookup(big_root)))
+
+    def llm(messages, **kw):
+        return {"candidates": [{"id": "vn", "axes": {"exemplar": "base",
+                                                     "visual_negatives": True},
+                                "rationale": "background FP"}], "stop": False}
+
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
+               llm_chat=llm, rounds=1, **_fakes())
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["vn"]
+    assert rec["neg_eta_grid"] == sorted(SearchCfg().neg_eta_grid)
+    assert rec.get("skipped") is None, rec.get("skipped")
+    assert set(rec["neg_eta_used"]) <= set(rec["neg_eta_grid"])
+
+
+def test_compact_history_and_prompt_carry_neg_eta():
+    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+    from agentic_configuration_search.planner.axes import validate_axes
+
+    b = validate_axes({})
+    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
+            {"round": 1, "champion": {"axes": b},
+             "candidates": [{"id": "vn", "axes": vn, "neg_eta_used": [0.25],
+                             "neg_eta_grid": [0.25, 0.5, 0.75]}]}]
+    row = _compact_history(hist)[1]["candidates"][0]
+    assert row["neg_eta_used"] == [0.25] and row["neg_eta_grid"] == [0.25, 0.5, 0.75]
+    assert "neg_eta_used" in PROMPT
 
 
 def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,

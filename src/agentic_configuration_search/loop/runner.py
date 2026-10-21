@@ -843,7 +843,7 @@ class Loop:
             "candidates": ([{k: c[k] for k in ("id", "axes")}
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
-                            | _tiling_record(c) | _requested(c)
+                            | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
                             | _unused_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
                             | {"forwards": setting_forwards(c["setting"])}
@@ -979,6 +979,26 @@ def _tiling_record(c: dict) -> dict:
     if not requested.get("tiling") or not c.get("setting"):
         return {}
     return {"tiling_used": _uses_tiling(c["setting"])}
+
+
+def _neg_eta_record(c: dict) -> dict:
+    """For a candidate that requested visual negatives, the neg_eta values screen
+    picked for semantic classes (neg_eta_used) and the grid it searched
+    (neg_eta_grid) — a sizing signal like tiling_used. neg_eta is the
+    suppression IoU threshold, so lower means stronger suppression: picks at the
+    low end of the grid point the planner toward more negatives
+    (visual_negative_k), picks at the high end toward folding the axis. An empty
+    list means no class picked a negative config."""
+    requested = c.get("requested_axes") or c["axes"]
+    if not requested.get("visual_negatives") or not c.get("setting"):
+        return {}
+    configs = {cf["config_id"]: cf for cf in c["setting"].get("configs", [])}
+    used = {configs[e["config_id"]]["neg_eta"]
+            for e in (c["setting"].get("per_class") or {}).values()
+            if e.get("modality", "semantic") == "semantic"
+            and configs.get(e["config_id"], {}).get("visual_negatives")}
+    grid = {cf["neg_eta"] for cf in configs.values() if cf.get("visual_negatives")}
+    return {"neg_eta_used": sorted(used), "neg_eta_grid": sorted(grid)}
 
 
 # Measured state with an unused axis turned off — when exemplar is unused, the

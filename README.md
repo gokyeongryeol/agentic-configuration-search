@@ -113,6 +113,13 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   before the discriminator refit, the most expensive step. An evaluated
   candidate with an unused axis gets its label corrected to the measured state,
   with the request kept in `requested_axes`.
+- Sizing signals are recorded in history: for tiling candidates, whether
+  screen actually picked a tile config (`tiling_used`); for visual-negative
+  candidates, the suppression IoU thresholds picked for semantic classes
+  (`neg_eta_used`) and the grid searched (`neg_eta_grid`). The planner reads
+  them before widening a count axis: tiling used on an adopted grid suggests
+  g+1, negatives picked at the low (strongest) end suggest raising
+  `visual_negative_k`, and picks at the high end suggest folding the axis.
 - lora and crop_classifier change the detector state (weights / artifact), so
   they are processed after the other candidates, and the state is restored if
   they are not adopted.
