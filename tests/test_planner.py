@@ -980,3 +980,46 @@ def test_dropped_rows_record_merged_axes():
                         max_candidates=3, dropped=dropped, base=champ)
     assert [d["skipped"] for d in dropped] == ["duplicate_axes"]
     assert dropped[0]["axes"] == validate_axes({"exemplar": "base", "tiling": 2})
+
+
+def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
+    """The schema bounds the longest response (rationale and id length, number of
+    candidates) and the output cap sits above it — at a 1024-token cap a
+    rationale that kept running truncated the response and the planner silently
+    fell back to deterministic."""
+    from agentic_configuration_search.planner import llm as L
+
+    seen = {}
+
+    def chat(messages, **kw):
+        seen.update(kw)
+        return {"candidates": [], "stop": True}
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path, max_candidates=3).propose(
+        [{"round": 0, "champion": {"axes": validate_axes({})}, "candidates": []}], {})
+    assert seen["max_tokens"] == L.OUTPUT_MAX_TOKENS
+    cands = seen["schema"]["schema"]["properties"]["candidates"]
+    assert cands["maxItems"] == 3
+    props = cands["items"]["properties"]
+    assert props["rationale"]["maxLength"] == L.RATIONALE_MAX_CHARS
+    assert props["id"]["maxLength"] <= 80
+    # the longest response the schema allows fits under the cap — at 2.0
+    # chars/token (more conservative than the measured minimum of 2.68), with
+    # 600 characters per candidate for axes (12 enumerated keys)
+    worst = 3 * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"] + 600)
+    assert worst / 2.0 < L.OUTPUT_MAX_TOKENS
+
+
+def test_char_budget_reserves_output_and_keeps_input_budget():
+    """Raising the output reserve to OUTPUT_MAX_TOKENS keeps the input budget —
+    the chars/token ratio is set to 2.5 to match the measured minimum (2.68)."""
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import _char_budget
+    from agentic_configuration_search.planner import llm as L
+
+    cfg = config_from_dict({"dataset": "x"})
+    ctx = cfg.planner.launch.max_model_len
+    assert _char_budget(cfg) == int((ctx - L.OUTPUT_MAX_TOKENS) * 2.5 * 0.9)
+    assert _char_budget(cfg) >= 27_000
+    # even a full budget fits in the server context at the measured minimum ratio (2.68)
+    assert _char_budget(cfg) / 2.68 + L.OUTPUT_MAX_TOKENS < ctx

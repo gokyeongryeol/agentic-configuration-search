@@ -13,6 +13,7 @@ failure never kills the loop (the gate protects against poor proposals).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -39,9 +40,12 @@ SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        "id": {"type": "string", "maxLength": 64},
                         "axes": {"type": "object"},
-                        "rationale": {"type": "string"},
+                        # rationales run to about 1,700 characters at most
+                        # (p99 about 1,050). Without a cap one rationale could
+                        # run on until the response hit the output cap
+                        "rationale": {"type": "string", "maxLength": 2000},
                     },
                     "required": ["axes", "rationale"],
                 },
@@ -56,10 +60,21 @@ SCHEMA = {
 # overflowing the server context. The last is the budget guard that measures the
 # assembled prompt (DEFAULT_CHAR_BUDGET).
 MAX_HISTORY = 8          # recent rounds in the prompt (the budget guard may cut further)
+# Response cap — the schema bounds the longest response (candidates ≤
+# max_candidates, rationale ≤ RATIONALE_MAX_CHARS characters, id ≤ 64) and this
+# is set above that longest response. A truncated response breaks the JSON and
+# the planner silently falls back to deterministic.
+RATIONALE_MAX_CHARS = SCHEMA["schema"]["properties"]["candidates"]["items"][
+    "properties"]["rationale"]["maxLength"]
+OUTPUT_MAX_TOKENS = 4096
+# Chars/token ratio — planner prompts measured with the planner tokenizer go no
+# lower than 2.68.
+CHARS_PER_TOKEN = 2.5
 # Prompt character budget — overflow is fixed by shrinking history. Derived
-# from max_model_len 16384 − 1024 output − slack, at 2.0 chars/token. Overflow
-# makes vLLM return 400 and the planner silently falls back to deterministic.
-DEFAULT_CHAR_BUDGET = 28_000
+# from max_model_len 16384 − the output cap, at the ratio above with 0.9 slack
+# (the same formula as runner._char_budget). Overflow makes vLLM return 400 and
+# the planner silently falls back to deterministic.
+DEFAULT_CHAR_BUDGET = int((16384 - OUTPUT_MAX_TOKENS) * CHARS_PER_TOKEN * 0.9)
 MAX_NOTE = 80            # prefix length of the skip note carried in the prompt
 NDIGITS = 4              # float digits in the prompt — at margin scale (0.005) the
                          # gate Δ/CI verdict turns on the 4th digit (3 is too few)
@@ -265,6 +280,14 @@ def _tried_lines(history: list[dict], champion: dict) -> list[str]:
         lines.append(", ".join(f"{k}={v}" for k, v in sorted(delta.items()))
                      or "(baseline = current champion)")
     return lines
+
+
+def _schema(max_candidates: int) -> dict:
+    """The schema with the candidate cap — keeps the longest response within
+    OUTPUT_MAX_TOKENS."""
+    out = copy.deepcopy(SCHEMA)
+    out["schema"]["properties"]["candidates"]["maxItems"] = max_candidates
+    return out
 
 
 def _modality_summary(modality_f: dict) -> dict:
@@ -573,7 +596,8 @@ class LLMPlanner:
                      self.char_budget, MAX_HISTORY, window)
         raw, error = None, None
         try:
-            raw = self.chat(messages, schema=SCHEMA)
+            raw = self.chat(messages, schema=_schema(self.max_candidates),
+                            max_tokens=OUTPUT_MAX_TOKENS)
         except Exception as exc:  # noqa: BLE001 — falling back is the contract
             error = f"{type(exc).__name__}: {exc}"
             log.warning("LLM planner call failed (%s) — falling back to deterministic", error)

@@ -36,3 +36,14 @@ def test_chat_without_schema_omits_response_format(json_server):
         lambda p, b: (200, {"choices": [{"message": {"content": "text"}}]}))
     assert LLMClient(base, "m").chat([{"role": "user", "content": "x"}]) == "text"
     assert "response_format" not in records[0]["payload"]
+
+
+def test_truncated_response_is_logged(json_server, caplog):
+    """A response cut off at max_tokens is logged — when it then failed to parse
+    as JSON and fell back to deterministic, the cause was invisible."""
+    import logging
+    base, _ = json_server(lambda p, b: (200, {"choices": [
+        {"message": {"content": '{"a": "cu'}, "finish_reason": "length"}]}))
+    with caplog.at_level(logging.WARNING):
+        LLMClient(base, "m").chat([{"role": "user", "content": "x"}], max_tokens=7)
+    assert any("max_tokens" in r.message and "7" in r.message for r in caplog.records)

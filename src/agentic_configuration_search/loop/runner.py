@@ -39,7 +39,7 @@ from ..fitting.materials import Materials
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
-from ..planner.llm import LLMPlanner
+from ..planner.llm import CHARS_PER_TOKEN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
 
@@ -1168,11 +1168,11 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
 
 def _char_budget(cfg) -> int:
     """Prompt character budget — derived from the vLLM server context.
-    (max_model_len − output reserve) × chars/token (conservative 2.0) × 0.9 slack.
+    (max_model_len − planner output cap) × chars/token × 0.9 slack.
     Even when attached to an external server via base_url (actual context
     unknown), the launch value is the reference."""
     ctx = getattr(cfg.planner.launch, "max_model_len", 8192)
-    return max(4000, int((ctx - 1024) * 2.0 * 0.9))
+    return max(4000, int((ctx - OUTPUT_MAX_TOKENS) * CHARS_PER_TOKEN * 0.9))
 
 
 def _winner_axes(winner: dict) -> tuple[dict, bool]:
