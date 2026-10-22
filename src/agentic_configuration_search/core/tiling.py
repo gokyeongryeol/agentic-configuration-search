@@ -79,6 +79,28 @@ def _seam_adjacent(a, b, seams_x, seams_y) -> bool:
     return False
 
 
+def _seam_adjacent_many(a: np.ndarray, b, sx: np.ndarray, sy: np.ndarray) -> np.ndarray:
+    """_seam_adjacent for every row of a at once — (N,) bool. Same rule."""
+    out = np.zeros(len(a), bool)
+    if len(sx):
+        a_ends = np.abs(a[:, 2:3] - sx) <= EDGE_EPS          # (N, S)
+        a_starts = np.abs(a[:, 0:1] - sx) <= EDGE_EPS
+        b_ends = np.abs(b[2] - sx) <= EDGE_EPS                # (S,)
+        b_starts = np.abs(b[0] - sx) <= EDGE_EPS
+        touch = (a_ends & b_starts) | (a_starts & b_ends)
+        overlap = (np.minimum(a[:, 3], b[3]) - np.maximum(a[:, 1], b[1])) > 0
+        out |= touch.any(axis=1) & overlap
+    if len(sy):
+        a_ends = np.abs(a[:, 3:4] - sy) <= EDGE_EPS
+        a_starts = np.abs(a[:, 1:2] - sy) <= EDGE_EPS
+        b_ends = np.abs(b[3] - sy) <= EDGE_EPS
+        b_starts = np.abs(b[1] - sy) <= EDGE_EPS
+        touch = (a_ends & b_starts) | (a_starts & b_ends)
+        overlap = (np.minimum(a[:, 2], b[2]) - np.maximum(a[:, 0], b[0])) > 0
+        out |= touch.any(axis=1) & overlap
+    return out
+
+
 def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
           tiles=None, width: int = 0, height: int = 0) -> list[dict]:
     """Merge full + tile detections, in two stages.
@@ -100,27 +122,44 @@ def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
     pool.sort(key=lambda d: -d["score"])
 
     seams_x, seams_y = (interior_seams(tiles, width, height) if tiles else (set(), set()))
+    sx = np.array(sorted(seams_x), dtype=float)
+    sy = np.array(sorted(seams_y), dtype=float)
 
+    # Kept boxes are also held as an array, and each detection is compared with
+    # all of them at once — building a 1×1 IoU per pair took tens of seconds per
+    # image at topk 300 × (1+g²) pieces. The verdict is unchanged: the first kept
+    # box, in order, with the same label and IoU ≥ NMS_IOU (dedup) or touching
+    # it across a seam (union). IoU comes from _iou_matrix as before, so the
+    # values are the same.
     kept: list[dict] = []
+    boxes = np.empty((len(pool), 4))
+    labels: list = []
     for det in pool:
-        target = None
-        for k in kept:
-            if k["label"] != det["label"]:
-                continue
-            iou = _iou_matrix(np.array([k["box"]]), np.array([det["box"]]))[0, 0]
-            if iou >= NMS_IOU:          # duplicate of the same object -> keep the higher score
-                target = ("dedup", k)
-                break
-            if mode == "nmm" and _seam_adjacent(k["box"], det["box"], seams_x, seams_y):
-                target = ("union", k)   # piece cut at a seam -> union
-                break
-        if target is None:
+        m = len(kept)
+        hit = None
+        if m:
+            same = np.fromiter((lab == det["label"] for lab in labels), bool, m)
+            if same.any():
+                kb = boxes[:m]
+                iou = _iou_matrix(kb, np.array([det["box"]], dtype=float))[:, 0]
+                dup = same & (iou >= NMS_IOU)
+                cut = (same & _seam_adjacent_many(kb, det["box"], sx, sy)
+                       if mode == "nmm" else np.zeros(m, bool))
+                idx = np.flatnonzero(dup | cut)
+                if len(idx):
+                    i = int(idx[0])
+                    hit = (("dedup" if dup[i] else "union"), i)
+        if hit is None:
+            boxes[m] = det["box"]
+            labels.append(det["label"])
             kept.append(det)
             continue
-        kind, k = target
+        kind, i = hit
+        k = kept[i]
         if kind == "union":
             k["box"] = [min(k["box"][0], det["box"][0]), min(k["box"][1], det["box"][1]),
                         max(k["box"][2], det["box"][2]), max(k["box"][3], det["box"][3])]
+            boxes[i] = k["box"]
         k["sources"] = sorted(set(k["sources"]) | set(det["sources"]))
     return kept
 

@@ -205,3 +205,108 @@ def test_run_tiled_grid_calls_full_plus_g_squared():
     assert len(calls) == 1 and len(calls[0]) == 1 + 9
     assert calls[0][0] == (4000, 3000)
     assert set(calls[0][1:]) == {(2000, 1500)}
+
+
+
+
+# --- merge vectorization: results must be bit-identical to the old implementation (a 1×1 IoU per detection pair) ---
+
+def _reference_merge(full_dets, tile_dets, mode="nmm", tiles=None, width=0, height=0):
+    """merge as it was before vectorization — the equivalence reference."""
+    import numpy as np
+    from agentic_configuration_search.core.tiling import NMS_IOU, _iou_matrix, _seam_adjacent, interior_seams
+    pool = [{**d, "sources": list(d.get("sources", ["full"]))} for d in full_dets]
+    pool += [{**d, "sources": list(d.get("sources", ["tile"]))} for d in tile_dets]
+    pool.sort(key=lambda d: -d["score"])
+    seams_x, seams_y = (interior_seams(tiles, width, height) if tiles else (set(), set()))
+    kept = []
+    for det in pool:
+        target = None
+        for k in kept:
+            if k["label"] != det["label"]:
+                continue
+            iou = _iou_matrix(np.array([k["box"]]), np.array([det["box"]]))[0, 0]
+            if iou >= NMS_IOU:
+                target = ("dedup", k)
+                break
+            if mode == "nmm" and _seam_adjacent(k["box"], det["box"], seams_x, seams_y):
+                target = ("union", k)
+                break
+        if target is None:
+            kept.append(det)
+            continue
+        kind, k = target
+        if kind == "union":
+            k["box"] = [min(k["box"][0], det["box"][0]), min(k["box"][1], det["box"][1]),
+                        max(k["box"][2], det["box"][2]), max(k["box"][3], det["box"][3])]
+        k["sources"] = sorted(set(k["sources"]) | set(det["sources"]))
+    return kept
+
+
+def _random_pieces(rng, width, height, grid, n_per_piece, n_labels):
+    """Full + tile detections (tile coordinates). Some boxes touch a tile border
+    exactly to take the seam-union path, some overlap the same object in full and
+    tile to take the dedup path."""
+    cfg = {"grid": grid, "overlap": 0.5, "merge": "nmm"}
+    tiles, _ = tiling.tile_plan(width, height, cfg)
+
+    def box(w, h):
+        x, y = rng.uniform(0, w - 8), rng.uniform(0, h - 8)
+        s = rng.uniform(4, 60)
+        return [x, y, min(w, x + s), min(h, y + rng.uniform(4, 60))]
+
+    full = [{"box": box(width, height), "score": round(rng.uniform(0.03, 0.95), 3),
+             "label": rng.randrange(n_labels)} for _ in range(n_per_piece)]
+    per_tile = []
+    for (x1, y1, x2, y2) in tiles:
+        tw, th = x2 - x1, y2 - y1
+        ds = []
+        for _ in range(n_per_piece):
+            b = box(tw, th)
+            r = rng.random()
+            if r < 0.15:            # touches the right border — seam-union candidate with the neighbor tile
+                b[2] = float(tw)
+            elif r < 0.30:          # touches the bottom border
+                b[3] = float(th)
+            elif r < 0.45 and full:  # nearly the same object as a full detection
+                fb = rng.choice(full)["box"]
+                b = [fb[0] - x1 + 1, fb[1] - y1, fb[2] - x1 + 1, fb[3] - y1]
+            ds.append({"box": b, "score": round(rng.uniform(0.03, 0.95), 3),
+                       "label": rng.randrange(n_labels)})
+        per_tile.append(ds)
+    return [full] + per_tile, tiles
+
+
+@pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("mode", ["nmm", "nms"])
+def test_merge_matches_pairwise_reference(seed, mode):
+    import random
+    rng = random.Random(seed)
+    width, height = rng.choice([(640, 640), (800, 600), (333, 517)])
+    grid = rng.choice([2, 3])
+    results, tiles = _random_pieces(rng, width, height, grid,
+                                    n_per_piece=rng.choice([0, 3, 40]),
+                                    n_labels=rng.choice([1, 3]))
+    cfg = {"grid": grid, "overlap": 0.5, "merge": mode}
+    full = [{**d, "sources": ["full"]} for d in results[0]]
+    tile = []
+    for (x1, y1, _x2, _y2), dets in zip(tiles, results[1:]):
+        tile += [{**d, "sources": ["tile"]} for d in tiling.offset_detections(dets, x1, y1)]
+    got = tiling.merge(full, tile, mode, tiles=tiles, width=width, height=height)
+    ref = _reference_merge(full, tile, mode, tiles=tiles, width=width, height=height)
+    assert got == ref
+    assert tiling.merge_from_results(results, tiles, False, width, height, cfg) == ref
+
+
+def test_merge_is_fast_on_topk_sized_inputs():
+    """apply_topk (300) per piece × (full + 4 tiles) — the old implementation took
+    seconds to tens of seconds per image (a 1×1 numpy IoU per detection pair).
+    It must stay under a second per image."""
+    import random
+    import time
+    rng = random.Random(0)
+    results, tiles = _random_pieces(rng, 640, 640, 2, n_per_piece=300, n_labels=1)
+    t0 = time.perf_counter()
+    tiling.merge_from_results(results, tiles, False, 640, 640,
+                              {"grid": 2, "overlap": 0.5, "merge": "nmm"})
+    assert time.perf_counter() - t0 < 1.0
