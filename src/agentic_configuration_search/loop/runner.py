@@ -32,7 +32,7 @@ import yaml
 
 from ..config import Config, config_from_dict
 from ..core.data import Dataset, load_dataset, prescreen_subset
-from ..diagnose import describe
+from ..diagnose import describe, residual
 from ..diagnose.errors import diagnose
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
@@ -53,6 +53,8 @@ log = logging.getLogger(__name__)
 # name of the holdout diagnosis)
 DIAG_FILES = ("diagnosis_train.json", "diagnosis_test.json")
 DIAG_KEY = "diagnosis_key.json"       # fingerprint of the diagnosis inputs — the next round reuses it if equal
+FINAL_DIR = "final"                   # the final champion's diagnosis at the end of the run — rounds/final/
+RESIDUAL = "residual.json"            # structure of residual misses (report only, diagnose.residual)
 
 @dataclass
 class RunResult:
@@ -305,8 +307,10 @@ class Loop:
         this round's directory (_crop_notes replays the notes). Rounds under an
         unchanged champion would otherwise repeat the full train inference and
         the VLM notes — the diagnosis is a function of the champion and config
-        alone."""
-        for src in (round_dir, prev):
+        alone. When a finished run continues with more rounds, the end-of-run
+        final diagnosis (rounds/final) is a reuse candidate too."""
+        final = self.out_dir / "rounds" / FINAL_DIR
+        for src in (round_dir, prev, final if final != round_dir else None):
             if src is None or not (src / DIAG_KEY).exists() or not all(
                     (src / name).exists() for name in DIAG_FILES):
                 continue
@@ -334,6 +338,7 @@ class Loop:
         or the previous one (prev), it is not recomputed (_reuse_diagnosis)."""
         key = self._diagnosis_key(champion)
         reused = self._reuse_diagnosis(key, round_dir, prev)
+        self._diag_reused = reused is not None
         if reused is not None:
             return reused
         # with no key, or notes from another diagnosis left over, delete them so
@@ -380,6 +385,44 @@ class Loop:
         _write(round_dir / DIAG_FILES[1], d_test)
         _write(round_dir / DIAG_KEY, key)          # last — only once the diagnosis is fully written
         return {"train": d_train, "test": d_test}
+
+    def final_diagnosis(self, champion: dict, history: list[dict]) -> dict:
+        """The final champion's diagnosis at the end of the run — rounds/final/
+        (diagnosis, crop notes, residual).
+
+        A round's diagnosis is of the champion at the **start** of the round, so
+        when the last round adopts, the final champion's residual errors are
+        recorded nowhere. This goes through the same _diagnosis path, so if the
+        last round adopted nothing it only copies that diagnosis (no inference);
+        if it adopted, it is one train inference plus notes. Resume reuses this
+        directory itself, so it is idempotent. residual is computed from GT
+        annotations and the diagnosis alone (no inference).
+
+        Report-only, so a failure does not kill the run — it is recorded as an
+        error in run_summary. Returns run_summary's final_diagnosis key."""
+        t0 = time.monotonic()
+        rd = self.out_dir / "rounds" / FINAL_DIR
+        last = history[-1]["round"] if history else 0
+        info = {"dir": f"rounds/{FINAL_DIR}", "champion_round": champion.get("round"),
+                "after_round": last}
+        try:
+            rd.mkdir(parents=True, exist_ok=True)
+            diagnosis = self._diagnosis(
+                champion, rd, prev=self._round_dir(last) if last >= 1 else None)
+            info["reused"] = self._diag_reused
+            self._crop_notes(diagnosis, rd)
+            ev = champion["eval"]
+            _write(rd / RESIDUAL, residual.residual(
+                residual.image_rows(self.ds.train), diagnosis["train"],
+                ev["records"], ev.get("floor_records"), ev["tau_test"],
+                self.ds.ontology, iou_thr=self.iou,
+                small_ratio=self.cfg.diagnose.small_object_ratio))
+        except Exception as exc:  # noqa: BLE001 — a report-only diagnosis must not kill the run
+            log.exception("final champion diagnosis failed — the report falls back to the "
+                          "last round's diagnosis")
+            info["error"] = f"{type(exc).__name__}: {exc}"
+        info["dur_s"] = round(time.monotonic() - t0, 1)
+        return info
 
     def _planner_chat(self):
         """Chat callable shared by the llm planner and crop notes — the injected
@@ -1217,6 +1260,9 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 if stop:
                     result.stopped = stop
                     break
+        # the final champion's diagnosis — material for the report's residual-miss
+        # analysis (rounds/final)
+        final_diag = loop.final_diagnosis(champion, history)
 
     _write(loop.out_dir / "run_summary.json", {
         "stopped": result.stopped,
@@ -1229,6 +1275,7 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                               and (e.get("decision") or {}).get("adopted")),
         "champion": {"id": champion.get("id"), "axes": champion.get("axes"),
                      "micro_f_beta": (champion.get("eval") or {}).get("micro_f_beta")},
+        "final_diagnosis": final_diag,
         "finished_at": datetime.now().isoformat(timespec="seconds")})
     result.history = history
     result.champion = champion

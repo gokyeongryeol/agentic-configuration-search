@@ -160,6 +160,17 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
   previous round's are copied (`diagnosis_key.json`).
+- **final champion diagnosis**: a round's diagnosis is of the champion at the
+  start of the round, so when the last round adopts, the final champion's
+  residual errors would be recorded nowhere. At the end of the run the final
+  champion is diagnosed once more into `rounds/final/` — if the last round
+  adopted nothing this only copies its diagnosis (no inference); if it adopted,
+  it is one train inference plus crop notes. The structure of residual misses
+  (`residual.json` — size, crowding, border and aspect buckets, label quality
+  flags) is computed from GT annotations and the diagnosis alone. Resume is
+  idempotent, and continuing a finished run with more rounds lets the next
+  round reuse this diagnosis. It is report-only: a failure still ends the run
+  and is recorded in `run_summary.json` as `final_diagnosis.error`.
 - A round adopts one candidate, the one with the largest Δ. Candidates that
   passed the gate but lost to it are marked `gate_passed_but_lost` and carried
   into the next round as `carry_<id>`: the axes they changed are applied on top
@@ -231,12 +242,34 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 ```
 runs/<dataset>/run/
   history.jsonl        # round ledger (per-candidate wall_min and reask, per-round pass_cache counts)
-  run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion, holdout_split
+  run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
+                       # holdout_split, final_diagnosis (reused or not, duration)
   champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image)
   champion_eval.json   # champion holdout evaluation, incl. tau_test
   rounds/round_NNN/    # proposal (+ proposal_reask<k>), settings/<cand>/ materials, screen, eval,
                        # decision, diagnosis (+ diagnosis_key), crop_notes
+  rounds/final/        # final champion diagnosis (diagnosis, diagnosis_key, crop_notes) + residual.json
+  report.md            # output of acs report
 ```
+
+### Report
+
+`acs report <run_dir>` reads only the run's artifacts (no GPU) and writes
+`report.md`. A section whose artifacts are missing is noted in a line and
+skipped (older runs still render).
+
+| section | contents |
+|---|---|
+| header, round trajectory, candidates tried | final holdout F(β) and Δ vs. baseline, the champion and adopted increment per round, per-candidate fit_dev, holdout, gate Δ, CI lower bound and outcome |
+| adoption path | increments rejected or skipped under an earlier champion that came back and were adopted after a champion change (re-adoptions — earlier outcome and Δ/CI) and how many were rejected again (by reason), holdout Δ per adopted increment, per-axis tries, adoptions and outcome distribution (axes never adopted), carry-over (`carry_*`) results |
+| time use | run and round wall clock (`dur_s`), minutes by stage (materialize, screen, holdout), by outcome and by axis with adopted Δ per hour (`wall_min`), pass cache hit rate, re-asks and empty rounds, whether the final diagnosis was reused |
+| FP/FN causes over rounds | the holdout counts by cause of the champion entering each round, and their changes |
+| residual misses | for the final champion (`rounds/final`; otherwise the last round's diagnosis with a warning): per-class FN/GT; FN/GT by size bucket (with px at the 640 px detector input side), cause × size, crowding (GT per image), border contact and elongation; condition terms from crop notes (class × cause); representative train misses (5 per class, filename, box, note) |
+| data collection suggestions | a one-line suggestion per class from GT count, miss rate, main cause, main size and condition terms (read as a method problem when below_threshold dominates); label quality flags (GT with a short side ≤ 3 px, duplicate GT, localization share) |
+
+Holdout is aggregate-only in every section — samples and filenames come only
+from train. The amount of data needed is not estimated (no learning curve is
+measured).
 
 ### Prediction
 

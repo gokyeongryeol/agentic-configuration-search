@@ -103,7 +103,12 @@ def test_empty_round_reasks_planner_within_the_round(big_root, tmp_path,  # noqa
     stored = json.loads((rd / "proposal_reask1.json").read_text())
     assert stored["message"] == msg and stored["response"]["candidates"][0]["id"] == "ex"
     assert (rd / "settings" / "ex").is_dir()
-    assert len(n_diag) == 2                              # train + holdout, once
+    # the round diagnosis (train + holdout) runs once. The other 2 calls are the
+    # end-of-run final champion diagnosis (rounds/final) — round 1 adopted, so
+    # the champion changed
+    assert len(n_diag) == 4
+    assert json.loads((tmp_path / "run" / "rounds" / "final" / "diagnosis_key.json")
+                      .read_text())["champion"]["id"] == "ex"
 
 
 def test_reask_is_capped_and_can_be_disabled(big_root, tmp_path, monkeypatch):  # noqa: F811

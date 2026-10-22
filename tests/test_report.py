@@ -1,15 +1,19 @@
 """diagnose/report — trajectory, report, A/B, retrospective hit rate. No GPU needed."""
 
+import json as _json
 from pathlib import Path
 
 import pytest
 
 from agentic_configuration_search.diagnose.report import (ab_compare, render_report,
                                                      retrospective_hit_rate, trajectory)
+from agentic_configuration_search.core.coco import Ontology
+from agentic_configuration_search.diagnose import residual as _residual
+from agentic_configuration_search.diagnose.errors import diagnose as _diagnose
 from agentic_configuration_search.infer import gateway
 from agentic_configuration_search.loop.runner import run_rounds
 from agentic_configuration_search.planner import deterministic
-from tests.conftest import make_split
+from tests.conftest import CATS, make_split
 from tests.test_loop import _fake_infer, _fakes, _gt_lookup
 
 
@@ -46,6 +50,9 @@ def test_trajectory_and_report(finished_run):
     assert "exemplar" in md                         # axis turned on in the champion
     assert (finished_run / "report.md").exists()
     assert "residual error" in md                        # residual-error summary of the last round's diagnosis
+    # reads the end-of-run final champion diagnosis (rounds/final) and residual
+    assert "`rounds/final`" in md and "### Size buckets" in md and "> Note:" not in md
+    assert "## Adoption path" in md and "## Data collection suggestions" in md
 
 
 def test_ab_compare_self_is_tie(finished_run):
@@ -67,3 +74,290 @@ def test_retrospective_hit_rate_with_deterministic(finished_run):
 def test_report_missing_run_errors(tmp_path):
     with pytest.raises(FileNotFoundError, match="history"):
         trajectory(tmp_path / "nope")
+
+
+# --- synthetic run directories — the per-section report contract ------------------
+
+_BASE = {"exemplar": "none", "alias": False, "text_negatives": False,
+         "visual_negatives": False, "tiling": False, "rescorer": False,
+         "lora": False, "crop_classifier": False, "exemplar_k": None,
+         "fn_k": None, "visual_negative_k": None, "text_negative_k": None}
+_EX = {**_BASE, "exemplar": "base", "exemplar_k": 4}
+_EXT = {**_EX, "tiling": 2}
+
+
+def _wall(m, s, h=0.0):
+    return {"materialize": m, "screen": s, **({"holdout": h} if h else {}),
+            "total": m + s + h}
+
+
+def _cand(cid, axes, **kw):
+    return {"id": cid, "axes": axes, "adopted": False,
+            "fit_dev_micro_f_beta": 0.5, **kw}
+
+
+def _gate(delta, lo, adopted=False):
+    return {"micro_f_beta": 0.5 + delta,
+            "gate": {"delta": delta, "lo": lo, "hi": None, "adopted": adopted}}
+
+
+def _history_rows(*, timing=True):
+    """R0 baseline → R1 exemplar adopted (tiling=2 rejected at the gate,
+    text_negatives passed but lost, alias same_setting) → R2 tiling=2 re-adopted
+    (the carry rejected, alias same_setting again, 1 re-ask) → R3 an empty round
+    (rescorer no_material, 1 re-ask)."""
+    def ch(axes, rnd, cid, f):
+        return {"axes": axes, "round": rnd, "id": cid, "micro_f_beta": f}
+    t = (lambda **kw: kw) if timing else (lambda **kw: {})
+    rows = [
+        {"round": 0, "champion": ch(_BASE, 0, "baseline", 0.5), "candidates": [],
+         "decision": {"round": 0, "kind": "baseline", "adopted": True,
+                      "id": "baseline", "micro_f_beta": 0.5},
+         **t(dur_s=60.0)},
+        {"round": 1, "champion": ch(_EX, 1, "ex", 0.6),
+         "candidates": [
+             _cand("til2", {**_BASE, "tiling": 2}, **t(wall_min=_wall(1, 2, 1))),
+             _cand("ex", _EX, adopted=True, **t(wall_min=_wall(3, 4, 1))),
+             _cand("neg", {**_BASE, "text_negatives": "fp_crop"},
+                   gate_passed_but_lost=True, **t(wall_min=_wall(2, 2, 1))),
+             _cand("al", {**_BASE, "alias": "vlm"}, skipped="same_setting",
+                   **t(wall_min=_wall(1, 1)))],
+         "decision": {"round": 1, "adopted": True, "id": "ex",
+                      "screened": ["til2", "ex", "neg"],
+                      "evaluated": {"til2": _gate(-0.01, -0.03),
+                                    "ex": _gate(0.10, 0.05, True),
+                                    "neg": _gate(0.03, 0.01, True)},
+                      "skipped": ["al"], "micro_f_beta": 0.6},
+         **t(dur_s=1500.0, pass_cache={"hits": 10, "misses": 30,
+                                       "invalidations": 0, "hit_rate": 0.25,
+                                       "entries": 30})},
+        {"round": 2, "champion": ch(_EXT, 2, "til2b", 0.65),
+         "candidates": [
+             _cand("carry_neg", {**_EX, "text_negatives": "fp_crop"},
+                   source="carryover", **t(wall_min=_wall(1, 1, 1))),
+             _cand("til2b", _EXT, adopted=True, reask=1,
+                   **t(wall_min=_wall(0, 8, 2))),
+             _cand("al2", {**_EX, "alias": "vlm"}, skipped="same_setting",
+                   **t(wall_min=_wall(1, 1)))],
+         "decision": {"round": 2, "adopted": True, "id": "til2b", "reasks": 1,
+                      "screened": ["carry_neg", "til2b"],
+                      "evaluated": {"carry_neg": _gate(-0.005, -0.02),
+                                    "til2b": _gate(0.05, 0.02, True)},
+                      "skipped": ["al2"], "micro_f_beta": 0.65},
+         **t(dur_s=1200.0, pass_cache={"hits": 20, "misses": 20,
+                                       "invalidations": 1, "hit_rate": 0.5,
+                                       "entries": 50})},
+        {"round": 3, "champion": ch(_EXT, 2, "til2b", 0.65),
+         "candidates": [_cand("res", {**_EXT, "rescorer": True},
+                              skipped="no_material", reask=1,
+                              **t(wall_min=_wall(2, 0)))],
+         "decision": {"round": 3, "adopted": False, "kind": "no_candidates",
+                      "skipped": ["res"], "reasks": 1},
+         **t(dur_s=600.0, pass_cache={"hits": 0, "misses": 0, "invalidations": 0,
+                                      "hit_rate": 0.0, "entries": 50})},
+    ]
+    return rows
+
+
+ONTO = Ontology.from_categories(CATS)
+
+
+def _img(file, gts, dets=(), w=100, h=100):
+    return {"file": file, "width": w, "height": h,
+            "detections": [{"box": b, "score": 0.9, "category_id": c}
+                           for b, c in dets],
+            "gts": [{"box": b, "category_id": c} for b, c in gts]}
+
+
+def _train_images():
+    """cat a: finds most large GT and misses the small border GT. cat b: misses all (large ones)."""
+    imgs = []
+    for i in range(6):
+        imgs.append(_img(f"a{i}.png", [([40, 40, 70, 70], 1), ([0, 10, 3, 13], 1)],
+                         dets=[([40, 40, 70, 70], 1)]))
+    imgs.append(_img("b0.png", [([10, 10, 60, 60], 2)]))
+    imgs.append(_img("bad.png", [([20, 20, 21, 40], 1), ([50, 50, 70, 70], 2),
+                                 ([50, 50, 70, 70], 2)],
+                     dets=[([20, 20, 21, 40], 1), ([50, 50, 70, 70], 2)]))
+    return imgs
+
+
+def _holdout_images():
+    return [_img("h0.png", [([40, 40, 70, 70], 1), ([0, 0, 2, 2], 1)],
+                 dets=[([40, 40, 70, 70], 1)]),
+            _img("h1.png", [([10, 10, 60, 60], 2)])]
+
+
+def _write_diag(d: Path, *, notes=True, with_residual=True):
+    d.mkdir(parents=True, exist_ok=True)
+    tau = {1: 0.5, 2: 0.5}
+    train, hold = _train_images(), _holdout_images()
+    d_train = _diagnose(train, None, tau, ONTO, iou_thr=0.5, anonymize=False)
+    d_test = _diagnose(hold, None, tau, ONTO, iou_thr=0.5, anonymize=True)
+    (d / "diagnosis_train.json").write_text(_json.dumps(d_train))
+    (d / "diagnosis_test.json").write_text(_json.dumps(d_test))
+    if with_residual:
+        res = _residual.residual([{k: v for k, v in r.items() if k != "detections"}
+                                  for r in train], d_train, hold, None, tau, ONTO,
+                                 iou_thr=0.5, small_ratio=0.04)
+        (d / "residual.json").write_text(_json.dumps(res))
+    if notes:
+        fn = {r["image"]: r for r in d_train["fn"]}
+        rows = [
+            {"crop": 0, "kind": "missed_small", "category": "cat a",
+             "category_id": 1, "image": "a0.png", "box": fn["a0.png"]["box"],
+             "note": "A tiny blurry plate partially cropped at the frame edge."},
+            {"crop": 1, "kind": "missed_small", "category": "cat a",
+             "category_id": 1, "image": "a1.png", "box": fn["a1.png"]["box"],
+             "note": "Tiny, blurry object near the border."},
+            {"crop": 2, "kind": "missed", "category": "cat b", "category_id": 2,
+             "image": "b0.png", "box": fn["b0.png"]["box"],
+             "note": "A dark object in shadow, unusual viewpoint."},
+        ]
+        (d / "crop_notes.json").write_text(_json.dumps({"notes": rows}))
+
+
+def _synthetic_run(tmp_path, *, timing=True, final=True, notes=True, upto=None):
+    run = tmp_path / "run"
+    (run / "rounds").mkdir(parents=True)
+    rows = _history_rows(timing=timing)[:upto]
+    (run / "history.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n")
+    (run / "champion.json").write_text(_json.dumps(
+        {"round": 2, "id": "til2b", "axes": _EXT, "micro_f_beta": 0.65}))
+    summary = {"stopped": "empty_rounds", "last_round": 3}
+    if timing:
+        summary["final_diagnosis"] = {"dir": "rounds/final", "reused": True,
+                                      "champion_round": 2, "after_round": 3,
+                                      "dur_s": 0.4}
+    (run / "run_summary.json").write_text(_json.dumps(summary))
+    for r in range(len(rows)):
+        _write_diag(run / "rounds" / f"round_{r:03d}", notes=notes,
+                    with_residual=False)
+    if final:
+        _write_diag(run / "rounds" / "final", notes=notes)
+    return run
+
+
+def _section(md: str, title: str) -> str:
+    """From '## title' to the next '## '."""
+    start = md.index(f"## {title}")
+    nxt = md.find("\n## ", start + 3)
+    return md[start: nxt if nxt != -1 else len(md)]
+
+
+def test_adoption_path_section(tmp_path):
+    md = render_report(_synthetic_run(tmp_path))
+    s = _section(md, "Adoption path")
+    # re-adoption: tiling=2, rejected at the gate in R1 (champion R0), adopted in R2 (champion R1)
+    assert "tiling=2" in s and "R1" in s and "gate_failed" in s and "-0.0100" in s
+    # the same increment re-proposed after a champion change and rejected again (alias same_setting)
+    assert "same_setting 1" in s
+    # per-axis contribution — adopted increments' holdout Δ, axes without gain and their reasons
+    assert "+0.1000" in s and "+0.0500" in s
+    assert "alias" in s and "same_setting 2" in s
+    assert "rescorer" in s and "no_material 1" in s
+    assert "gate_passed_but_lost 1" in s           # text_negatives
+    # carry-over results
+    assert "carry_neg" in s and "rejected" in s
+
+
+def test_time_section(tmp_path):
+    md = render_report(_synthetic_run(tmp_path))
+    s = _section(md, "Time use")
+    # per-stage sums — materialize 11, screen 19, holdout 6 (min)
+    assert "materialize" in s and "11.0" in s and "19.0" in s and "6.0" in s
+    assert "pass cache" in s and "37.5%" in s       # 30 / 80
+    assert "**re-asks**: 2 (" in s
+    assert "empty rounds" in s and "R3" in s
+    assert "reused" in s                               # final diagnosis
+    # adopted gain per hour by axis — exemplar: +0.10 in 8 min
+    assert "exemplar" in s and "+0.750" in s        # 0.10 / (8/60)
+
+
+def test_residual_section_reads_final_diagnosis(tmp_path):
+    md = render_report(_synthetic_run(tmp_path))
+    s = _section(md, "Residual misses")
+    assert "rounds/final" in s and "> Note:" not in s
+    assert "small" in s and "<26px" in s             # size buckets and input px (640 px side)
+    assert "border" in s and "Crowding" in s
+    # condition terms per class × cause — blur and tiny from cat a's missed_small notes
+    assert "cat a" in s and "blur" in s and "tiny" in s
+    # representative train misses — filename, cause, note
+    assert "a0.png" in s and "missed_small" in s and "frame edge" in s
+    # individual holdout images never appear in the report
+    assert "h0.png" not in md and "h1.png" not in md
+
+
+def test_data_collection_section(tmp_path):
+    md = render_report(_synthetic_run(tmp_path))
+    s = _section(md, "Data collection suggestions")
+    assert "cat a" in s and "cat b" in s
+    assert "small objects" in s                       # cat a: small dominates
+    assert "frame border" in s                        # cat a: misses touching the border
+    # label quality — GT with a short side ≤ 3px and duplicate GT
+    assert "bad.png" in s and "duplicate" in s
+    assert "how much data" in s                       # the honesty note
+
+
+def test_report_falls_back_without_final_diagnosis(tmp_path):
+    """An older run: no rounds/final and no time keys — sections are noted in a
+    line and skipped. The last round (R2) adopted, so the R2 diagnosis used
+    instead is not the final champion's."""
+    run = _synthetic_run(tmp_path, timing=False, final=False, upto=3)
+    md = render_report(run)
+    assert "## Adoption path" in md                   # history alone is enough
+    t = _section(md, "Time use")
+    assert "predates the time keys" in t and "materialize" not in t
+    s = _section(md, "Residual misses")
+    assert "> Note:" in s and "round 2" in s          # the last round's diagnosis stands in
+    # without residual.json, size buckets still come from the FN rows' size_ratio (no denominators)
+    assert "small" in s
+
+
+def test_report_fallback_after_non_adopting_last_round_has_no_warning(tmp_path):
+    """If the last round adopted nothing, its diagnosis is the final champion's."""
+    run = _synthetic_run(tmp_path, timing=False, final=False)
+    s = _section(render_report(run), "Residual misses")
+    assert "round 3" in s and "> Note:" not in s
+
+
+def test_report_survives_history_only_run(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    rows = _history_rows(timing=False)
+    (run / "history.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n")
+    md = render_report(run)
+    assert "## Adoption path" in md
+    assert "No diagnosis artifacts" in md
+
+
+def test_report_section_error_is_contained(tmp_path, monkeypatch):
+    """One broken section does not stop the rest of the report."""
+    from agentic_configuration_search.diagnose import report as rep
+    run = _synthetic_run(tmp_path)
+
+    def boom(*a, **k):
+        raise KeyError("x")
+    monkeypatch.setattr(rep, "_time_section", boom)
+    md = render_report(run)
+    assert "## Time use" in md and "could not be generated" in md
+    assert "## Data collection suggestions" in md
+
+
+def test_axis_label_ignores_axes_turned_off():
+    from agentic_configuration_search.diagnose.report import _axis_label
+    assert _axis_label({"alias": "vlm", "lora": False, "rescorer": False}) == "alias"
+    assert _axis_label({"exemplar": "base", "exemplar_k": 2}) == "exemplar"
+    assert _axis_label({"tiling": False}) == "off:tiling"
+
+
+def test_samples_cover_kinds_round_robin():
+    from agentic_configuration_search.diagnose.report import _samples
+    rows = ([{"category": "c", "kind": "below_threshold", "image": f"b{i}.png",
+              "box": [0, 0, 50, 50]} for i in range(6)]
+            + [{"category": "c", "kind": "missed", "image": "m.png",
+                "box": [0, 0, 10, 10]}])
+    picked = _samples(rows, [])
+    assert len(picked) == 5 and picked[0]["kind"] == "missed"
