@@ -49,6 +49,11 @@ class PlannerCfg:
     # path). Images per call are batched; a failed batch degrades to no notes for
     # that batch only.
     crop_notes: bool = True
+    # When every candidate of a round is rejected before holdout (filters,
+    # screen), how many times to ask again in the same conversation within the
+    # same round — diagnosis and champion are reused. 0 turns it off. kind=llm
+    # only (the deterministic planner is not re-asked)
+    max_reasks: int = 1
     launch: VllmLaunchCfg = field(default_factory=VllmLaunchCfg)
 
     _NESTED: ClassVar[dict] = {"launch": VllmLaunchCfg}
@@ -65,6 +70,10 @@ class GateCfg:
 class SaturationCfg:
     rounds: int = 5                      # stop after this many consecutive stagnant rounds
     epsilon: float = 0.0                 # a round is stagnant if the Δ CI lower bound <= this
+    # Stop (stopped="empty_rounds") after this many consecutive rounds that
+    # measured nothing on holdout (even after re-asking). 0 turns it off — such
+    # rounds still count toward rounds
+    empty_rounds: int = 2
 
 
 @dataclass(frozen=True)
@@ -327,6 +336,12 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"gate.bootstrap: must be >= 1 ({cfg.gate.bootstrap})")
     if not (0.0 < cfg.gate.confidence < 1.0):
         raise ConfigError(f"gate.confidence: outside (0,1) ({cfg.gate.confidence})")
+    if cfg.saturation.empty_rounds < 0:
+        raise ConfigError("saturation.empty_rounds: must be >= 0 — 0 is off "
+                          f"({cfg.saturation.empty_rounds})")
+    if cfg.planner.max_reasks < 0:
+        raise ConfigError("planner.max_reasks: must be >= 0 — 0 is off "
+                          f"({cfg.planner.max_reasks})")
     if cfg.saturation.rounds < 1:
         raise ConfigError(f"saturation.rounds: must be >= 1 ({cfg.saturation.rounds})")
     if cfg.mine.exemplar_selection not in EXEMPLAR_SELECTIONS:

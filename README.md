@@ -143,8 +143,23 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   (numbers unchanged).
 - **decide** adopts a candidate only if the paired-bootstrap lower bound of its
   holdout Δ clears the margin; otherwise the champion stays.
+- **re-ask**: if every candidate is rejected before holdout (by the filters or
+  screen: `tiling_blocked`, `axis_unused`, `same_setting`, `no_material`, …),
+  the round is not closed — the planner is asked again within the same round
+  (`planner.max_reasks`, default 1, 0 = off). The follow-up carries each
+  candidate's rejection reason, note and served material; diagnosis and
+  champion are reused. Re-asked candidates go through the same filters, screen
+  and holdout and stay in the same round's history as `reask: k`. LLM planner
+  only (the deterministic planner is not re-asked).
 - **saturation** stops the run after `saturation.rounds` rounds without a
-  meaningful adoption, or when the planner has nothing left to try.
+  meaningful adoption, or when the planner has nothing left to try. A round
+  that measured nothing on holdout even after re-asking (an empty round) stops
+  the run earlier after `saturation.empty_rounds` (default 2, 0 = off)
+  consecutive ones (`stopped: "empty_rounds"`). Empty rounds are also stagnant
+  and count toward `saturation.rounds`.
+- **diagnosis reuse**: if the champion and config equal the previous round's,
+  the diagnosis (full train inference) and crop notes are not recomputed; the
+  previous round's are copied (`diagnosis_key.json`).
 - A round adopts one candidate, the one with the largest Δ. Candidates that
   passed the gate but lost to it are marked `gate_passed_but_lost` and carried
   into the next round as `carry_<id>`: the axes they changed are applied on top
@@ -196,7 +211,8 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   Filling them from the baseline would evaluate the champion with its axes
   silently off.
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
-  Prompts and responses are saved, so `--resume` replays them without the LLM.
+  Prompts and responses are saved, so `--resume` replays them without the LLM
+  (same-round re-asks too, `proposal_reask<k>.json`).
   The prompt is rebuilt every round; when it exceeds the estimated-token budget
   (server context − output cap), the history window shrinks first. Response
   length is bounded by the schema (rationale, id, candidate count). One call
@@ -214,11 +230,12 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 
 ```
 runs/<dataset>/run/
-  history.jsonl        # round ledger (per-candidate wall_min, per-round pass_cache counts)
-  run_summary.json     # stop reason, final champion, holdout_split
+  history.jsonl        # round ledger (per-candidate wall_min and reask, per-round pass_cache counts)
+  run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion, holdout_split
   champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image)
   champion_eval.json   # champion holdout evaluation, incl. tau_test
-  rounds/round_NNN/    # proposal, settings/<cand>/ materials, screen, eval, decision, diagnosis
+  rounds/round_NNN/    # proposal (+ proposal_reask<k>), settings/<cand>/ materials, screen, eval,
+                       # decision, diagnosis (+ diagnosis_key), crop_notes
 ```
 
 ### Prediction

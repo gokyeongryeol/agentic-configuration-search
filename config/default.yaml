@@ -25,6 +25,7 @@ planner:
   base_url: null                          # running vLLM endpoint. null = start via launch (attach if persist)
   crop_notes: true                        # show the VLM crops of every prompt sample and merge its descriptions into the diagnosis
                                           # (kind=llm only, diagnostic signal only — never on the decision path)
+  max_reasks: 1                           # re-asks within the round when every candidate is rejected before holdout (0=off, kind=llm only)
   launch:                                 # vLLM launch parameters when kind=llm and base_url is null
     gpu: 3
     port: 8104
@@ -43,6 +44,7 @@ gate:                                     # adoption gate
 saturation:                               # stopping rule
   rounds: 5                               # stop after this many consecutive stalled rounds
   epsilon: 0.0                            # a round is stalled if the Δ CI lower bound is ≤ this
+  empty_rounds: 2                         # stop after this many consecutive rounds that measured nothing on holdout (0=off)
 
 screen:
   top_k: 2                                # candidates promoted to holdout after fit_dev scoring

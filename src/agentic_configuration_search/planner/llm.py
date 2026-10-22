@@ -27,6 +27,9 @@ from .gates import tiling_gate, under_champion
 log = logging.getLogger(__name__)
 
 ARTIFACT = "proposal.json"
+# Proposals re-asked within the same round (k = 1, 2, …) — the same replay
+# contract as proposal.json
+REASK_ARTIFACT = "proposal_reask{k}.json"
 
 SYSTEM = ("You plan the next inference-setting experiments for an open-vocabulary "
           "object detector. Answer with JSON only.")
@@ -459,6 +462,28 @@ def _drop_carried(candidates: list[dict], carried_keys: set,
     return keep, dups
 
 
+def _outcome_lines(rows: list[dict], champion: dict) -> list[str]:
+    """Candidate lines of the re-ask message — the increment (by request), the
+    rejection reason, the start of the note, and when present the served
+    material (same_setting) and unused axes."""
+    lines = []
+    for c in rows[:MAX_REASK_LINES]:
+        delta = _delta_axes(c.get("requested_axes") or c.get("axes"), champion)
+        line = (f"- {c.get('id')} ("
+                + (", ".join(f"{a}={v}" for a, v in sorted(delta.items()))
+                   or "no change") + f"): skipped={c.get('skipped')}")
+        if c.get("unused_axes"):
+            line += f", unused_axes={c['unused_axes']}"
+        if c.get("note"):
+            line += f" — {str(c['note'])[:MAX_NOTE]}"
+        if c.get("material"):
+            line += f" [served material: {c['material']}]"
+        lines.append(line)
+    if len(rows) > MAX_REASK_LINES:
+        lines.append(f"- … and {len(rows) - MAX_REASK_LINES} more")
+    return lines
+
+
 def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dict]:
     """Per round: trajectory, candidate deltas, and verdicts only — large
     record-like fields are left out.
@@ -683,6 +708,22 @@ FOLLOWUP = """{n} of your candidates repeated re-queued ones that are queued any
 so they were dropped. Kept from your answer: {kept}. Propose up to {k} further
 candidates that differ from both, under the same rules, in the same JSON format."""
 
+# Follow-up asked in the same conversation when every candidate of the round
+# was rejected before holdout (up to planner.max_reasks times, by the runner).
+# It carries what happened to each candidate.
+REASK = """None of the candidates so far this round reached the held-out evaluation,
+so the round has measured nothing yet. What happened to each (difference from
+the current champion, then why it was dropped):
+{outcomes}
+Propose up to {k} new candidates that differ from all of the above and from the
+already-tried combinations, under the same rules, in the same JSON format. Avoid
+the same failure: a folded tiling grid is blocked, an axis the screen left unused
+stays unused for other values of it, and a quantity whose material collapsed to
+the same setting collapses again. If nothing promising remains, return stop=true
+with no candidates."""
+
+MAX_REASK_LINES = 24     # cap on candidate lines in the re-ask message
+
 # Inserted only when dataset_notes (config) is set — otherwise notes_block=""
 # and the prompt is byte-identical to the no-notes form (pinned by
 # tests/test_planner.py).
@@ -736,7 +777,7 @@ class LLMPlanner:
         # filtered from the response — None means the full value space
         self.facts = facts
 
-    def _refill(self, build, window, raw, dups, candidates, champion, carried_keys,
+    def _refill(self, build, raw, dups, candidates, champion, carried_keys,
                 dropped, carried_ids) -> dict:
         """Ask once more, in the same conversation, for the slots freed by
         candidates that repeated carried ones (extends candidates and dropped in
@@ -744,7 +785,7 @@ class LLMPlanner:
 
         The conversation grows by the first response and the follow-up message —
         if the first prompt nearly filled the budget, shrink the history window
-        (build) to fit. With dups present there is at least one free slot."""
+        (build) to fit (_fit). With dups present there is at least one free slot."""
         k = self.max_candidates - len(candidates)
 
         def delta(c):
@@ -755,10 +796,7 @@ class LLMPlanner:
                                k=k)
         tail = [{"role": "assistant", "content": json.dumps(raw, ensure_ascii=False)},
                 {"role": "user", "content": note}]
-        msgs = build(window) + tail
-        while _est_tokens(msgs) > self.token_budget and window > 0:
-            window -= 1
-            msgs = build(window) + tail
+        msgs, window = self._fit(build, tail)
         record = {"message": note, "response": None, "error": None, "window": window}
         if _est_tokens(msgs) > self.token_budget:
             record["error"] = "over the prompt budget — not asking again"
@@ -801,18 +839,27 @@ class LLMPlanner:
     def artifact_path(self) -> Path:
         return self.artifact_dir / ARTIFACT
 
-    def propose(self, history: list[dict], diagnosis: dict) -> dict:
-        if self.artifact_path.exists():
-            # replay — zero LLM calls (resume contract)
-            log.info("proposal replay: %s", self.artifact_path)
-            stored = json.loads(self.artifact_path.read_text())
-            out = {k: stored[k] for k in ("planner", "candidates", "stop")}
-            # Restore the drop record too — so a resumed run does not silently
-            # lose budget where a fresh one would not. Old artifacts without
-            # the field read as an empty list.
-            out["dropped"] = stored.get("dropped") or []
-            return out
+    def reask_path(self, k: int) -> Path:
+        return self.artifact_dir / REASK_ARTIFACT.format(k=k)
 
+    @staticmethod
+    def _replay(path: Path) -> dict:
+        """Replay a stored proposal — zero LLM calls (resume contract). The drop
+        record is restored too — so a resumed run does not silently lose budget
+        where a fresh one would not. Old artifacts without it read as an empty
+        list."""
+        log.info("proposal replay: %s", path)
+        stored = json.loads(path.read_text())
+        out = {k: stored[k] for k in ("planner", "candidates", "stop")}
+        out["dropped"] = stored.get("dropped") or []
+        return out
+
+    def _builder(self, history: list[dict], diagnosis: dict):
+        """(build, carried) — build(window, strip=False) is the first prompt
+        assembled with history window `window`. strip removes the diagnosis
+        detail (samples), the last line of defense. propose and reask must
+        assemble the same prompt for a re-ask to continue the same
+        conversation."""
         champion = (history[-1].get("champion", {}).get("axes")
                     if history else None) or {}
         axes_doc = "\n".join(
@@ -824,7 +871,7 @@ class LLMPlanner:
             f"{k}={x!r}" for k, xs in sorted(self.disabled_values.items())
             for x in xs]
         compact = _compact_diagnosis(diagnosis)
-        diag_json = json.dumps(compact, ensure_ascii=False, default=str)
+        diag_full = json.dumps(compact, ensure_ascii=False, default=str)
         tried_lines = _tried_lines(history, champion)
         leverage_lines = [
             ln for ln in _leverage_lines(diagnosis)
@@ -838,7 +885,9 @@ class LLMPlanner:
                                  sorted(_delta_axes(c["axes"], champion).items()))
                        for c in carried]
 
-        def build(window: int) -> list[dict]:
+        def build(window: int, strip: bool = False) -> list[dict]:
+            diag_json = (json.dumps(_strip_samples(compact), ensure_ascii=False,
+                                    default=str) if strip else diag_full)
             return [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": PROMPT.format(
@@ -866,18 +915,112 @@ class LLMPlanner:
                                  if self.notes else ""),
                     max_candidates=self.max_candidates)},
             ]
+        return build, carried
 
-        # Budget guard — drop the oldest rounds first. If still over at
-        # window=0, strip diagnosis samples as the last line of defense.
+    def _fit(self, build, tail: list[dict] = ()) -> tuple[list[dict], int]:
+        """Budget guard — drop the oldest rounds first. If still over at window=0,
+        strip the diagnosis samples as the last line of defense. tail is the end
+        of the conversation (earlier responses, follow-up messages) — it counts
+        toward the budget too."""
+        tail = list(tail)
         window = MAX_HISTORY
-        messages = build(window)
+        messages = build(window) + tail
         while _est_tokens(messages) > self.token_budget and window > 0:
             window -= 1
-            messages = build(window)
+            messages = build(window) + tail
         if _est_tokens(messages) > self.token_budget:
-            diag_json = json.dumps(_strip_samples(compact),
-                                   ensure_ascii=False, default=str)
-            messages = build(0)
+            messages = build(0, strip=True) + tail
+        return messages, window
+
+    def reask(self, history: list[dict], diagnosis: dict, outcomes: list[dict], *,
+              k: int, taken: set) -> dict | None:
+        """The k-th re-ask of the round — called by the runner when every
+        candidate was rejected before holdout. history and diagnosis are exactly
+        what propose got (diagnosis and champion are not recomputed). outcomes
+        are this round's rejection rows (history-row shape), and taken holds the
+        candidate ids already used this round — a repeated id would collide in
+        materials directories and history rows, so _free_id renames it.
+
+        Continues the conversation of the first proposal (proposal.json) and the
+        earlier re-asks, and stores the result as proposal_reask<k>.json — resume
+        replays it (zero calls). Without a first response (the call failed and
+        the round fell back to deterministic) there is no conversation to
+        continue, so it does not ask (None). A failed call is an empty proposal —
+        not filled by the deterministic fallback (this round's first proposal
+        already ran)."""
+        path = self.reask_path(k)
+        if path.exists():
+            return self._replay(path)
+        first = (json.loads(self.artifact_path.read_text())
+                 if self.artifact_path.exists() else {})
+        if first.get("response") is None:
+            log.info("re-ask skipped — no first planner response (fallback round)")
+            return None
+
+        def said(raw):
+            return {"role": "assistant",
+                    "content": json.dumps(raw, ensure_ascii=False, default=str)}
+        tail = [said(first["response"])]
+        follow = first.get("followup") or {}
+        if follow.get("response") is not None:
+            tail += [{"role": "user", "content": follow["message"]},
+                     said(follow["response"])]
+        for j in range(1, k):
+            prev = (json.loads(self.reask_path(j).read_text())
+                    if self.reask_path(j).exists() else {})
+            if prev.get("response") is not None:
+                tail += [{"role": "user", "content": prev["message"]},
+                         said(prev["response"])]
+
+        champion = (history[-1].get("champion", {}).get("axes")
+                    if history else None) or {}
+        message = REASK.format(outcomes="\n".join(_outcome_lines(outcomes, champion))
+                               or "- (none)", k=self.max_candidates)
+        tail.append({"role": "user", "content": message})
+        build, _ = self._builder(history, diagnosis)
+        messages, window = self._fit(build, tail)
+        record = {"reask": k, "message": message, "response": None, "error": None,
+                  "window": window}
+        raw = None
+        if _est_tokens(messages) > self.token_budget:
+            record["error"] = "over the prompt budget — not asking again"
+        else:
+            try:
+                raw = self.chat(messages, schema=_schema(self.max_candidates),
+                                max_tokens=OUTPUT_MAX_TOKENS)
+            except Exception as exc:  # noqa: BLE001 — the re-ask is a bonus
+                record["error"] = f"{type(exc).__name__}: {exc}"
+                log.warning("re-ask %d failed (%s) — closing the round", k, record["error"])
+        record["response"] = raw
+        taken = set(taken)
+        renamed = []
+        for i, c in enumerate((raw or {}).get("candidates") or []):
+            if isinstance(c, dict):
+                c = {**c, "id": _free_id(str(c.get("id") or f"reask{k}_{i}"), taken)}
+                taken.add(c["id"])
+            renamed.append(c)
+        dropped: list[dict] = []
+        candidates = sanitize_candidates(renamed, max_candidates=self.max_candidates,
+                                         dropped=dropped,
+                                         disabled_axes=self.disabled_axes,
+                                         disabled_values=self.disabled_values,
+                                         base=champion or None, facts=self.facts)
+        stop = bool((raw or {}).get("stop")) and not candidates
+        proposal = {"planner": "llm", "candidates": candidates, "stop": stop,
+                    "dropped": dropped}
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({**proposal, "prompt": messages, **record},
+                                   indent=2, ensure_ascii=False, default=str))
+        return proposal
+
+    def propose(self, history: list[dict], diagnosis: dict) -> dict:
+        if self.artifact_path.exists():
+            return self._replay(self.artifact_path)
+
+        champion = (history[-1].get("champion", {}).get("axes")
+                    if history else None) or {}
+        build, carried = self._builder(history, diagnosis)
+        messages, window = self._fit(build)
         if window < MAX_HISTORY:
             log.info("prompt budget (estimated %d tokens) — history window shrunk %d→%d rounds",
                      self.token_budget, MAX_HISTORY, window)
@@ -904,7 +1047,7 @@ class LLMPlanner:
         candidates, dups = _drop_carried(candidates, carried_keys, dropped)
         followup = None
         if dups and raw is not None and not raw.get("stop"):
-            followup = self._refill(build, window, raw, dups, candidates, champion,
+            followup = self._refill(build, raw, dups, candidates, champion,
                                     carried_keys, dropped,
                                     [c["id"] for c in carried])
         if dropped:

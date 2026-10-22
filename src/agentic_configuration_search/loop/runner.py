@@ -17,10 +17,12 @@ are not adopted.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -47,13 +49,29 @@ from .materialize import materialize
 
 log = logging.getLogger(__name__)
 
+# Round diagnosis artifacts — file names as before (diagnosis_test is the legacy
+# name of the holdout diagnosis)
+DIAG_FILES = ("diagnosis_train.json", "diagnosis_test.json")
+DIAG_KEY = "diagnosis_key.json"       # fingerprint of the diagnosis inputs — the next round reuses it if equal
+
 @dataclass
 class RunResult:
     out_dir: Path
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     champion: dict | None = None
-    stopped: str = "rounds"           # rounds | saturation | planner_stop
+    stopped: str = "rounds"           # rounds | saturation | empty_rounds | planner_stop
+
+
+@dataclass
+class _RoundAcc:
+    """State accumulated across a round's attempts (the first proposal + re-asks)."""
+    served_w: object = None              # weights the detector has loaded now
+    served_a: object = None              # reclassification artifact the detector has loaded now
+    skipped: list = field(default_factory=list)
+    screened: list = field(default_factory=list)
+    evaluated: list = field(default_factory=list)
+    n_runnable: int = 0                  # candidates that reached wiring (filter/wiring drops excluded)
 
 
 def _slug(text: str) -> str:
@@ -257,9 +275,71 @@ class Loop:
                           else ()),
             tiling_variants=_tiling_variants(s, axes))
 
-    def _diagnosis(self, champion: dict, round_dir: Path) -> dict:
+    def _diagnosis_key(self, champion: dict) -> dict:
+        """Fingerprint of the diagnosis inputs — the champion (its whole served
+        state and holdout thresholds) and the config.
+
+        The config is hashed whole except rounds and out_dir, which do not reach
+        the diagnosis — picking which keys reach it (inference, cause
+        classification, crop notes) and missing one would reuse a stale
+        diagnosis, so the key errs wide and recomputes when in doubt."""
+        cfg = dataclasses.asdict(self.cfg)
+        for k in ("rounds", "out_dir"):
+            cfg.pop(k, None)
+        ev = champion["eval"]
+        key = {"champion": {k: champion.get(k) for k in
+                            ("round", "id", "materials_dir", "weights",
+                             "adapt_root", "rescorer_path")}
+               | {"micro_f_beta": ev["micro_f_beta"], "tau_test": ev["tau_test"]},
+               "config": hashlib.sha256(json.dumps(
+                   cfg, sort_keys=True, default=str).encode()).hexdigest()}
+        # normalize through a JSON round trip — compare in the stored key's shape
+        # (string keys, paths)
+        return json.loads(json.dumps(key, sort_keys=True, default=str))
+
+    def _reuse_diagnosis(self, key: dict, round_dir: Path,
+                         prev: Path | None) -> dict | None:
+        """Use an existing diagnosis of the same inputs — this round's directory
+        first (resuming an interrupted round), then the previous round's. From
+        the previous round, the diagnosis, crop notes and key are copied into
+        this round's directory (_crop_notes replays the notes). Rounds under an
+        unchanged champion would otherwise repeat the full train inference and
+        the VLM notes — the diagnosis is a function of the champion and config
+        alone."""
+        for src in (round_dir, prev):
+            if src is None or not (src / DIAG_KEY).exists() or not all(
+                    (src / name).exists() for name in DIAG_FILES):
+                continue
+            if json.loads((src / DIAG_KEY).read_text()) != key:
+                continue
+            if src != round_dir:
+                # the key goes last — dying mid-copy leaves no key, so it is recomputed
+                for name in DIAG_FILES + (describe.ARTIFACT, DIAG_KEY):
+                    if (src / name).exists():
+                        shutil.copyfile(src / name, round_dir / name)
+                    elif name == describe.ARTIFACT:
+                        (round_dir / name).unlink(missing_ok=True)
+            log.info("diagnosis reused: %s — same champion %s (round %s) and config",
+                     src.name, key["champion"]["id"], key["champion"]["round"])
+            return {"train": json.loads((round_dir / DIAG_FILES[0]).read_text()),
+                    "test": json.loads((round_dir / DIAG_FILES[1]).read_text())}
+        return None
+
+    def _diagnosis(self, champion: dict, round_dir: Path,
+                   prev: Path | None = None) -> dict:
         """Diagnosis on train (detailed) + holdout (anonymized aggregates) — the
-        planner's input. (Artifact key/file name "test" is legacy.)"""
+        planner's input. (Artifact key/file name "test" is legacy.)
+
+        If a diagnosis with the same inputs (_diagnosis_key) exists in this round
+        or the previous one (prev), it is not recomputed (_reuse_diagnosis)."""
+        key = self._diagnosis_key(champion)
+        reused = self._reuse_diagnosis(key, round_dir, prev)
+        if reused is not None:
+            return reused
+        # with no key, or notes from another diagnosis left over, delete them so
+        # they are not replayed
+        (round_dir / describe.ARTIFACT).unlink(missing_ok=True)
+        (round_dir / DIAG_KEY).unlink(missing_ok=True)
         tau = champion["eval"]["tau_test"]
         train = self.ds.train
         paths = [train.image_path(e) for e in train.images]
@@ -296,8 +376,9 @@ class Loop:
                           champion["eval"]["floor_records"], tau,
                           self.ds.ontology, iou_thr=self.iou, anonymize=True,
                           **small)
-        _write(round_dir / "diagnosis_train.json", d_train)
-        _write(round_dir / "diagnosis_test.json", d_test)
+        _write(round_dir / DIAG_FILES[0], d_train)
+        _write(round_dir / DIAG_FILES[1], d_test)
+        _write(round_dir / DIAG_KEY, key)          # last — only once the diagnosis is fully written
         return {"train": d_train, "test": d_test}
 
     def _planner_chat(self):
@@ -328,21 +409,23 @@ class Loop:
         if notes:
             diagnosis["train"]["crop_notes"] = notes
 
+    def _llm_planner(self, round_dir: Path) -> LLMPlanner:
+        chat = self._planner_chat()
+        if chat is None:
+            raise ValueError("planner.kind=llm requires planner.base_url or "
+                             "an injected llm_chat")
+        return LLMPlanner(chat=chat, artifact_dir=round_dir,
+                          notes=self.cfg.dataset_notes,
+                          token_budget=_token_budget(self.cfg),
+                          disabled_axes=self.disabled_axes,
+                          disabled_values=self.disabled_values,
+                          facts=self._facts(),
+                          tiling_overlap=self.cfg.search.tiling_overlap)
+
     def _propose(self, history: list[dict], diagnosis: dict,
                  round_dir: Path) -> dict:
         if self.cfg.planner.kind == "llm":
-            chat = self._planner_chat()
-            if chat is None:
-                raise ValueError("planner.kind=llm requires planner.base_url or "
-                                 "an injected llm_chat")
-            proposal = LLMPlanner(chat=chat, artifact_dir=round_dir,
-                                  notes=self.cfg.dataset_notes,
-                                  token_budget=_token_budget(self.cfg),
-                                  disabled_axes=self.disabled_axes,
-                                  disabled_values=self.disabled_values,
-                                  facts=self._facts(),
-                                  tiling_overlap=self.cfg.search.tiling_overlap).propose(
-                history, diagnosis)
+            proposal = self._llm_planner(round_dir).propose(history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              disabled_axes=self.disabled_axes,
@@ -359,8 +442,54 @@ class Loop:
         # below still applies)
         carried = deterministic.carryover(history, self.disabled_axes,
                                           self.disabled_values, facts=self._facts())
-        merged = proposal["candidates"] + humans + carried
+        fresh, dropped = self._filter(proposal["candidates"] + humans + carried,
+                                      history)
+        # merge with planner-stage drops (invalid_axes etc.) — overwriting would
+        # erase candidates discarded by sanitization from history.
+        return {**proposal, "candidates": fresh,
+                "dropped": (list(proposal.get("dropped") or [])
+                            + human_dropped + dropped),
+                "stop": proposal["stop"] and not fresh}
 
+    def _reask(self, k: int, r: int, history: list[dict], diagnosis: dict,
+               round_dir: Path, champion: dict, acc: "_RoundAcc") -> dict | None:
+        """The k-th re-ask of the round — when every candidate so far was rejected
+        before holdout. Diagnosis and champion are this round's.
+
+        Re-asked candidates go through the shared filter too. The history it
+        sees gets this round's rows so far appended — a combination proposed
+        earlier in the round is combo_tried, and a grid at or above one just
+        left unused is tiling_blocked. Human and carried candidates already ran
+        with the first proposal and are not added again. Candidate and drop rows
+        get reask=k.
+
+        The deterministic planner is not re-asked (None) — it is the fixed path
+        and the A/B control. Neither is the LLM when its first call failed and
+        there is no conversation to continue."""
+        if self.cfg.planner.kind != "llm":
+            return None
+        rows = acc.skipped + [{k_: c[k_] for k_ in ("id", "axes")} | _requested(c)
+                              | _unused_record(c) | _tiling_record(c)
+                              for c in acc.screened]
+        proposal = self._llm_planner(round_dir).reask(
+            history, diagnosis, acc.skipped, k=k, taken={c["id"] for c in rows})
+        if proposal is None:              # no conversation to continue (first call failed)
+            return None
+        for c in proposal["candidates"] + proposal["dropped"]:
+            c["reask"] = k
+        so_far = history + [{"round": r, "champion": _champion_summary(champion),
+                             "candidates": rows}]
+        fresh, dropped = self._filter(proposal["candidates"], so_far)
+        log.info("round %d: no candidate reached holdout, re-asked (%d) — %d new candidates",
+                 r, k, len(fresh))
+        return {**proposal, "candidates": fresh,
+                "dropped": proposal["dropped"] + dropped,
+                "stop": proposal["stop"] and not fresh}
+
+    def _filter(self, merged: list[dict],
+                history: list[dict]) -> tuple[list[dict], list[dict]]:
+        """(kept, dropped) — the source-independent shared filter
+        (tiling_blocked, combo_tried)."""
         # Common combo filter: regardless of source (LLM, deterministic, human),
         # block retrying **an already-tried full axes combination**. It works per
         # combination, not per (axis, value), so retrying the same axis after the
@@ -392,12 +521,7 @@ class Loop:
         if dropped:
             log.info("filtered %d already-tried combinations: %s", len(dropped),
                      [c["id"] for c in dropped])
-        # merge with planner-stage drops (invalid_axes etc.) — overwriting would
-        # erase candidates discarded by sanitization from history.
-        return {**proposal, "candidates": fresh,
-                "dropped": (list(proposal.get("dropped") or [])
-                            + human_dropped + dropped),
-                "stop": proposal["stop"] and not fresh}
+        return fresh, dropped
 
     def _facts(self) -> DatasetFacts:
         """Facts that let sanitization block candidates whose outcome the data already decides."""
@@ -668,7 +792,13 @@ class Loop:
         return champion
 
     def run_round(self, r: int, champion: dict, history: list[dict]) -> tuple[dict, dict]:
-        """One round — returns (decision, champion)."""
+        """One round — returns (decision, champion).
+
+        If every candidate of the first proposal is rejected before holdout
+        (filters, screen), the planner is asked again within the same round (up
+        to planner.max_reasks times — _reask). Diagnosis and champion are reused,
+        and re-asked candidates go through the same path and are recorded in the
+        same round."""
         self._round_t0 = time.monotonic()
         self._pass_t0 = gateway.pass_cache_stats()
         self._champion = champion          # parent for material inheritance
@@ -677,12 +807,144 @@ class Loop:
         self._tried_fps = _evaluated_fps(history)
         rd = self._round_dir(r)
         rd.mkdir(parents=True, exist_ok=True)
-        diagnosis = self._diagnosis(champion, rd)
+        diagnosis = self._diagnosis(champion, rd,
+                                    prev=self._round_dir(r - 1) if r > 1 else None)
         self._crop_notes(diagnosis, rd)      # merge VLM notes (diagnostic signal only)
         proposal = self._propose(history, diagnosis, rd)
+        # served_* is what the detector has loaded right now — detector-state
+        # candidates swap it in turn
+        acc = _RoundAcc(served_w=champion.get("weights"),
+                        served_a=champion.get("adapt_root"))
+        self._attempt(rd, champion, proposal, acc)
+        reasks = 0
+        while (not acc.evaluated and not proposal["stop"]
+               and reasks < self.cfg.planner.max_reasks):
+            nxt = self._reask(reasks + 1, r, history, diagnosis, rd, champion, acc)
+            if nxt is None:
+                break
+            reasks += 1
+            proposal = nxt
+            self._attempt(rd, champion, proposal, acc)
+        skipped, screened, evaluated = acc.skipped, acc.screened, acc.evaluated
+        served_w, served_a = acc.served_w, acc.served_a
+        reask_mark = {"reasks": reasks} if reasks else {}
 
+        if not acc.n_runnable:
+            decision = {"round": r, "adopted": False,
+                        "kind": ("planner_stop" if proposal["stop"] else "no_candidates"),
+                        "skipped": [c["id"] for c in skipped]} | reask_mark
+            _write(rd / "decision.json", decision)
+            self._append_history({
+                "round": r,
+                "champion": _champion_summary(champion),
+                "candidates": skipped, "decision": decision})
+            return decision, champion
+
+        _write(rd / "screen.json",
+               [{k: c[k] for k in ("id", "axes", "fit_dev_micro_f_beta")}
+                for c in screened])
+        # keep records too — re-judging past runs after changing gate criteria
+        # (one/two-sided, alpha, margin) needs more than the champion's records.
+        _write(rd / "eval.json",
+               [{"id": c["id"], "axes": c["axes"],
+                 "micro_f_beta": c["eval"]["micro_f_beta"],
+                 "tau_test": c["eval"]["tau_test"], "gate": c["gate"],
+                 "records": c["eval"]["records"]}
+                for c in evaluated])
+
+        winners = [c for c in evaluated if c["gate"]["adopted"]]
+        winner = max(winners, key=lambda c: c["gate"]["delta"]) if winners else None
+        # passed the gate but lost to a winner with a larger Δ — carried to the next round
+        lost = {c["id"] for c in winners if c is not winner}
+        decision = {
+            "round": r, "adopted": winner is not None,
+            "id": winner["id"] if winner else None,
+            "screened": [c["id"] for c in screened],
+            "evaluated": {c["id"]: {"micro_f_beta": c["eval"]["micro_f_beta"],
+                                    "gate": {k: c["gate"][k] for k in
+                                             ("delta", "lo", "hi", "adopted")}}
+                          for c in evaluated},
+            "skipped": [c["id"] for c in skipped],
+        } | reask_mark
+        if proposal["stop"]:
+            # the planner declared "nothing to try" while re-asked — this round
+            # measured nothing (which is why it was re-asked) and the run stops here
+            decision["kind"] = "planner_stop"
+        if winner:
+            w_axes, _ = _winner_axes(winner)     # defensive rescorer label reconciliation
+            # downstream inheritance: a classifier-arm winner keeps its own artifact;
+            # any other winner (lora included) inherits the champion's as-is.
+            adapt_root = winner.get("_adapt_root", champion.get("adapt_root"))
+            if not adapt_root:
+                w_axes["crop_classifier"] = False
+            # The champion can lose the rescorer in two ways that mean different things:
+            # (1) the candidate never requested it — the planner's choice;
+            # (2) it was requested but the refit on the arm was identity — a label correction.
+            # Without distinguishing them, the ledger would record (1) as a correction.
+            if champion["axes"].get("rescorer") and not w_axes.get("rescorer"):
+                asked = winner.get("rescorer_refit") == "identity"
+                decision["rescorer_dropped_by"] = "refit_identity" if asked \
+                    else "proposal"
+                decision["note"] = (
+                    "rescorer re-fit on the winning arm is identity (α=0 for all classes) — "
+                    "champion label corrected" if asked else
+                    "winner did not request the rescorer — champion loses that layer")
+            champion = {"round": r, "id": winner["id"], "axes": w_axes,
+                        "setting": winner["setting"],
+                        "materials_dir": winner["materials_dir"],
+                        "eval": winner["eval"],
+                        # a detector-state winner keeps its own; otherwise inherit current
+                        "weights": winner.get("_weights", champion.get("weights")),
+                        "adapt_root": adapt_root,
+                        "rescorer_path": winner.get("rescorer_path")}
+            self._save_champion(champion)
+            decision["micro_f_beta"] = winner["eval"]["micro_f_beta"]
+        # Bring the detector to the final champion's state. Detector-state
+        # candidates swap it in turn, so the last candidate's state is not
+        # necessarily the winner's — a lora winner may have been unloaded before
+        # the classifier candidates.
+        if not _same_state(served_w, champion.get("weights")):
+            self.detector_hooks["weights_ctl"](champion.get("weights"))
+        if not _same_state(served_a, champion.get("adapt_root")):
+            self._adapt_ctl(champion.get("adapt_root"))
+        _write(rd / "decision.json", decision)
+        self._append_history({
+            "round": r,
+            "champion": _champion_summary(champion),
+            "candidates": ([{k: c[k] for k in ("id", "axes")}
+                            | {"adopted": bool(winner and c["id"] == winner["id"]),
+                               "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
+                            | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
+                            | ({"prescreen": c["prescreen"]} if c.get("prescreen") else {})
+                            | _unused_record(c) | _reask_record(c)
+                            | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
+                            | _modality_record(c["setting"], self.ds.ontology)
+                            | {"forwards": setting_forwards(c["setting"])}
+                            | ({"wall_min": _wall_min(c["_wall"])}
+                               if c.get("_wall") else {})
+                            | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
+                            | ({"source": c["source"]} if c.get("source") else {})
+                            for c in screened] + skipped),
+            "decision": decision})
+        return decision, champion
+
+    def _gate(self, champion: dict, ev: dict) -> dict:
+        return gate(champion["eval"]["records"], ev["records"],
+                    cat_ids=self.cat_ids, iou_thr=self.iou,
+                    margin=self.cfg.gate.margin,
+                    n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
+                    alpha=1.0 - self.cfg.gate.confidence,
+                    beta=self.cfg.beta)
+
+    def _attempt(self, rd: Path, champion: dict, proposal: dict,
+                 acc: "_RoundAcc") -> None:
+        """Run one proposal's candidates (the first one or a re-ask) through
+        wiring, screen and holdout, accumulating into acc. The decision is made
+        once at the end of the round."""
+
+        skipped = acc.skipped
+        skipped.extend(proposal.get("dropped", []))   # include combo_tried records
         wired, lora_cands, classifier_cands = [], [], []
-        skipped = list(proposal.get("dropped", []))   # include combo_tried records
         n_filtered = len(skipped)                     # up to here: filter drops, not wiring
         champ_axes = champion.get("axes") or {}
         for c in proposal["candidates"]:
@@ -727,15 +989,8 @@ class Loop:
                         [c["id"] for c in skipped[n_filtered:]])
 
         if not wired and not lora_cands and not classifier_cands:
-            decision = {"round": r, "adopted": False,
-                        "kind": ("planner_stop" if proposal["stop"] else "no_candidates"),
-                        "skipped": [c["id"] for c in skipped]}
-            _write(rd / "decision.json", decision)
-            self._append_history({
-                "round": r,
-                "champion": _champion_summary(champion),
-                "candidates": skipped, "decision": decision})
-            return decision, champion
+            return
+        acc.n_runnable += len(wired) + len(lora_cands) + len(classifier_cands)
 
         screened = []
         for c in wired:
@@ -749,21 +1004,11 @@ class Loop:
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
             _close_wall(entry["_wall"], t0, skipped[n_skip:])
-        _write(rd / "screen.json",
-               [{k: c[k] for k in ("id", "axes", "fit_dev_micro_f_beta")}
-                for c in screened])
 
         top = sorted(screened, key=lambda c: -c["fit_dev_micro_f_beta"])
         top = top[: self.cfg.screen.top_k]
-        evaluated = []
-
-        def _gate(ev):
-            return gate(champion["eval"]["records"], ev["records"],
-                        cat_ids=self.cat_ids, iou_thr=self.iou,
-                        margin=self.cfg.gate.margin,
-                        n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
-                        alpha=1.0 - self.cfg.gate.confidence,
-                        beta=self.cfg.beta)
+        evaluated = acc.evaluated
+        _gate = lambda ev: self._gate(champion, ev)  # noqa: E731
 
         for c in top:
             t0 = time.monotonic()
@@ -776,8 +1021,7 @@ class Loop:
         # function is not tied to the detector's score distribution, and removing
         # it would make lora fight carrying a handicap equal to its gain.
         # served_* is what the detector has loaded right now (updated per candidate).
-        served_w = champion.get("weights")
-        served_a = champion.get("adapt_root")
+        served_w, served_a = acc.served_w, acc.served_a
         for c in lora_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
@@ -824,7 +1068,7 @@ class Loop:
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
                             | _requested(entry) | _unused_record(entry)
-                            | {"_wall": wall})
+                            | _reask_record(entry) | {"_wall": wall})
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", ""),
@@ -838,14 +1082,6 @@ class Loop:
             evaluated.append({**entry, "_materials": materials,
                               "_weights": str(res["weights"]),
                               "eval": ev, "gate": _gate(ev)})
-        # keep records too — re-judging past runs after changing gate criteria
-        # (one/two-sided, alpha, margin) needs more than the champion's records.
-        _write(rd / "eval.json",
-               [{"id": c["id"], "axes": c["axes"],
-                 "micro_f_beta": c["eval"]["micro_f_beta"],
-                 "tau_test": c["eval"]["tau_test"], "gate": c["gate"],
-                 "records": c["eval"]["records"]}
-                for c in evaluated])
 
         # --- crop classifier candidates — detector-state candidates, same discipline as lora ---
         # Measure them on the champion's weights. If a winning lora arm stayed
@@ -893,7 +1129,7 @@ class Loop:
                               "fit_dev_micro_f_beta")}
                             | {"crop_classifier": res["decision"]}
                             | _requested(entry) | _unused_record(entry)
-                            | {"_wall": wall})
+                            | _reask_record(entry) | {"_wall": wall})
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -913,78 +1149,8 @@ class Loop:
             evaluated.append({**entry, "_materials": materials,
                               "_adapt_root": str(res["adapt_root"]),
                               "eval": ev, "gate": _gate(ev)})
-
-        winners = [c for c in evaluated if c["gate"]["adopted"]]
-        winner = max(winners, key=lambda c: c["gate"]["delta"]) if winners else None
-        # passed the gate but lost to a winner with a larger Δ — carried to the next round
-        lost = {c["id"] for c in winners if c is not winner}
-        decision = {
-            "round": r, "adopted": winner is not None,
-            "id": winner["id"] if winner else None,
-            "screened": [c["id"] for c in screened],
-            "evaluated": {c["id"]: {"micro_f_beta": c["eval"]["micro_f_beta"],
-                                    "gate": {k: c["gate"][k] for k in
-                                             ("delta", "lo", "hi", "adopted")}}
-                          for c in evaluated},
-            "skipped": [c["id"] for c in skipped],
-        }
-        if winner:
-            w_axes, _ = _winner_axes(winner)     # defensive rescorer label reconciliation
-            # downstream inheritance: a classifier-arm winner keeps its own artifact;
-            # any other winner (lora included) inherits the champion's as-is.
-            adapt_root = winner.get("_adapt_root", champion.get("adapt_root"))
-            if not adapt_root:
-                w_axes["crop_classifier"] = False
-            # The champion can lose the rescorer in two ways that mean different things:
-            # (1) the candidate never requested it — the planner's choice;
-            # (2) it was requested but the refit on the arm was identity — a label correction.
-            # Without distinguishing them, the ledger would record (1) as a correction.
-            if champion["axes"].get("rescorer") and not w_axes.get("rescorer"):
-                asked = winner.get("rescorer_refit") == "identity"
-                decision["rescorer_dropped_by"] = "refit_identity" if asked \
-                    else "proposal"
-                decision["note"] = (
-                    "rescorer re-fit on the winning arm is identity (α=0 for all classes) — "
-                    "champion label corrected" if asked else
-                    "winner did not request the rescorer — champion loses that layer")
-            champion = {"round": r, "id": winner["id"], "axes": w_axes,
-                        "setting": winner["setting"],
-                        "materials_dir": winner["materials_dir"],
-                        "eval": winner["eval"],
-                        # a detector-state winner keeps its own; otherwise inherit current
-                        "weights": winner.get("_weights", champion.get("weights")),
-                        "adapt_root": adapt_root,
-                        "rescorer_path": winner.get("rescorer_path")}
-            self._save_champion(champion)
-            decision["micro_f_beta"] = winner["eval"]["micro_f_beta"]
-        # Bring the detector to the final champion's state. Detector-state
-        # candidates swap it in turn, so the last candidate's state is not
-        # necessarily the winner's — a lora winner may have been unloaded before
-        # the classifier candidates.
-        if not _same_state(served_w, champion.get("weights")):
-            self.detector_hooks["weights_ctl"](champion.get("weights"))
-        if not _same_state(served_a, champion.get("adapt_root")):
-            self._adapt_ctl(champion.get("adapt_root"))
-        _write(rd / "decision.json", decision)
-        self._append_history({
-            "round": r,
-            "champion": _champion_summary(champion),
-            "candidates": ([{k: c[k] for k in ("id", "axes")}
-                            | {"adopted": bool(winner and c["id"] == winner["id"]),
-                               "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
-                            | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
-                            | ({"prescreen": c["prescreen"]} if c.get("prescreen") else {})
-                            | _unused_record(c)
-                            | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
-                            | _modality_record(c["setting"], self.ds.ontology)
-                            | {"forwards": setting_forwards(c["setting"])}
-                            | ({"wall_min": _wall_min(c["_wall"])}
-                               if c.get("_wall") else {})
-                            | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
-                            | ({"source": c["source"]} if c.get("source") else {})
-                            for c in screened] + skipped),
-            "decision": decision})
-        return decision, champion
+        acc.screened.extend(screened)
+        acc.served_w, acc.served_a = served_w, served_a
 
 
 def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
@@ -1030,10 +1196,12 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
 
         # if resume reset the counter to 0, an already-saturated run would spend more
         # rounds — restore the trailing stagnant count from history and continue it.
+        # the count of empty rounds (nothing measured on holdout) is restored the same way
         stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
-        if stagnant_rounds >= cfg.saturation.rounds:
-            result.stopped = "saturation"
-        else:
+        empty_rounds = _trailing_empty(history)
+        result.stopped = _saturated(cfg.saturation, stagnant_rounds,
+                                    empty_rounds) or result.stopped
+        if result.stopped == "rounds":
             for r in range(start, rounds + 1):
                 decision, champion = loop.run_round(r, champion, history)
                 history = loop._read_history()
@@ -1044,8 +1212,10 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 stagnant_rounds = (stagnant_rounds + 1
                                    if _stagnant(decision, cfg.saturation.epsilon)
                                    else 0)
-                if stagnant_rounds >= cfg.saturation.rounds:
-                    result.stopped = "saturation"
+                empty_rounds = empty_rounds + 1 if _empty_round(decision) else 0
+                stop = _saturated(cfg.saturation, stagnant_rounds, empty_rounds)
+                if stop:
+                    result.stopped = stop
                     break
 
     _write(loop.out_dir / "run_summary.json", {
@@ -1348,6 +1518,11 @@ def _requested(c: dict) -> dict:
     return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
 
 
+def _reask_record(c: dict) -> dict:
+    """For a candidate from a re-ask in the same round, which re-ask it was (reask=k)."""
+    return {"reask": c["reask"]} if c.get("reask") else {}
+
+
 def _unused_record(c: dict) -> dict:
     """Unused axes to keep on the history row — shared by plain candidates and
     the lora and classifier arms."""
@@ -1478,6 +1653,35 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
     if new_cls:
         return "classifier"
     return "wired"
+
+
+def _empty_round(decision: dict) -> bool:
+    """Did the round measure nothing on holdout — evaluated still empty after the
+    re-asks (no_candidates and planner_stop included)? Not the baseline."""
+    return decision.get("kind") != "baseline" and not decision.get("evaluated")
+
+
+def _trailing_empty(history: list[dict]) -> int:
+    """Consecutive empty rounds at the tail of history — restores the
+    empty_rounds counter on resume. The baseline (round 0) is always a
+    boundary."""
+    n = 0
+    for e in reversed(history):
+        if e.get("round", 0) == 0 or not _empty_round(e.get("decision") or {}):
+            break
+        n += 1
+    return n
+
+
+def _saturated(sat, stagnant: int, empty: int) -> str | None:
+    """The stop reason, or None. An empty round is also stagnant and counts
+    toward saturation.rounds, so when both are reached in the same round the
+    wider one, saturation, is recorded."""
+    if stagnant >= sat.rounds:
+        return "saturation"
+    if sat.empty_rounds and empty >= sat.empty_rounds:
+        return "empty_rounds"
+    return None
 
 
 def _trailing_stagnant(history: list[dict], epsilon: float) -> int:

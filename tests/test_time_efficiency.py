@@ -159,8 +159,13 @@ def test_blocked_tiling_is_dropped_before_materialize(big_root, tmp_path,  # noq
     monkeypatch.setattr(runner, "materialize",
                         lambda cfg, ds, axes, *a, **k: (seen.append(axes.get("tiling")),
                                                         orig(cfg, ds, axes, *a, **k))[1])
+    # this checks the fold across rounds — re-asking within the round is off
+    # (that path is in tests/test_empty_round.py)
+    from agentic_configuration_search.config import config_from_dict
+    cfg = config_from_dict({"dataset": str(big_root), "rounds": 2,
+                            "planner": {"kind": "llm", "max_reasks": 0}})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
-               rounds=2, **_fakes())
+               rounds=2, cfg=cfg, **_fakes())
     h = _hist(tmp_path / "run")
     assert h[1]["candidates"][0]["skipped"] == "axis_unused", h[1]["candidates"]
     rec = {c["id"]: c for c in h[2]["candidates"]}["t3"]

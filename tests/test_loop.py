@@ -816,7 +816,10 @@ def test_unused_record_is_shared_by_all_candidate_paths():
 
     assert runner._unused_record({"unused_axes": ["exemplar"]}) == {"unused_axes": ["exemplar"]}
     assert runner._unused_record({}) == {}
-    assert inspect.getsource(runner.Loop.run_round).count("_unused_record(") == 3
+    # the round body is split into run_round (decision, record) and _attempt
+    # (wiring, screen, arms)
+    src = inspect.getsource(runner.Loop.run_round) + inspect.getsource(runner.Loop._attempt)
+    assert src.count("_unused_record(") == 3
 
 
 def test_neg_eta_record_reads_the_screened_setting():
