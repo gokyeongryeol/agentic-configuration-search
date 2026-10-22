@@ -92,6 +92,43 @@ are left out of the planner's value list, and candidates that turn them on or
 change them away from the champion's value are rejected — candidates that turn
 them off or inherit the champion's value are kept.
 
+### Split use per axis
+
+Every axis follows the same frame — materials and training come from train,
+selection from fit_dev, adoption from the holdout gate. Nothing derived from
+holdout (thresholds included) feeds materials (`test_materialize_purity` and
+`test_split_roles` pin this).
+
+- **train** is all of `fit_train` + `fit_dev`. Prompt materials (alias,
+  exemplar, negatives) are mined from all of train; axes that train a model
+  (rescorer, lora, crop_classifier) use only `fit_train`, so what they learn is
+  measured fairly on `fit_dev`.
+- **Mining pass**: train inferred with the candidate's exemplars (a GT k-center
+  selection if it has none), without negatives or tiling, at the floor
+  threshold. Missed GT (fn_arm) and false positives (negatives) come from it.
+- Axes whose value equals the champion's are not re-mined; their materials are
+  inherited from the champion.
+
+| axis | materials / training | selection (`fit_dev`) | adoption (holdout) |
+|---|---|---|---|
+| `alias` | train: a few GT crops per class (the candidate's exemplars, or a k-center selection, default 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
+| `exemplar` | train: `base` takes `exemplar_k` GT crops by k-center; `fn_arm` adds `fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
+| `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
+| `visual_negatives` | train: `visual_negative_k` mining-pass false-positive crops per class | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
+| `tiling` | none — an inference setting | tiled and untiled configs are chosen from the same grid, shared by all classes (a text-only candidate runs the text pass per tiling variant). If untiled wins, `axis_unused`. Grids ≥ `screen.prescreen_min_grid` are first screened on a `fit_dev` subset | 〃 |
+| `rescorer` | `fit_train`: discriminator training (area statistics over all of train) | per-class α grid — identity unless the gain exceeds `rescorer.margin` | 〃 |
+| `lora` | `fit_train`: YOLOE tail fine-tune (no validation split during training) | λ grid — the arm's ΔF must exceed `lora.margin` | 〃 |
+| `crop_classifier` | `fit_train`: GT crops (positive) and false positives from a fit_train pass (background), mined at the `fit_dev` thresholds | ΔF must exceed `crop_classifier.margin` | 〃 |
+
+Every round, apart from the axes:
+
+| step | split |
+|---|---|
+| diagnosis (planner input) | all of train inferred with the champion and split by cause (with samples); the holdout as aggregates only. Thresholds are the champion's holdout thresholds — planner input only, never fed into materials |
+| screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` to holdout |
+| adoption, saturation | holdout (`valid`, or `test` when there is no `valid`) — compared with the champion at holdout thresholds; adopted only if the paired-bootstrap lower bound exceeds `gate.margin` and Δ > 0 |
+| final measurement | `test` (when `valid` was the holdout) — the settled champion, once, outside the loop (`scripts/predict.py --split test`) |
+
 ### Round loop
 
 ```
