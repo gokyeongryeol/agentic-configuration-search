@@ -94,9 +94,10 @@ def test_dataset_notes_must_be_string():
 
 def test_tiling_grid_comes_from_axis_not_config():
     """The tile grid (grid g) is a planner-chosen axis value — config keeps only the
-    overlap and merge shared by every grid. The old tiling_configs list is an unknown key."""
+    overlap, merge and min_score shared by every grid. The old tiling_configs list is an unknown key."""
     s = config_from_dict(BASE).search
-    assert s.tiling_overlap == 0.5 and s.tiling_merge == "nmm"
+    assert s.tiling_overlap == 0.5 and s.tiling_merge == "sahi"
+    assert s.tiling_merge_min_score == 0.3
     with pytest.raises(ConfigError, match="tiling_configs"):
         config_from_dict({**BASE, "search": {"tiling_configs": [
             {"grid": 2, "overlap": 0.5, "merge": "nmm"}]}})

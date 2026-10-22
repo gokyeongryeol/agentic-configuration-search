@@ -34,18 +34,26 @@ def merge_modalities(semantic_dets: list[dict], text_dets: list[dict],
              for d in text_dets]
     pool.sort(key=lambda d: -d["score"])
 
+    # Kept boxes are also held as an array and each detection is compared with
+    # all of them at once — a 1×1 IoU per pair took seconds per image and class
+    # at topk 300 × two modalities. The verdict is unchanged (the first kept box,
+    # in order, with the same class and IoU ≥ iou) and so are the IoU values.
     kept: list[dict] = []
+    boxes = np.empty((len(pool), 4))
+    cats: list = []
     for det in pool:
+        m = len(kept)
         target = None
-        for k in kept:
-            if k["category_id"] != det["category_id"]:
-                continue
-            overlap = iou_matrix(np.array([k["box"]], dtype=float),
-                                 np.array([det["box"]], dtype=float))[0, 0]
-            if overlap >= iou:
-                target = k
-                break
+        if m:
+            same = np.fromiter((c == det["category_id"] for c in cats), bool, m)
+            if same.any():
+                overlap = iou_matrix(boxes[:m], np.array([det["box"]], dtype=float))[:, 0]
+                idx = np.flatnonzero(same & (overlap >= iou))
+                if len(idx):
+                    target = kept[int(idx[0])]
         if target is None:
+            boxes[m] = det["box"]
+            cats.append(det["category_id"])
             kept.append(det)
         else:
             target["modalities"] = sorted(set(target["modalities"]) | set(det["modalities"]))

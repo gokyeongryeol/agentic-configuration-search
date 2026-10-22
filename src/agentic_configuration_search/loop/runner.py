@@ -17,10 +17,12 @@ are not adopted.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,8 +31,8 @@ from pathlib import Path
 import yaml
 
 from ..config import Config, config_from_dict
-from ..core.data import Dataset, load_dataset
-from ..diagnose import describe
+from ..core.data import Dataset, load_dataset, prescreen_subset
+from ..diagnose import describe, residual
 from ..diagnose.errors import diagnose
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
@@ -39,6 +41,7 @@ from ..fitting.materials import Materials
 from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
+from ..planner.gates import tiling_gate
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
@@ -46,13 +49,31 @@ from .materialize import materialize
 
 log = logging.getLogger(__name__)
 
+# Round diagnosis artifacts — file names as before (diagnosis_test is the legacy
+# name of the holdout diagnosis)
+DIAG_FILES = ("diagnosis_train.json", "diagnosis_test.json")
+DIAG_KEY = "diagnosis_key.json"       # fingerprint of the diagnosis inputs — the next round reuses it if equal
+FINAL_DIR = "final"                   # the final champion's diagnosis at the end of the run — rounds/final/
+RESIDUAL = "residual.json"            # structure of residual misses (report only, diagnose.residual)
+
 @dataclass
 class RunResult:
     out_dir: Path
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     champion: dict | None = None
-    stopped: str = "rounds"           # rounds | saturation | planner_stop
+    stopped: str = "rounds"           # rounds | saturation | empty_rounds | planner_stop
+
+
+@dataclass
+class _RoundAcc:
+    """State accumulated across a round's attempts (the first proposal + re-asks)."""
+    served_w: object = None              # weights the detector has loaded now
+    served_a: object = None              # reclassification artifact the detector has loaded now
+    skipped: list = field(default_factory=list)
+    screened: list = field(default_factory=list)
+    evaluated: list = field(default_factory=list)
+    n_runnable: int = 0                  # candidates that reached wiring (filter/wiring drops excluded)
 
 
 def _slug(text: str) -> str:
@@ -154,15 +175,19 @@ class Loop:
                   "weights": champion.get("weights"),
                   "adapt_root": champion.get("adapt_root"),
                   "rescorer_path": champion.get("rescorer_path"),
-                  "forwards_per_image": setting_forwards(champion["setting"])})
+                  "forwards_per_image": setting_forwards(champion["setting"]),
+                  "fit_dev_micro_f_beta":
+                      champion["setting"].get("fit_dev_micro_f_beta")})
         _write(self.out_dir / "champion_eval.json", champion["eval"])
 
     def _load_champion(self) -> dict:
         meta = json.loads((self.out_dir / "champion.json").read_text())
         ev = json.loads((self.out_dir / "champion_eval.json").read_text())
         ev["tau_test"] = {int(k): v for k, v in ev["tau_test"].items()}
+        setting = _setting_load(meta["setting"])
+        setting["fit_dev_micro_f_beta"] = meta["fit_dev_micro_f_beta"]
         return {"round": meta["round"], "id": meta["id"], "axes": meta["axes"],
-                "setting": _setting_load(meta["setting"]),
+                "setting": setting,
                 "materials_dir": meta["materials_dir"], "eval": ev,
                 "weights": meta.get("weights"),
                 "adapt_root": meta.get("adapt_root"),
@@ -173,6 +198,14 @@ class Loop:
         entry.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
         if getattr(self, "_round_t0", None) is not None:
             entry.setdefault("dur_s", round(time.monotonic() - self._round_t0, 1))
+        pc = _pass_cache_delta(getattr(self, "_pass_t0", None),
+                               gateway.pass_cache_stats())
+        if pc is not None:
+            entry.setdefault("pass_cache", pc)
+            log.info("round %s pass cache: hit %d · miss %d (hit rate %.0f%%) · "
+                     "invalidate %d · %d pieces held", entry.get("round"), pc["hits"],
+                     pc["misses"], 100 * pc["hit_rate"], pc["invalidations"],
+                     pc["entries"])
         with open(self.out_dir / "history.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
@@ -228,7 +261,8 @@ class Loop:
             log.info("resume: restored champion reclassification artifact %s", adapt_root)
             self._adapt_ctl(Path(adapt_root))
 
-    def _screen(self, materials: Materials, axes: dict) -> dict:
+    def _screen(self, materials: Materials, axes: dict, split=None) -> dict:
+        """Fix the candidate setting on fit_dev (or a subset of it — prescreen)."""
         s = self.cfg.search
         # text-only candidate: the text pass sweeps the text-negative suppression
         # IoU (neg_eta) over the grid (text-only branch of screen_candidate). With
@@ -236,15 +270,81 @@ class Loop:
         text_neg_sweep = (axes.get("text_negatives")
                           and axes.get("exemplar") == "none")
         return screen_candidate(
-            self.cfg, self.client, self.ds.fit_dev, self.ds.ontology, materials,
+            self.cfg, self.client, self.ds.fit_dev if split is None else split,
+            self.ds.ontology, materials,
             neg_eta_grid=(s.neg_eta_grid
                           if (axes.get("visual_negatives") or text_neg_sweep)
                           else ()),
             tiling_variants=_tiling_variants(s, axes))
 
-    def _diagnosis(self, champion: dict, round_dir: Path) -> dict:
+    def _diagnosis_key(self, champion: dict) -> dict:
+        """Fingerprint of the diagnosis inputs — the champion (its whole served
+        state and holdout thresholds) and the config.
+
+        The config is hashed whole except rounds and out_dir, which do not reach
+        the diagnosis — picking which keys reach it (inference, cause
+        classification, crop notes) and missing one would reuse a stale
+        diagnosis, so the key errs wide and recomputes when in doubt."""
+        cfg = dataclasses.asdict(self.cfg)
+        for k in ("rounds", "out_dir"):
+            cfg.pop(k, None)
+        ev = champion["eval"]
+        key = {"champion": {k: champion.get(k) for k in
+                            ("round", "id", "materials_dir", "weights",
+                             "adapt_root", "rescorer_path")}
+               | {"micro_f_beta": ev["micro_f_beta"], "tau_test": ev["tau_test"]},
+               "config": hashlib.sha256(json.dumps(
+                   cfg, sort_keys=True, default=str).encode()).hexdigest()}
+        # normalize through a JSON round trip — compare in the stored key's shape
+        # (string keys, paths)
+        return json.loads(json.dumps(key, sort_keys=True, default=str))
+
+    def _reuse_diagnosis(self, key: dict, round_dir: Path,
+                         prev: Path | None) -> dict | None:
+        """Use an existing diagnosis of the same inputs — this round's directory
+        first (resuming an interrupted round), then the previous round's. From
+        the previous round, the diagnosis, crop notes and key are copied into
+        this round's directory (_crop_notes replays the notes). Rounds under an
+        unchanged champion would otherwise repeat the full train inference and
+        the VLM notes — the diagnosis is a function of the champion and config
+        alone. When a finished run continues with more rounds, the end-of-run
+        final diagnosis (rounds/final) is a reuse candidate too."""
+        final = self.out_dir / "rounds" / FINAL_DIR
+        for src in (round_dir, prev, final if final != round_dir else None):
+            if src is None or not (src / DIAG_KEY).exists() or not all(
+                    (src / name).exists() for name in DIAG_FILES):
+                continue
+            if json.loads((src / DIAG_KEY).read_text()) != key:
+                continue
+            if src != round_dir:
+                # the key goes last — dying mid-copy leaves no key, so it is recomputed
+                for name in DIAG_FILES + (describe.ARTIFACT, DIAG_KEY):
+                    if (src / name).exists():
+                        shutil.copyfile(src / name, round_dir / name)
+                    elif name == describe.ARTIFACT:
+                        (round_dir / name).unlink(missing_ok=True)
+            log.info("diagnosis reused: %s — same champion %s (round %s) and config",
+                     src.name, key["champion"]["id"], key["champion"]["round"])
+            return {"train": json.loads((round_dir / DIAG_FILES[0]).read_text()),
+                    "test": json.loads((round_dir / DIAG_FILES[1]).read_text())}
+        return None
+
+    def _diagnosis(self, champion: dict, round_dir: Path,
+                   prev: Path | None = None) -> dict:
         """Diagnosis on train (detailed) + holdout (anonymized aggregates) — the
-        planner's input. (Artifact key/file name "test" is legacy.)"""
+        planner's input. (Artifact key/file name "test" is legacy.)
+
+        If a diagnosis with the same inputs (_diagnosis_key) exists in this round
+        or the previous one (prev), it is not recomputed (_reuse_diagnosis)."""
+        key = self._diagnosis_key(champion)
+        reused = self._reuse_diagnosis(key, round_dir, prev)
+        self._diag_reused = reused is not None
+        if reused is not None:
+            return reused
+        # with no key, or notes from another diagnosis left over, delete them so
+        # they are not replayed
+        (round_dir / describe.ARTIFACT).unlink(missing_ok=True)
+        (round_dir / DIAG_KEY).unlink(missing_ok=True)
         tau = champion["eval"]["tau_test"]
         train = self.ds.train
         paths = [train.image_path(e) for e in train.images]
@@ -281,9 +381,48 @@ class Loop:
                           champion["eval"]["floor_records"], tau,
                           self.ds.ontology, iou_thr=self.iou, anonymize=True,
                           **small)
-        _write(round_dir / "diagnosis_train.json", d_train)
-        _write(round_dir / "diagnosis_test.json", d_test)
+        _write(round_dir / DIAG_FILES[0], d_train)
+        _write(round_dir / DIAG_FILES[1], d_test)
+        _write(round_dir / DIAG_KEY, key)          # last — only once the diagnosis is fully written
         return {"train": d_train, "test": d_test}
+
+    def final_diagnosis(self, champion: dict, history: list[dict]) -> dict:
+        """The final champion's diagnosis at the end of the run — rounds/final/
+        (diagnosis, crop notes, residual).
+
+        A round's diagnosis is of the champion at the **start** of the round, so
+        when the last round adopts, the final champion's residual errors are
+        recorded nowhere. This goes through the same _diagnosis path, so if the
+        last round adopted nothing it only copies that diagnosis (no inference);
+        if it adopted, it is one train inference plus notes. Resume reuses this
+        directory itself, so it is idempotent. residual is computed from GT
+        annotations and the diagnosis alone (no inference).
+
+        Report-only, so a failure does not kill the run — it is recorded as an
+        error in run_summary. Returns run_summary's final_diagnosis key."""
+        t0 = time.monotonic()
+        rd = self.out_dir / "rounds" / FINAL_DIR
+        last = history[-1]["round"] if history else 0
+        info = {"dir": f"rounds/{FINAL_DIR}", "champion_round": champion.get("round"),
+                "after_round": last}
+        try:
+            rd.mkdir(parents=True, exist_ok=True)
+            diagnosis = self._diagnosis(
+                champion, rd, prev=self._round_dir(last) if last >= 1 else None)
+            info["reused"] = self._diag_reused
+            self._crop_notes(diagnosis, rd)
+            ev = champion["eval"]
+            _write(rd / RESIDUAL, residual.residual(
+                residual.image_rows(self.ds.train), diagnosis["train"],
+                ev["records"], ev.get("floor_records"), ev["tau_test"],
+                self.ds.ontology, iou_thr=self.iou,
+                small_ratio=self.cfg.diagnose.small_object_ratio))
+        except Exception as exc:  # noqa: BLE001 — a report-only diagnosis must not kill the run
+            log.exception("final champion diagnosis failed — the report falls back to the "
+                          "last round's diagnosis")
+            info["error"] = f"{type(exc).__name__}: {exc}"
+        info["dur_s"] = round(time.monotonic() - t0, 1)
+        return info
 
     def _planner_chat(self):
         """Chat callable shared by the llm planner and crop notes — the injected
@@ -313,20 +452,23 @@ class Loop:
         if notes:
             diagnosis["train"]["crop_notes"] = notes
 
+    def _llm_planner(self, round_dir: Path) -> LLMPlanner:
+        chat = self._planner_chat()
+        if chat is None:
+            raise ValueError("planner.kind=llm requires planner.base_url or "
+                             "an injected llm_chat")
+        return LLMPlanner(chat=chat, artifact_dir=round_dir,
+                          notes=self.cfg.dataset_notes,
+                          token_budget=_token_budget(self.cfg),
+                          disabled_axes=self.disabled_axes,
+                          disabled_values=self.disabled_values,
+                          facts=self._facts(),
+                          tiling_overlap=self.cfg.search.tiling_overlap)
+
     def _propose(self, history: list[dict], diagnosis: dict,
                  round_dir: Path) -> dict:
         if self.cfg.planner.kind == "llm":
-            chat = self._planner_chat()
-            if chat is None:
-                raise ValueError("planner.kind=llm requires planner.base_url or "
-                                 "an injected llm_chat")
-            proposal = LLMPlanner(chat=chat, artifact_dir=round_dir,
-                                  notes=self.cfg.dataset_notes,
-                                  token_budget=_token_budget(self.cfg),
-                                  disabled_axes=self.disabled_axes,
-                                  disabled_values=self.disabled_values,
-                                  facts=self._facts()).propose(
-                history, diagnosis)
+            proposal = self._llm_planner(round_dir).propose(history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              disabled_axes=self.disabled_axes,
@@ -343,16 +485,72 @@ class Loop:
         # below still applies)
         carried = deterministic.carryover(history, self.disabled_axes,
                                           self.disabled_values, facts=self._facts())
-        merged = proposal["candidates"] + humans + carried
+        fresh, dropped = self._filter(proposal["candidates"] + humans + carried,
+                                      history)
+        # merge with planner-stage drops (invalid_axes etc.) — overwriting would
+        # erase candidates discarded by sanitization from history.
+        return {**proposal, "candidates": fresh,
+                "dropped": (list(proposal.get("dropped") or [])
+                            + human_dropped + dropped),
+                "stop": proposal["stop"] and not fresh}
 
+    def _reask(self, k: int, r: int, history: list[dict], diagnosis: dict,
+               round_dir: Path, champion: dict, acc: "_RoundAcc") -> dict | None:
+        """The k-th re-ask of the round — when every candidate so far was rejected
+        before holdout. Diagnosis and champion are this round's.
+
+        Re-asked candidates go through the shared filter too. The history it
+        sees gets this round's rows so far appended — a combination proposed
+        earlier in the round is combo_tried, and a grid at or above one just
+        left unused is tiling_blocked. Human and carried candidates already ran
+        with the first proposal and are not added again. Candidate and drop rows
+        get reask=k.
+
+        The deterministic planner is not re-asked (None) — it is the fixed path
+        and the A/B control. Neither is the LLM when its first call failed and
+        there is no conversation to continue."""
+        if self.cfg.planner.kind != "llm":
+            return None
+        rows = acc.skipped + [{k_: c[k_] for k_ in ("id", "axes")} | _requested(c)
+                              | _unused_record(c) | _tiling_record(c)
+                              for c in acc.screened]
+        proposal = self._llm_planner(round_dir).reask(
+            history, diagnosis, acc.skipped, k=k, taken={c["id"] for c in rows})
+        if proposal is None:              # no conversation to continue (first call failed)
+            return None
+        for c in proposal["candidates"] + proposal["dropped"]:
+            c["reask"] = k
+        so_far = history + [{"round": r, "champion": _champion_summary(champion),
+                             "candidates": rows}]
+        fresh, dropped = self._filter(proposal["candidates"], so_far)
+        log.info("round %d: no candidate reached holdout, re-asked (%d) — %d new candidates",
+                 r, k, len(fresh))
+        return {**proposal, "candidates": fresh,
+                "dropped": proposal["dropped"] + dropped,
+                "stop": proposal["stop"] and not fresh}
+
+    def _filter(self, merged: list[dict],
+                history: list[dict]) -> tuple[list[dict], list[dict]]:
+        """(kept, dropped) — the source-independent shared filter
+        (tiling_blocked, combo_tried)."""
         # Common combo filter: regardless of source (LLM, deterministic, human),
         # block retrying **an already-tried full axes combination**. It works per
         # combination, not per (axis, value), so retrying the same axis after the
         # champion changes is allowed. The LLM can forget failures outside the
         # prompt window (MAX_HISTORY), so this filter is the only permanent barrier.
         tried = tried_combos(history)
+        gate = tiling_gate(history)
         fresh, dropped = [], []
         for c in merged:
+            # tiling fold gate (planner.gates) — screening a grid at or above an
+            # unused one costs 1+g² forwards per image. Only planner candidates are
+            # blocked: a person decides for human candidates, and carried ones
+            # already passed the holdout gate.
+            why = (gate.block(c["axes"])
+                   if c.get("source") not in ("human", "carryover") else None)
+            if why:
+                dropped.append({**c, "skipped": "tiling_blocked", "note": why})
+                continue
             key = tuple(sorted(c["axes"].items()))
             if key in tried:
                 # no silent drops — record as combo_tried in skipped so it flows via
@@ -366,12 +564,7 @@ class Loop:
         if dropped:
             log.info("filtered %d already-tried combinations: %s", len(dropped),
                      [c["id"] for c in dropped])
-        # merge with planner-stage drops (invalid_axes etc.) — overwriting would
-        # erase candidates discarded by sanitization from history.
-        return {**proposal, "candidates": fresh,
-                "dropped": (list(proposal.get("dropped") or [])
-                            + human_dropped + dropped),
-                "stop": proposal["stop"] and not fresh}
+        return fresh, dropped
 
     def _facts(self) -> DatasetFacts:
         """Facts that let sanitization block candidates whose outcome the data already decides."""
@@ -432,6 +625,62 @@ class Loop:
         return rescore.rescored_screen(self.cfg, self.ds, setting,
                                        rescorer, dev_preds)
 
+    def _prescreen(self, c: dict, axes: dict, materials: Materials, entry: dict,
+                   skipped: list) -> bool:
+        """Screen a large-grid tiling candidate on a fit_dev subset first — if no
+        class uses a tile there, reject it without the full screen (True).
+
+        A grid g screen costs 1+g² forwards, so from g ≥ screen.prescreen_min_grid
+        the full fit_dev is expensive. If tiles are used on the subset
+        (core.data.prescreen_subset — inside fit_dev, deterministic), the full
+        fit_dev is screened as before, so the final numbers equal those without
+        a prescreen (the pass cache reuses the subset's passes).
+
+        Only for single increments that change tiling alone — a candidate that
+        also changes other axes is not the champion even if tiles go unused, so
+        it cannot be rejected."""
+        s = self.cfg.screen
+        champ = (getattr(self, "_champion", None) or {}).get("axes") or {}
+        g = axes.get("tiling")
+        if not g or g < s.prescreen_min_grid or g == champ.get("tiling"):
+            return False
+        if {k for k, v in c["axes"].items() if champ.get(k) != v} != {"tiling"}:
+            return False
+        sub = prescreen_subset(self.ds.fit_dev, s.prescreen_fraction,
+                               s.prescreen_min_images)
+        if sub is None:
+            return False
+        setting = self._screen(materials, axes, split=sub)
+        info = {"n_images": len(sub.images), "of": len(self.ds.fit_dev.images),
+                "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
+                "passed": _uses_tiling(setting)}
+        if setting.get("tiling_f"):
+            info["tiling_f"] = setting["tiling_f"]
+        entry["prescreen"] = info
+        if info["passed"]:
+            return False
+        rec = {**c, "skipped": "axis_unused", "unused_axes": ["tiling"],
+               "tiling_used": False, "prescreen": info,
+               "note": f"prescreen: no class picked the grid {g} tile config on "
+                       f"fit_dev {info['n_images']}/{info['of']} images — the full "
+                       "screen is skipped"}
+        if setting.get("tiling_f"):
+            rec["tiling_f"] = setting["tiling_f"]
+        log.info("candidate %s: %s", c["id"], rec["note"])
+        skipped.append(rec)
+        return True
+
+    def _materialize_timed(self, axes: dict, mat_dir, wall: dict) -> Materials:
+        """materialize — records the time taken (seconds) in wall["materialize"]
+        (even on failure)."""
+        t0 = time.monotonic()
+        try:
+            return materialize(self.cfg, self.ds, axes, mat_dir,
+                               seed=self.cfg.run_seed,
+                               **self._parent_kw(), **self._mat_kw)
+        finally:
+            wall["materialize"] = time.monotonic() - t0
+
     def _screen_one(self, c: dict, mat_dir, entry: dict,
                     screened: list, skipped: list) -> None:
         """materialize + screen for one candidate — the caller records failures as rejections."""
@@ -439,10 +688,11 @@ class Loop:
             # the rescorer is a post-processing layer on the setting fixed by the
             # other axes — discriminator on fit_train, α grid on fit_dev (loop.rescore)
             base_axes = {**c["axes"], "rescorer": False}
-            materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                    seed=self.cfg.run_seed,
-                                    **self._parent_kw(), **self._mat_kw)
+            materials = self._materialize_timed(base_axes, mat_dir,
+                                                entry.setdefault("_wall", {}))
             if self._guard_material(c, materials, skipped):
+                return
+            if self._prescreen(c, base_axes, materials, entry, skipped):
                 return
             setting0 = self._screen(materials, base_axes)
             # judge sameness **before** the refit — if the served state equals the
@@ -465,10 +715,11 @@ class Loop:
             entry["_rescorer"] = rescorer
             entry["rescorer_path"] = str(Path(mat_dir) / "rescorer.json")
         else:
-            materials = materialize(self.cfg, self.ds, c["axes"], mat_dir,
-                                    seed=self.cfg.run_seed,
-                                    **self._parent_kw(), **self._mat_kw)
+            materials = self._materialize_timed(c["axes"], mat_dir,
+                                                entry.setdefault("_wall", {}))
             if self._guard_material(c, materials, skipped):
+                return
+            if self._prescreen(c, c["axes"], materials, entry, skipped):
                 return
             setting = self._screen(materials, c["axes"])
             if self._skip_same(c, entry, setting, materials, skipped):
@@ -517,11 +768,23 @@ class Loop:
                            "earlier round — evaluation skipped"}
         else:
             return False
+        if rec["skipped"] == "same_setting":
+            # what was the same — the planner sees whether another k refined to
+            # the same material (e.g. text_negative_k 2 and 4 both to one phrase)
+            # and folds variations of that axis
+            mat = _material_summary(setting, materials)
+            if mat:
+                rec["material"] = mat
+                rec["note"] += f" — served material: {mat}"
         rec |= _modality_record(setting, self.ds.ontology)
+        if entry.get("prescreen"):
+            rec["prescreen"] = entry["prescreen"]
         if unused:
             rec.setdefault("unused_axes", unused)
             if "tiling" in unused:
                 rec["tiling_used"] = False
+                if setting.get("tiling_f"):
+                    rec["tiling_f"] = setting["tiling_f"]   # how far it fell short
         log.info("candidate %s: %s", c["id"], rec["note"])
         skipped.append(rec)
         return True
@@ -548,6 +811,7 @@ class Loop:
 
     def baseline(self) -> dict:
         self._round_t0 = time.monotonic()
+        self._pass_t0 = gateway.pass_cache_stats()
         rd = self._round_dir(0)
         mat_dir = rd / "settings" / "baseline"
         materials = materialize(self.cfg, self.ds, BASELINE, mat_dir,
@@ -571,67 +835,47 @@ class Loop:
         return champion
 
     def run_round(self, r: int, champion: dict, history: list[dict]) -> tuple[dict, dict]:
-        """One round — returns (decision, champion)."""
+        """One round — returns (decision, champion).
+
+        If every candidate of the first proposal is rejected before holdout
+        (filters, screen), the planner is asked again within the same round (up
+        to planner.max_reasks times — _reask). Diagnosis and champion are reused,
+        and re-asked candidates go through the same path and are recorded in the
+        same round."""
         self._round_t0 = time.monotonic()
+        self._pass_t0 = gateway.pass_cache_stats()
         self._champion = champion          # parent for material inheritance
         self._champion.pop("_fp", None)
         self._seen_fps: set[str] = set()     # served states that passed screen this round
         self._tried_fps = _evaluated_fps(history)
         rd = self._round_dir(r)
         rd.mkdir(parents=True, exist_ok=True)
-        diagnosis = self._diagnosis(champion, rd)
+        diagnosis = self._diagnosis(champion, rd,
+                                    prev=self._round_dir(r - 1) if r > 1 else None)
         self._crop_notes(diagnosis, rd)      # merge VLM notes (diagnostic signal only)
         proposal = self._propose(history, diagnosis, rd)
+        # served_* is what the detector has loaded right now — detector-state
+        # candidates swap it in turn
+        acc = _RoundAcc(served_w=champion.get("weights"),
+                        served_a=champion.get("adapt_root"))
+        self._attempt(rd, champion, proposal, acc)
+        reasks = 0
+        while (not acc.evaluated and not proposal["stop"]
+               and reasks < self.cfg.planner.max_reasks):
+            nxt = self._reask(reasks + 1, r, history, diagnosis, rd, champion, acc)
+            if nxt is None:
+                break
+            reasks += 1
+            proposal = nxt
+            self._attempt(rd, champion, proposal, acc)
+        skipped, screened, evaluated = acc.skipped, acc.screened, acc.evaluated
+        served_w, served_a = acc.served_w, acc.served_a
+        reask_mark = {"reasks": reasks} if reasks else {}
 
-        wired, lora_cands, classifier_cands = [], [], []
-        skipped = list(proposal.get("dropped", []))   # include combo_tried records
-        n_filtered = len(skipped)                     # up to here: filter drops, not wiring
-        champ_axes = champion.get("axes") or {}
-        for c in proposal["candidates"]:
-            miss = _missing_hook(c["axes"], self._mat_kw)
-            if miss:
-                skipped.append({**c, "skipped": "missing_hook",
-                                "note": f"{miss} not injected — cannot produce material "
-                                        f"for this axis (needs LLM/worker wiring)"})
-                continue
-            route = _route_detector_state(c["axes"], champ_axes)
-            if route == "off":
-                off = [k for k in ("lora", "crop_classifier")
-                       if champ_axes.get(k) and not c["axes"].get(k)]
-                skipped.append({**c, "skipped": "detector_state_off",
-                                "note": f"{off}: the champion's detector-state axes cannot "
-                                        "be measured turned off (the state stays loaded "
-                                        "while measuring) — keep them on"})
-            elif route == "compound":
-                skipped.append({**c, "skipped": "compound_server_state",
-                                "note": "turning on both lora and crop_classifier relative to "
-                                        "champion is unsupported (gain cannot be attributed) — "
-                                        "split it into single increments"})
-            elif route == "lora":
-                if self.detector_hooks is None:
-                    skipped.append({**c, "skipped": "lora_deps",
-                                    "note": "weights_ctl/base_weights not injected — "
-                                            "needs GPU wiring (detector_hooks)"})
-                else:
-                    lora_cands.append(c)
-            elif route == "classifier":
-                if self.detector_hooks is None or not self.detector_hooks.get("adapt_ctl"):
-                    skipped.append({**c, "skipped": "adapt_ctl",
-                                    "note": "adapt_ctl not injected — needs detector client "
-                                            "wiring (detector_hooks)"})
-                else:
-                    classifier_cands.append(c)
-            else:
-                wired.append(c)
-        if len(skipped) > n_filtered:
-            log.warning("skipped %d candidates that cannot be wired: %s",
-                        len(skipped) - n_filtered,
-                        [c["id"] for c in skipped[n_filtered:]])
-
-        if not wired and not lora_cands and not classifier_cands:
+        if not acc.n_runnable:
             decision = {"round": r, "adopted": False,
                         "kind": ("planner_stop" if proposal["stop"] else "no_candidates"),
-                        "skipped": [c["id"] for c in skipped]}
+                        "skipped": [c["id"] for c in skipped]} | reask_mark
             _write(rd / "decision.json", decision)
             self._append_history({
                 "round": r,
@@ -639,96 +883,9 @@ class Loop:
                 "candidates": skipped, "decision": decision})
             return decision, champion
 
-        screened = []
-        for c in wired:
-            mat_dir = rd / "settings" / _slug(c["id"])
-            entry = {**c, "materials_dir": str(mat_dir)}
-            try:
-                self._screen_one(c, mat_dir, entry, screened, skipped)
-            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
-                log.exception("candidate %s failed — rejected, round continues", c["id"])
-                skipped.append({**c, "skipped": "error",
-                                "note": f"{type(exc).__name__}: {exc}"})
         _write(rd / "screen.json",
                [{k: c[k] for k in ("id", "axes", "fit_dev_micro_f_beta")}
                 for c in screened])
-
-        top = sorted(screened, key=lambda c: -c["fit_dev_micro_f_beta"])
-        top = top[: self.cfg.screen.top_k]
-        evaluated = []
-
-        def _gate(ev):
-            return gate(champion["eval"]["records"], ev["records"],
-                        cat_ids=self.cat_ids, iou_thr=self.iou,
-                        margin=self.cfg.gate.margin,
-                        n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
-                        alpha=1.0 - self.cfg.gate.confidence,
-                        beta=self.cfg.beta)
-
-        for c in top:
-            ev = self._evaluate_candidate(c, c["setting"], c["_materials"])
-            evaluated.append({**c, "eval": ev, "gate": _gate(ev)})
-
-        # --- lora candidates — they swap the client's weights, so always last ---
-        # Evaluate with the champion's classifier left loaded — a crop -> class
-        # function is not tied to the detector's score distribution, and removing
-        # it would make lora fight carrying a handicap equal to its gain.
-        # served_* is what the detector has loaded right now (updated per candidate).
-        served_w = champion.get("weights")
-        served_a = champion.get("adapt_root")
-        for c in lora_cands:
-            mat_dir = rd / "settings" / _slug(c["id"])
-            base_axes = {**c["axes"], "lora": False}
-            try:
-                materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                        seed=self.cfg.run_seed,
-                                        **self._parent_kw(), **self._mat_kw)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("lora candidate %s material failed — rejected", c["id"])
-                skipped.append({**c, "skipped": "error",
-                                "note": f"{type(exc).__name__}: {exc}"})
-                continue
-            if self._guard_material(c, materials, skipped):
-                continue
-            try:
-                # lora axis = tail fine-tune + λ-interpolation arms —
-                # contract {"decision","weights","grid","setting"}
-                res = tail_round.run_tail_candidate(
-                    self.cfg, self.ds, base_axes, materials, mat_dir,
-                    screen_fn=self._screen,
-                    weights_ctl=self.detector_hooks["weights_ctl"],
-                    base_weights=self.detector_hooks["base_weights"],
-                    restore_weights=champion.get("weights"),
-                    seed=self.cfg.run_seed)
-                # adopted: the winning arm stays loaded; otherwise restore_weights (current)
-                served_w = res["weights"] or champion.get("weights")
-            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
-                log.exception("lora candidate %s failed — restored current weights and rejected", c["id"])
-                self.detector_hooks["weights_ctl"](champion.get("weights"))
-                served_w = champion.get("weights")
-                skipped.append({**c, "skipped": "error",
-                                "note": f"{type(exc).__name__}: {exc}"})
-                continue
-            entry = {**c, "materials_dir": str(mat_dir),
-                     "setting": res["setting"],
-                     "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
-                                             default=0.0),
-                     "lora": res["decision"]}
-            _relabel_unused(entry)
-            screened.append({k: entry[k] for k in
-                             ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
-                            | _requested(entry) | _unused_record(entry))
-            if not res["decision"].get("adopted"):
-                skipped.append({**c, "skipped": "lora_gate",
-                                "note": res["decision"].get("reason", "")})
-                continue
-            setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
-            entry["setting"] = setting
-            ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
-            evaluated.append({**entry, "_materials": materials,
-                              "_weights": str(res["weights"]),
-                              "eval": ev, "gate": _gate(ev)})
         # keep records too — re-judging past runs after changing gate criteria
         # (one/two-sided, alpha, margin) needs more than the champion's records.
         _write(rd / "eval.json",
@@ -737,67 +894,6 @@ class Loop:
                  "tau_test": c["eval"]["tau_test"], "gate": c["gate"],
                  "records": c["eval"]["records"]}
                 for c in evaluated])
-
-        # --- crop classifier candidates — detector-state candidates, same discipline as lora ---
-        # Measure them on the champion's weights. If a winning lora arm stayed
-        # loaded and the classifier then won, the champion would be served without
-        # that arm while its τ and holdout F came from on top of it — they would
-        # not match the serving state (adapt_round restores only the artifact).
-        if classifier_cands and not _same_state(served_w, champion.get("weights")):
-            self.detector_hooks["weights_ctl"](champion.get("weights"))
-            served_w = champion.get("weights")
-        for c in classifier_cands:
-            mat_dir = rd / "settings" / _slug(c["id"])
-            base_axes = {**c["axes"], "crop_classifier": False}
-            try:
-                materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                        seed=self.cfg.run_seed,
-                                        **self._parent_kw(), **self._mat_kw)
-                if self._guard_material(c, materials, skipped):
-                    continue
-                res = adapt_round.run_classifier_candidate(
-                    self.cfg, self.ds, base_axes, materials, mat_dir,
-                    screen_fn=self._screen,
-                    adapt_ctl=self._adapt_ctl,
-                    repo_root=self.detector_hooks["repo_root"],
-                    restore_root=champion.get("adapt_root"),
-                    seed=self.cfg.run_seed, client=self.client)
-                # adopted: its own artifact stays loaded; otherwise restore_root (current)
-                served_a = res["adapt_root"] or champion.get("adapt_root")
-            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
-                log.exception("classifier candidate %s failed — restored current state and rejected", c["id"])
-                self._adapt_ctl(champion.get("adapt_root"))
-                served_a = champion.get("adapt_root")
-                skipped.append({**c, "skipped": "error",
-                                "note": f"{type(exc).__name__}: {exc}"})
-                continue
-            entry = {**c, "materials_dir": str(mat_dir),
-                     "setting": res["setting"],
-                     "fit_dev_micro_f_beta":
-                         res["setting"]["fit_dev_micro_f_beta"],
-                     "crop_classifier": res["decision"]}
-            _relabel_unused(entry)
-            screened.append({k: entry[k] for k in
-                             ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")}
-                            | {"crop_classifier": res["decision"]}
-                            | _requested(entry) | _unused_record(entry))
-            if not res["decision"].get("adopted"):
-                # The tripwire (too few training crops) keeps the same material
-                # until the champion changes — record the axis as empty so it reaches
-                # the planner's dead-axis list. It cannot be blocked up front because
-                # the background FP count is an inference result.
-                dead = ({"empty_axis": "crop_classifier"}
-                        if res["decision"].get("tripwire") else {})
-                skipped.append({**c, "skipped": "classifier_gate", **dead,
-                                "note": res["decision"].get("reason", "")})
-                continue
-            setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
-            entry["setting"] = setting
-            ev = self._evaluate_candidate(entry, setting, materials)
-            evaluated.append({**entry, "_materials": materials,
-                              "_adapt_root": str(res["adapt_root"]),
-                              "eval": ev, "gate": _gate(ev)})
 
         winners = [c for c in evaluated if c["gate"]["adopted"]]
         winner = max(winners, key=lambda c: c["gate"]["delta"]) if winners else None
@@ -812,7 +908,11 @@ class Loop:
                                              ("delta", "lo", "hi", "adopted")}}
                           for c in evaluated},
             "skipped": [c["id"] for c in skipped],
-        }
+        } | reask_mark
+        if proposal["stop"]:
+            # the planner declared "nothing to try" while re-asked — this round
+            # measured nothing (which is why it was re-asked) and the run stops here
+            decision["kind"] = "planner_stop"
         if winner:
             w_axes, _ = _winner_axes(winner)     # defensive rescorer label reconciliation
             # downstream inheritance: a classifier-arm winner keeps its own artifact;
@@ -858,15 +958,242 @@ class Loop:
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
                             | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
-                            | _unused_record(c)
+                            | ({"prescreen": c["prescreen"]} if c.get("prescreen") else {})
+                            | _unused_record(c) | _reask_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
                             | _modality_record(c["setting"], self.ds.ontology)
                             | {"forwards": setting_forwards(c["setting"])}
+                            | ({"wall_min": _wall_min(c["_wall"])}
+                               if c.get("_wall") else {})
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | ({"source": c["source"]} if c.get("source") else {})
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
+
+    def _gate(self, champion: dict, ev: dict) -> dict:
+        return gate(champion["eval"]["records"], ev["records"],
+                    cat_ids=self.cat_ids, iou_thr=self.iou,
+                    margin=self.cfg.gate.margin,
+                    n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
+                    alpha=1.0 - self.cfg.gate.confidence,
+                    beta=self.cfg.beta)
+
+    def _attempt(self, rd: Path, champion: dict, proposal: dict,
+                 acc: "_RoundAcc") -> None:
+        """Run one proposal's candidates (the first one or a re-ask) through
+        wiring, screen and holdout, accumulating into acc. The decision is made
+        once at the end of the round."""
+
+        skipped = acc.skipped
+        skipped.extend(proposal.get("dropped", []))   # include combo_tried records
+        wired, lora_cands, classifier_cands = [], [], []
+        n_filtered = len(skipped)                     # up to here: filter drops, not wiring
+        champ_axes = champion.get("axes") or {}
+        for c in proposal["candidates"]:
+            miss = _missing_hook(c["axes"], self._mat_kw)
+            if miss:
+                skipped.append({**c, "skipped": "missing_hook",
+                                "note": f"{miss} not injected — cannot produce material "
+                                        f"for this axis (needs LLM/worker wiring)"})
+                continue
+            route = _route_detector_state(c["axes"], champ_axes)
+            if route == "off":
+                off = [k for k in ("lora", "crop_classifier")
+                       if champ_axes.get(k) and not c["axes"].get(k)]
+                skipped.append({**c, "skipped": "detector_state_off",
+                                "note": f"{off}: the champion's detector-state axes cannot "
+                                        "be measured turned off (the state stays loaded "
+                                        "while measuring) — keep them on"})
+            elif route == "compound":
+                skipped.append({**c, "skipped": "compound_server_state",
+                                "note": "turning on both lora and crop_classifier relative to "
+                                        "champion is unsupported (gain cannot be attributed) — "
+                                        "split it into single increments"})
+            elif route == "lora":
+                if self.detector_hooks is None:
+                    skipped.append({**c, "skipped": "lora_deps",
+                                    "note": "weights_ctl/base_weights not injected — "
+                                            "needs GPU wiring (detector_hooks)"})
+                else:
+                    lora_cands.append(c)
+            elif route == "classifier":
+                if self.detector_hooks is None or not self.detector_hooks.get("adapt_ctl"):
+                    skipped.append({**c, "skipped": "adapt_ctl",
+                                    "note": "adapt_ctl not injected — needs detector client "
+                                            "wiring (detector_hooks)"})
+                else:
+                    classifier_cands.append(c)
+            else:
+                wired.append(c)
+        if len(skipped) > n_filtered:
+            log.warning("skipped %d candidates that cannot be wired: %s",
+                        len(skipped) - n_filtered,
+                        [c["id"] for c in skipped[n_filtered:]])
+
+        if not wired and not lora_cands and not classifier_cands:
+            return
+        acc.n_runnable += len(wired) + len(lora_cands) + len(classifier_cands)
+
+        screened = []
+        for c in wired:
+            mat_dir = rd / "settings" / _slug(c["id"])
+            entry = {**c, "materials_dir": str(mat_dir), "_wall": {}}
+            t0, n_skip = time.monotonic(), len(skipped)
+            try:
+                self._screen_one(c, mat_dir, entry, screened, skipped)
+            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
+                log.exception("candidate %s failed — rejected, round continues", c["id"])
+                skipped.append({**c, "skipped": "error",
+                                "note": f"{type(exc).__name__}: {exc}"})
+            _close_wall(entry["_wall"], t0, skipped[n_skip:])
+
+        top = sorted(screened, key=lambda c: -c["fit_dev_micro_f_beta"])
+        top = top[: self.cfg.screen.top_k]
+        evaluated = acc.evaluated
+        _gate = lambda ev: self._gate(champion, ev)  # noqa: E731
+
+        for c in top:
+            t0 = time.monotonic()
+            ev = self._evaluate_candidate(c, c["setting"], c["_materials"])
+            c["_wall"]["holdout"] = time.monotonic() - t0
+            evaluated.append({**c, "eval": ev, "gate": _gate(ev)})
+
+        # --- lora candidates — they swap the client's weights, so always last ---
+        # Evaluate with the champion's classifier left loaded — a crop -> class
+        # function is not tied to the detector's score distribution, and removing
+        # it would make lora fight carrying a handicap equal to its gain.
+        # served_* is what the detector has loaded right now (updated per candidate).
+        served_w, served_a = acc.served_w, acc.served_a
+        for c in lora_cands:
+            mat_dir = rd / "settings" / _slug(c["id"])
+            base_axes = {**c["axes"], "lora": False}
+            wall, t0, n_skip = {}, time.monotonic(), len(skipped)
+            try:
+                materials = self._materialize_timed(base_axes, mat_dir, wall)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("lora candidate %s material failed — rejected", c["id"])
+                skipped.append({**c, "skipped": "error",
+                                "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
+                continue
+            if self._guard_material(c, materials, skipped):
+                _close_wall(wall, t0, skipped[n_skip:])
+                continue
+            try:
+                # lora axis = tail fine-tune + λ-interpolation arms —
+                # contract {"decision","weights","grid","setting"}
+                res = tail_round.run_tail_candidate(
+                    self.cfg, self.ds, base_axes, materials, mat_dir,
+                    screen_fn=self._screen,
+                    weights_ctl=self.detector_hooks["weights_ctl"],
+                    base_weights=self.detector_hooks["base_weights"],
+                    restore_weights=champion.get("weights"),
+                    seed=self.cfg.run_seed)
+                # adopted: the winning arm stays loaded; otherwise restore_weights (current)
+                served_w = res["weights"] or champion.get("weights")
+            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
+                log.exception("lora candidate %s failed — restored current weights and rejected", c["id"])
+                self.detector_hooks["weights_ctl"](champion.get("weights"))
+                served_w = champion.get("weights")
+                skipped.append({**c, "skipped": "error",
+                                "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
+                continue
+            _close_wall(wall, t0, ())
+            entry = {**c, "materials_dir": str(mat_dir),
+                     "setting": res["setting"],
+                     "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
+                                             default=0.0),
+                     "lora": res["decision"]}
+            _relabel_unused(entry)
+            screened.append({k: entry[k] for k in
+                             ("id", "axes", "materials_dir", "setting",
+                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
+                            | _requested(entry) | _unused_record(entry)
+                            | _reask_record(entry) | {"_wall": wall})
+            if not res["decision"].get("adopted"):
+                skipped.append({**c, "skipped": "lora_gate",
+                                "note": res["decision"].get("reason", ""),
+                                "wall_min": _wall_min(wall)})
+                continue
+            setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
+            entry["setting"] = setting
+            t1 = time.monotonic()
+            ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
+            wall["holdout"] = time.monotonic() - t1
+            evaluated.append({**entry, "_materials": materials,
+                              "_weights": str(res["weights"]),
+                              "eval": ev, "gate": _gate(ev)})
+
+        # --- crop classifier candidates — detector-state candidates, same discipline as lora ---
+        # Measure them on the champion's weights. If a winning lora arm stayed
+        # loaded and the classifier then won, the champion would be served without
+        # that arm while its τ and holdout F came from on top of it — they would
+        # not match the serving state (adapt_round restores only the artifact).
+        if classifier_cands and not _same_state(served_w, champion.get("weights")):
+            self.detector_hooks["weights_ctl"](champion.get("weights"))
+            served_w = champion.get("weights")
+        for c in classifier_cands:
+            mat_dir = rd / "settings" / _slug(c["id"])
+            base_axes = {**c["axes"], "crop_classifier": False}
+            wall, t0, n_skip = {}, time.monotonic(), len(skipped)
+            try:
+                materials = self._materialize_timed(base_axes, mat_dir, wall)
+                if self._guard_material(c, materials, skipped):
+                    _close_wall(wall, t0, skipped[n_skip:])
+                    continue
+                res = adapt_round.run_classifier_candidate(
+                    self.cfg, self.ds, base_axes, materials, mat_dir,
+                    screen_fn=self._screen,
+                    adapt_ctl=self._adapt_ctl,
+                    repo_root=self.detector_hooks["repo_root"],
+                    restore_root=champion.get("adapt_root"),
+                    seed=self.cfg.run_seed, client=self.client)
+                # adopted: its own artifact stays loaded; otherwise restore_root (current)
+                served_a = res["adapt_root"] or champion.get("adapt_root")
+            except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
+                log.exception("classifier candidate %s failed — restored current state and rejected", c["id"])
+                self._adapt_ctl(champion.get("adapt_root"))
+                served_a = champion.get("adapt_root")
+                skipped.append({**c, "skipped": "error",
+                                "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
+                continue
+            _close_wall(wall, t0, ())
+            entry = {**c, "materials_dir": str(mat_dir),
+                     "setting": res["setting"],
+                     "fit_dev_micro_f_beta":
+                         res["setting"]["fit_dev_micro_f_beta"],
+                     "crop_classifier": res["decision"]}
+            _relabel_unused(entry)
+            screened.append({k: entry[k] for k in
+                             ("id", "axes", "materials_dir", "setting",
+                              "fit_dev_micro_f_beta")}
+                            | {"crop_classifier": res["decision"]}
+                            | _requested(entry) | _unused_record(entry)
+                            | _reask_record(entry) | {"_wall": wall})
+            if not res["decision"].get("adopted"):
+                # The tripwire (too few training crops) keeps the same material
+                # until the champion changes — record the axis as empty so it reaches
+                # the planner's dead-axis list. It cannot be blocked up front because
+                # the background FP count is an inference result.
+                dead = ({"empty_axis": "crop_classifier"}
+                        if res["decision"].get("tripwire") else {})
+                skipped.append({**c, "skipped": "classifier_gate", **dead,
+                                "note": res["decision"].get("reason", ""),
+                                "wall_min": _wall_min(wall)})
+                continue
+            setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
+            entry["setting"] = setting
+            t1 = time.monotonic()
+            ev = self._evaluate_candidate(entry, setting, materials)
+            wall["holdout"] = time.monotonic() - t1
+            evaluated.append({**entry, "_materials": materials,
+                              "_adapt_root": str(res["adapt_root"]),
+                              "eval": ev, "gate": _gate(ev)})
+        acc.screened.extend(screened)
+        acc.served_w, acc.served_a = served_w, served_a
 
 
 def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
@@ -912,10 +1239,12 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
 
         # if resume reset the counter to 0, an already-saturated run would spend more
         # rounds — restore the trailing stagnant count from history and continue it.
+        # the count of empty rounds (nothing measured on holdout) is restored the same way
         stagnant_rounds = _trailing_stagnant(history, cfg.saturation.epsilon)
-        if stagnant_rounds >= cfg.saturation.rounds:
-            result.stopped = "saturation"
-        else:
+        empty_rounds = _trailing_empty(history)
+        result.stopped = _saturated(cfg.saturation, stagnant_rounds,
+                                    empty_rounds) or result.stopped
+        if result.stopped == "rounds":
             for r in range(start, rounds + 1):
                 decision, champion = loop.run_round(r, champion, history)
                 history = loop._read_history()
@@ -926,9 +1255,14 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 stagnant_rounds = (stagnant_rounds + 1
                                    if _stagnant(decision, cfg.saturation.epsilon)
                                    else 0)
-                if stagnant_rounds >= cfg.saturation.rounds:
-                    result.stopped = "saturation"
+                empty_rounds = empty_rounds + 1 if _empty_round(decision) else 0
+                stop = _saturated(cfg.saturation, stagnant_rounds, empty_rounds)
+                if stop:
+                    result.stopped = stop
                     break
+        # the final champion's diagnosis — material for the report's residual-miss
+        # analysis (rounds/final)
+        final_diag = loop.final_diagnosis(champion, history)
 
     _write(loop.out_dir / "run_summary.json", {
         "stopped": result.stopped,
@@ -941,6 +1275,7 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                               and (e.get("decision") or {}).get("adopted")),
         "champion": {"id": champion.get("id"), "axes": champion.get("axes"),
                      "micro_f_beta": (champion.get("eval") or {}).get("micro_f_beta")},
+        "final_diagnosis": final_diag,
         "finished_at": datetime.now().isoformat(timespec="seconds")})
     result.history = history
     result.champion = champion
@@ -966,6 +1301,41 @@ def _invalidating_hooks(hooks: dict) -> dict:
     return out
 
 
+def _pass_cache_delta(before: dict | None, now: dict | None) -> dict | None:
+    """Pass cache counts during the round (per piece) — history's pass_cache key.
+    entries is the number of pieces held at the end of the round. None outside
+    the cache block."""
+    if now is None:
+        return None
+    before = before or {}
+    out = {k: now[k] - before.get(k, 0) for k in ("hits", "misses", "invalidations")}
+    seen = out["hits"] + out["misses"]
+    out["hit_rate"] = round(out["hits"] / seen, 4) if seen else 0.0
+    out["entries"] = now["entries"]
+    return out
+
+
+def _wall_min(wall: dict) -> dict:
+    """One candidate's wall clock (seconds) → history's wall_min (minutes), per
+    stage and total.
+
+    materialize (material mining) · screen (fit_dev scoring — including the
+    prescreen, the rescorer refit and lora/classifier training) · holdout
+    (evaluation). The planner reads per-axis cost from it."""
+    out = {k: round(v / 60, 2) for k, v in wall.items()}
+    out["total"] = round(sum(wall.values()) / 60, 2)
+    return out
+
+
+def _close_wall(wall: dict, t0: float, new_skips) -> None:
+    """Close screen as the time since t0 minus materialize. Candidate rows
+    rejected in between (new_skips) get wall_min right away — they never reach
+    holdout, so this is their whole cost."""
+    wall["screen"] = max(time.monotonic() - t0 - wall.get("materialize", 0.0), 0.0)
+    for rec in new_skips:
+        rec.setdefault("wall_min", _wall_min(wall))
+
+
 def _tiling_variants(search, axes: dict) -> tuple:
     """The one grid the candidate chose — screen compares only it against tiling off.
 
@@ -976,7 +1346,7 @@ def _tiling_variants(search, axes: dict) -> tuple:
     if not g:
         return ()
     return ({"grid": int(g), "overlap": search.tiling_overlap,
-             "merge": search.tiling_merge},)
+             "merge": search.tiling_merge, "min_score": search.tiling_merge_min_score},)
 
 
 def setting_forwards(setting: dict) -> int:
@@ -997,6 +1367,7 @@ def _champion_summary(champion: dict) -> dict:
     """The champion summary in a history row — with its serving cost (forwards_per_image)."""
     return {"axes": champion["axes"], "round": champion["round"],
             "id": champion["id"], "micro_f_beta": champion["eval"]["micro_f_beta"],
+            "fit_dev_micro_f_beta": champion["setting"]["fit_dev_micro_f_beta"],
             "forwards_per_image": setting_forwards(champion["setting"])}
 
 
@@ -1015,7 +1386,12 @@ def _tiling_record(c: dict) -> dict:
     requested = c.get("requested_axes") or c["axes"]
     if not requested.get("tiling") or not c.get("setting"):
         return {}
-    return {"tiling_used": _uses_tiling(c["setting"])}
+    out = {"tiling_used": _uses_tiling(c["setting"])}
+    if c["setting"].get("tiling_f"):
+        # per-class-mean fit_dev F(β) of the tiled and untiled configs — by how
+        # much it won or fell short
+        out["tiling_f"] = c["setting"]["tiling_f"]
+    return out
 
 
 def _neg_eta_record(c: dict) -> dict:
@@ -1099,6 +1475,36 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+MATERIAL_SUMMARY_MAX = 160    # cap on the material summary in same_setting rows
+
+
+def _material_summary(setting: dict, materials: Materials) -> str:
+    """A short summary of the material in the served state (_served_fp) — carried
+    in same_setting rows.
+
+    For text-modality classes, per-class suppression phrases and aliases
+    verbatim (what refinement converged to is the point); for semantic ones,
+    only exemplar and visual negative counts. Truncated at MATERIAL_SUMMARY_MAX."""
+    mods = {e.get("modality", "semantic")
+            for e in (setting.get("per_class") or {}).values()}
+    parts = []
+    if "text" in mods:
+        neg = {n: v for n, v in sorted(materials.text_negatives.items()) if v}
+        parts.append("text_negatives " + ("; ".join(
+            f"{n}=[{', '.join(sorted(v))}]" for n, v in neg.items()) or "none"))
+        if materials.aliases:
+            parts.append("aliases " + "; ".join(
+                f"{k}={v}" for k, v in sorted(materials.aliases.items())))
+    if "semantic" in mods:
+        n_ex = sum(len(v) for v in materials.exemplars.values())
+        n_vn = sum(len(v) for v in materials.visual_negatives.values())
+        parts.append(f"exemplars {n_ex}" + (f", visual_negatives {n_vn}"
+                                             if n_vn else ""))
+    out = " | ".join(parts)
+    return out if len(out) <= MATERIAL_SUMMARY_MAX \
+        else out[:MATERIAL_SUMMARY_MAX - 1] + "…"
+
+
 def _modality_record(setting: dict, ontology) -> dict:
     """fit_dev F(β) of the semantic and text passes screen measured per class,
     keyed by class name.
@@ -1157,6 +1563,11 @@ def _relabel_unused(entry: dict) -> None:
 
 def _requested(c: dict) -> dict:
     return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
+
+
+def _reask_record(c: dict) -> dict:
+    """For a candidate from a re-ask in the same round, which re-ask it was (reask=k)."""
+    return {"reask": c["reask"]} if c.get("reask") else {}
 
 
 def _unused_record(c: dict) -> dict:
@@ -1289,6 +1700,35 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
     if new_cls:
         return "classifier"
     return "wired"
+
+
+def _empty_round(decision: dict) -> bool:
+    """Did the round measure nothing on holdout — evaluated still empty after the
+    re-asks (no_candidates and planner_stop included)? Not the baseline."""
+    return decision.get("kind") != "baseline" and not decision.get("evaluated")
+
+
+def _trailing_empty(history: list[dict]) -> int:
+    """Consecutive empty rounds at the tail of history — restores the
+    empty_rounds counter on resume. The baseline (round 0) is always a
+    boundary."""
+    n = 0
+    for e in reversed(history):
+        if e.get("round", 0) == 0 or not _empty_round(e.get("decision") or {}):
+            break
+        n += 1
+    return n
+
+
+def _saturated(sat, stagnant: int, empty: int) -> str | None:
+    """The stop reason, or None. An empty round is also stagnant and counts
+    toward saturation.rounds, so when both are reached in the same round the
+    wider one, saturation, is recorded."""
+    if stagnant >= sat.rounds:
+        return "saturation"
+    if sat.empty_rounds and empty >= sat.empty_rounds:
+        return "empty_rounds"
+    return None
 
 
 def _trailing_stagnant(history: list[dict], epsilon: float) -> int:

@@ -49,6 +49,11 @@ class PlannerCfg:
     # path). Images per call are batched; a failed batch degrades to no notes for
     # that batch only.
     crop_notes: bool = True
+    # When every candidate of a round is rejected before holdout (filters,
+    # screen), how many times to ask again in the same conversation within the
+    # same round — diagnosis and champion are reused. 0 turns it off. kind=llm
+    # only (the deterministic planner is not re-asked)
+    max_reasks: int = 1
     launch: VllmLaunchCfg = field(default_factory=VllmLaunchCfg)
 
     _NESTED: ClassVar[dict] = {"launch": VllmLaunchCfg}
@@ -65,11 +70,23 @@ class GateCfg:
 class SaturationCfg:
     rounds: int = 5                      # stop after this many consecutive stagnant rounds
     epsilon: float = 0.0                 # a round is stagnant if the Δ CI lower bound <= this
+    # Stop (stopped="empty_rounds") after this many consecutive rounds that
+    # measured nothing on holdout (even after re-asking). 0 turns it off — such
+    # rounds still count toward rounds
+    empty_rounds: int = 2
 
 
 @dataclass(frozen=True)
 class ScreenCfg:
     top_k: int = 2                       # candidates sent to holdout eval after fit_dev scoring
+    # tiling prescreen — a candidate turning on grid ≥ prescreen_min_grid is first
+    # scored on a deterministic fit_dev subset (max(min_images, ⌈fraction·N⌉)
+    # images). If no class uses a tile there it is rejected without the full
+    # screen; otherwise the full fit_dev is screened as before. fraction 0 turns
+    # it off.
+    prescreen_fraction: float = 0.25
+    prescreen_min_images: int = 20
+    prescreen_min_grid: int = 3
 
 
 @dataclass(frozen=True)
@@ -141,7 +158,15 @@ class SearchCfg:
     # on resolution. merge=nmm unions only fragments touching a seam (containment
     # union would swallow instances).
     tiling_overlap: float = 0.5
-    tiling_merge: str = "nmm"
+    # Merge rule — sahi (default): SAHI GreedyNMM (IOS 0.5, class-wise); nmm:
+    # union only fragments at a seam; nms. min_score is the score at which
+    # detections **take part in the merge** (not a drop threshold) — only those
+    # at or above it are merged (SAHI filters by confidence before merging
+    # because a large low-score box absorbs high-score boxes and grows); those
+    # below it are kept, minus the ones overlapping a merged result, so τ_c can
+    # still be picked from the floor up.
+    tiling_merge: str = "sahi"
+    tiling_merge_min_score: float = 0.3
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -298,10 +323,25 @@ def _validate(cfg: Config) -> None:
                           f"(got {type(cfg.dataset_notes).__name__})")
     if cfg.screen.top_k < 1:
         raise ConfigError(f"screen.top_k: must be >= 1 ({cfg.screen.top_k})")
+    if not (0.0 <= cfg.screen.prescreen_fraction <= 1.0):
+        raise ConfigError("screen.prescreen_fraction: outside [0,1] — 0 is off "
+                          f"({cfg.screen.prescreen_fraction})")
+    if cfg.screen.prescreen_min_images < 1:
+        raise ConfigError("screen.prescreen_min_images: must be >= 1 "
+                          f"({cfg.screen.prescreen_min_images})")
+    if cfg.screen.prescreen_min_grid < 2:
+        raise ConfigError("screen.prescreen_min_grid: must be >= 2 — the smallest "
+                          f"grid is 2 ({cfg.screen.prescreen_min_grid})")
     if cfg.gate.bootstrap < 1:
         raise ConfigError(f"gate.bootstrap: must be >= 1 ({cfg.gate.bootstrap})")
     if not (0.0 < cfg.gate.confidence < 1.0):
         raise ConfigError(f"gate.confidence: outside (0,1) ({cfg.gate.confidence})")
+    if cfg.saturation.empty_rounds < 0:
+        raise ConfigError("saturation.empty_rounds: must be >= 0 — 0 is off "
+                          f"({cfg.saturation.empty_rounds})")
+    if cfg.planner.max_reasks < 0:
+        raise ConfigError("planner.max_reasks: must be >= 0 — 0 is off "
+                          f"({cfg.planner.max_reasks})")
     if cfg.saturation.rounds < 1:
         raise ConfigError(f"saturation.rounds: must be >= 1 ({cfg.saturation.rounds})")
     if cfg.mine.exemplar_selection not in EXEMPLAR_SELECTIONS:
@@ -323,6 +363,9 @@ def _validate(cfg: Config) -> None:
     o = cfg.search.tiling_overlap
     if isinstance(o, bool) or not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
         raise ConfigError(f"search.tiling_overlap: outside [0,1) ({o!r})")
+    s = cfg.search.tiling_merge_min_score
+    if isinstance(s, bool) or not isinstance(s, (int, float)) or not (0.0 <= s < 1.0):
+        raise ConfigError(f"search.tiling_merge_min_score: outside [0,1) ({s!r})")
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")
@@ -338,7 +381,7 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"lora.margin cannot be negative ({cfg.lora.margin})")
 
 
-TILING_MERGES = ("nmm", "nms")
+TILING_MERGES = ("nmm", "nms", "sahi")
 
 
 def load_config(path: str | Path) -> Config:

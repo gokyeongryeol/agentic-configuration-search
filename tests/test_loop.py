@@ -518,7 +518,7 @@ def test_tiling_variants_follow_axis_grid():
     s = config_from_dict({"dataset": "x"}).search
     assert _tiling_variants(s, {"tiling": False}) == ()
     assert _tiling_variants(s, {"tiling": 3}) == (
-        {"grid": 3, "overlap": 0.5, "merge": "nmm"},)
+        {"grid": 3, "overlap": 0.5, "merge": "sahi", "min_score": 0.3},)
 
 
 def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch):
@@ -816,7 +816,10 @@ def test_unused_record_is_shared_by_all_candidate_paths():
 
     assert runner._unused_record({"unused_axes": ["exemplar"]}) == {"unused_axes": ["exemplar"]}
     assert runner._unused_record({}) == {}
-    assert inspect.getsource(runner.Loop.run_round).count("_unused_record(") == 3
+    # the round body is split into run_round (decision, record) and _attempt
+    # (wiring, screen, arms)
+    src = inspect.getsource(runner.Loop.run_round) + inspect.getsource(runner.Loop._attempt)
+    assert src.count("_unused_record(") == 3
 
 
 def test_neg_eta_record_reads_the_screened_setting():

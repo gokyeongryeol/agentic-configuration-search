@@ -79,6 +79,96 @@ def _seam_adjacent(a, b, seams_x, seams_y) -> bool:
     return False
 
 
+def _seam_adjacent_many(a: np.ndarray, b, sx: np.ndarray, sy: np.ndarray) -> np.ndarray:
+    """_seam_adjacent for every row of a at once — (N,) bool. Same rule."""
+    out = np.zeros(len(a), bool)
+    if len(sx):
+        a_ends = np.abs(a[:, 2:3] - sx) <= EDGE_EPS          # (N, S)
+        a_starts = np.abs(a[:, 0:1] - sx) <= EDGE_EPS
+        b_ends = np.abs(b[2] - sx) <= EDGE_EPS                # (S,)
+        b_starts = np.abs(b[0] - sx) <= EDGE_EPS
+        touch = (a_ends & b_starts) | (a_starts & b_ends)
+        overlap = (np.minimum(a[:, 3], b[3]) - np.maximum(a[:, 1], b[1])) > 0
+        out |= touch.any(axis=1) & overlap
+    if len(sy):
+        a_ends = np.abs(a[:, 3:4] - sy) <= EDGE_EPS
+        a_starts = np.abs(a[:, 1:2] - sy) <= EDGE_EPS
+        b_ends = np.abs(b[3] - sy) <= EDGE_EPS
+        b_starts = np.abs(b[1] - sy) <= EDGE_EPS
+        touch = (a_ends & b_starts) | (a_starts & b_ends)
+        overlap = (np.minimum(a[:, 2], b[2]) - np.maximum(a[:, 0], b[0])) > 0
+        out |= touch.any(axis=1) & overlap
+    return out
+
+
+# SAHI GreedyNMMPostprocess defaults (sahi.predict.get_sliced_prediction):
+# postprocess_match_metric="IOS", postprocess_match_threshold=0.5, class_agnostic=False
+SAHI_IOS = 0.5
+
+
+def _ios_matrix(a: np.ndarray) -> np.ndarray:
+    """(N,4) → (N,N) intersection / smaller box area (SAHI calculate_bbox_ios)."""
+    ix = np.clip(np.minimum(a[:, None, 2], a[None, :, 2])
+                 - np.maximum(a[:, None, 0], a[None, :, 0]), 0, None)
+    iy = np.clip(np.minimum(a[:, None, 3], a[None, :, 3])
+                 - np.maximum(a[:, None, 1], a[None, :, 1]), 0, None)
+    area = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    smaller = np.minimum(area[:, None], area[None, :])
+    return np.where(smaller > 0, ix * iy / np.clip(smaller, 1e-9, None), 0.0)
+
+
+def _ios(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return ix * iy / smaller if smaller > 0 else 0.0
+
+
+def _sahi_greedy_nmm(pool: list[dict]) -> list[dict]:
+    """SAHI GREEDYNMM (IOS 0.5, class-wise) — follows sahi.postprocess's two steps.
+
+    1. Per class, scan in (score descending, x1, y1, x2, y2 ascending) order and
+       assign to the current keep every not-yet-assigned later box with
+       IOS ≥ 0.5 against the **original box**.
+    2. Per keep, merge the assigned boxes in order only while IOS ≥ 0.5 holds
+       against the **merged keep** (box = the enclosing box, score = the larger,
+       class = the higher-scoring one = keep).
+    Unlike the nmm mode, a smaller same-class box inside a large one has IOS 1
+    and is absorbed.
+    """
+    out: list[dict] = []
+    by_label: dict = {}
+    for d in pool:
+        by_label.setdefault(d["label"], []).append(d)
+    for label in sorted(by_label, key=str):
+        dets = by_label[label]
+        boxes = np.array([d["box"] for d in dets], dtype=float).reshape(-1, 4)
+        scores = np.array([d["score"] for d in dets], dtype=float)
+        order = np.lexsort((boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0], -scores))
+        ios = _ios_matrix(boxes)
+        taken = np.zeros(len(dets), bool)
+        for pos, i in enumerate(order):
+            if taken[i]:
+                continue
+            rest = order[pos + 1:]
+            rest = rest[~taken[rest]]
+            members = rest[ios[i, rest] >= SAHI_IOS]
+            taken[members] = True
+            keep = dict(dets[i])
+            for j in members:
+                other = dets[j]
+                if _ios(keep["box"], other["box"]) >= SAHI_IOS:
+                    keep["box"] = [min(keep["box"][0], other["box"][0]),
+                                   min(keep["box"][1], other["box"][1]),
+                                   max(keep["box"][2], other["box"][2]),
+                                   max(keep["box"][3], other["box"][3])]
+                    keep["score"] = max(keep["score"], other["score"])
+                    keep["sources"] = sorted(set(keep["sources"]) | set(other["sources"]))
+            out.append(keep)
+    out.sort(key=lambda d: -d["score"])
+    return out
+
+
 def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
           tiles=None, width: int = 0, height: int = 0) -> list[dict]:
     """Merge full + tile detections, in two stages.
@@ -94,33 +184,57 @@ def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
     absorbed into one giant box. The seam condition prevents that.
 
     Results keep their sources tags — read by the rescorer feature tile_agree.
+
+    `mode="sahi"` follows SAHI's default merge (GreedyNMM, IOS 0.5, class-wise)
+    instead of the two stages above (`_sahi_greedy_nmm`) — the same object found
+    by overlapping tiles merges into the enclosing box, and a smaller same-class
+    box inside a large one is absorbed too.
     """
     pool = [{**d, "sources": list(d.get("sources", ["full"]))} for d in full_dets]
     pool += [{**d, "sources": list(d.get("sources", ["tile"]))} for d in tile_dets]
+    if mode == "sahi":
+        return _sahi_greedy_nmm(pool)
     pool.sort(key=lambda d: -d["score"])
 
     seams_x, seams_y = (interior_seams(tiles, width, height) if tiles else (set(), set()))
+    sx = np.array(sorted(seams_x), dtype=float)
+    sy = np.array(sorted(seams_y), dtype=float)
 
+    # Kept boxes are also held as an array, and each detection is compared with
+    # all of them at once — building a 1×1 IoU per pair took tens of seconds per
+    # image at topk 300 × (1+g²) pieces. The verdict is unchanged: the first kept
+    # box, in order, with the same label and IoU ≥ NMS_IOU (dedup) or touching
+    # it across a seam (union). IoU comes from _iou_matrix as before, so the
+    # values are the same.
     kept: list[dict] = []
+    boxes = np.empty((len(pool), 4))
+    labels: list = []
     for det in pool:
-        target = None
-        for k in kept:
-            if k["label"] != det["label"]:
-                continue
-            iou = _iou_matrix(np.array([k["box"]]), np.array([det["box"]]))[0, 0]
-            if iou >= NMS_IOU:          # duplicate of the same object -> keep the higher score
-                target = ("dedup", k)
-                break
-            if mode == "nmm" and _seam_adjacent(k["box"], det["box"], seams_x, seams_y):
-                target = ("union", k)   # piece cut at a seam -> union
-                break
-        if target is None:
+        m = len(kept)
+        hit = None
+        if m:
+            same = np.fromiter((lab == det["label"] for lab in labels), bool, m)
+            if same.any():
+                kb = boxes[:m]
+                iou = _iou_matrix(kb, np.array([det["box"]], dtype=float))[:, 0]
+                dup = same & (iou >= NMS_IOU)
+                cut = (same & _seam_adjacent_many(kb, det["box"], sx, sy)
+                       if mode == "nmm" else np.zeros(m, bool))
+                idx = np.flatnonzero(dup | cut)
+                if len(idx):
+                    i = int(idx[0])
+                    hit = (("dedup" if dup[i] else "union"), i)
+        if hit is None:
+            boxes[m] = det["box"]
+            labels.append(det["label"])
             kept.append(det)
             continue
-        kind, k = target
+        kind, i = hit
+        k = kept[i]
         if kind == "union":
             k["box"] = [min(k["box"][0], det["box"][0]), min(k["box"][1], det["box"][1]),
                         max(k["box"][2], det["box"][2]), max(k["box"][3], det["box"][3])]
+            boxes[i] = k["box"]
         k["sources"] = sorted(set(k["sources"]) | set(det["sources"]))
     return kept
 
@@ -174,8 +288,33 @@ def merge_from_results(results: list[list[dict]], tiles, degenerate: bool,
     tile_dets: list[dict] = []
     for (x1, y1, _x2, _y2), dets in zip(tiles if not degenerate else [], results[1:]):
         tile_dets += [{**d, "sources": ["tile"]} for d in offset_detections(dets, x1, y1)]
-    return merge(full_dets, tile_dets, tile_cfg.get("merge", "nmm"),
-                 tiles=tiles, width=width, height=height)
+    mode = tile_cfg.get("merge", "nmm")
+    floor = float(tile_cfg.get("min_score") or 0.0)
+    if floor <= 0.0:
+        return merge(full_dets, tile_dets, mode, tiles=tiles, width=width, height=height)
+    # min_score is the score at which detections **take part in the merge** (not a
+    # drop threshold). Only those at or above it use the merge rule — so a large
+    # low-score box cannot absorb high-score boxes and grow (why SAHI filters by
+    # confidence before merging). Those below it only get IoU duplicates removed
+    # among themselves, then lose the ones overlapping a merged result with the
+    # same label and IoU ≥ NMS_IOU, and are kept — so the per-class threshold τ_c
+    # can still be picked from the floor up.
+    def split(dets):
+        return ([d for d in dets if d["score"] >= floor], [d for d in dets if d["score"] < floor])
+    full_hi, full_lo = split(full_dets)
+    tile_hi, tile_lo = split(tile_dets)
+    kept = merge(full_hi, tile_hi, mode, tiles=tiles, width=width, height=height)
+    low = merge(full_lo, tile_lo, "nms", tiles=tiles, width=width, height=height)
+    if not low:
+        return kept
+    if kept:
+        hi_boxes = np.array([d["box"] for d in kept], dtype=float)
+        hi_labels = [d["label"] for d in kept]
+        overlap = _iou_matrix(np.array([d["box"] for d in low], dtype=float), hi_boxes)
+        low = [d for i, d in enumerate(low)
+               if not any(overlap[i, j] >= NMS_IOU and hi_labels[j] == d["label"]
+                          for j in np.flatnonzero(overlap[i] >= NMS_IOU))]
+    return kept + low
 
 
 def run_tiled(predict_fn, image, tile_cfg: dict) -> list[dict]:
@@ -183,7 +322,10 @@ def run_tiled(predict_fn, image, tile_cfg: dict) -> list[dict]:
 
     predict_fn(images: list[PIL.Image]) -> list[list[dict]] — detections per image.
     image: PIL.Image (loaded by the caller).
-    tile_cfg: {"grid": int, "overlap": float, "merge": "nmm"|"nms"}
+    tile_cfg: {"grid": int, "overlap": float, "merge": "nmm"|"nms"|"sahi",
+               "min_score": float (optional — the score to take part in the merge:
+                                   below it, nms among themselves, then kept minus
+                                   those overlapping a merged result)}
     """
     tiles, degenerate = tile_plan(image.width, image.height, tile_cfg)
     crops = [] if degenerate else [image.crop(t) for t in tiles]

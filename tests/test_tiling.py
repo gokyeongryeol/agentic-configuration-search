@@ -205,3 +205,205 @@ def test_run_tiled_grid_calls_full_plus_g_squared():
     assert len(calls) == 1 and len(calls[0]) == 1 + 9
     assert calls[0][0] == (4000, 3000)
     assert set(calls[0][1:]) == {(2000, 1500)}
+
+
+
+
+# --- merge vectorization: results must be bit-identical to the old implementation (a 1×1 IoU per detection pair) ---
+
+def _reference_merge(full_dets, tile_dets, mode="nmm", tiles=None, width=0, height=0):
+    """merge as it was before vectorization — the equivalence reference."""
+    import numpy as np
+    from agentic_configuration_search.core.tiling import NMS_IOU, _iou_matrix, _seam_adjacent, interior_seams
+    pool = [{**d, "sources": list(d.get("sources", ["full"]))} for d in full_dets]
+    pool += [{**d, "sources": list(d.get("sources", ["tile"]))} for d in tile_dets]
+    pool.sort(key=lambda d: -d["score"])
+    seams_x, seams_y = (interior_seams(tiles, width, height) if tiles else (set(), set()))
+    kept = []
+    for det in pool:
+        target = None
+        for k in kept:
+            if k["label"] != det["label"]:
+                continue
+            iou = _iou_matrix(np.array([k["box"]]), np.array([det["box"]]))[0, 0]
+            if iou >= NMS_IOU:
+                target = ("dedup", k)
+                break
+            if mode == "nmm" and _seam_adjacent(k["box"], det["box"], seams_x, seams_y):
+                target = ("union", k)
+                break
+        if target is None:
+            kept.append(det)
+            continue
+        kind, k = target
+        if kind == "union":
+            k["box"] = [min(k["box"][0], det["box"][0]), min(k["box"][1], det["box"][1]),
+                        max(k["box"][2], det["box"][2]), max(k["box"][3], det["box"][3])]
+        k["sources"] = sorted(set(k["sources"]) | set(det["sources"]))
+    return kept
+
+
+def _random_pieces(rng, width, height, grid, n_per_piece, n_labels):
+    """Full + tile detections (tile coordinates). Some boxes touch a tile border
+    exactly to take the seam-union path, some overlap the same object in full and
+    tile to take the dedup path."""
+    cfg = {"grid": grid, "overlap": 0.5, "merge": "nmm"}
+    tiles, _ = tiling.tile_plan(width, height, cfg)
+
+    def box(w, h):
+        x, y = rng.uniform(0, w - 8), rng.uniform(0, h - 8)
+        s = rng.uniform(4, 60)
+        return [x, y, min(w, x + s), min(h, y + rng.uniform(4, 60))]
+
+    full = [{"box": box(width, height), "score": round(rng.uniform(0.03, 0.95), 3),
+             "label": rng.randrange(n_labels)} for _ in range(n_per_piece)]
+    per_tile = []
+    for (x1, y1, x2, y2) in tiles:
+        tw, th = x2 - x1, y2 - y1
+        ds = []
+        for _ in range(n_per_piece):
+            b = box(tw, th)
+            r = rng.random()
+            if r < 0.15:            # touches the right border — seam-union candidate with the neighbor tile
+                b[2] = float(tw)
+            elif r < 0.30:          # touches the bottom border
+                b[3] = float(th)
+            elif r < 0.45 and full:  # nearly the same object as a full detection
+                fb = rng.choice(full)["box"]
+                b = [fb[0] - x1 + 1, fb[1] - y1, fb[2] - x1 + 1, fb[3] - y1]
+            ds.append({"box": b, "score": round(rng.uniform(0.03, 0.95), 3),
+                       "label": rng.randrange(n_labels)})
+        per_tile.append(ds)
+    return [full] + per_tile, tiles
+
+
+@pytest.mark.parametrize("seed", range(12))
+@pytest.mark.parametrize("mode", ["nmm", "nms"])
+def test_merge_matches_pairwise_reference(seed, mode):
+    import random
+    rng = random.Random(seed)
+    width, height = rng.choice([(640, 640), (800, 600), (333, 517)])
+    grid = rng.choice([2, 3])
+    results, tiles = _random_pieces(rng, width, height, grid,
+                                    n_per_piece=rng.choice([0, 3, 40]),
+                                    n_labels=rng.choice([1, 3]))
+    cfg = {"grid": grid, "overlap": 0.5, "merge": mode}
+    full = [{**d, "sources": ["full"]} for d in results[0]]
+    tile = []
+    for (x1, y1, _x2, _y2), dets in zip(tiles, results[1:]):
+        tile += [{**d, "sources": ["tile"]} for d in tiling.offset_detections(dets, x1, y1)]
+    got = tiling.merge(full, tile, mode, tiles=tiles, width=width, height=height)
+    ref = _reference_merge(full, tile, mode, tiles=tiles, width=width, height=height)
+    assert got == ref
+    assert tiling.merge_from_results(results, tiles, False, width, height, cfg) == ref
+
+
+def test_merge_is_fast_on_topk_sized_inputs():
+    """apply_topk (300) per piece × (full + 4 tiles) — the old implementation took
+    seconds to tens of seconds per image (a 1×1 numpy IoU per detection pair).
+    It must stay under a second per image."""
+    import random
+    import time
+    rng = random.Random(0)
+    results, tiles = _random_pieces(rng, 640, 640, 2, n_per_piece=300, n_labels=1)
+    t0 = time.perf_counter()
+    tiling.merge_from_results(results, tiles, False, 640, 640,
+                              {"grid": 2, "overlap": 0.5, "merge": "nmm"})
+    assert time.perf_counter() - t0 < 1.0
+
+
+
+
+# --- sahi mode: the same rule as SAHI GreedyNMMPostprocess defaults (IOS 0.5, class-wise) ---
+
+def _d(box, score, label=1, src="tile"):
+    return {"box": list(map(float, box)), "score": score, "label": label, "sources": [src]}
+
+
+def test_sahi_merges_overlapping_slices_of_one_object_into_their_union():
+    """Two overlapping tiles catching one object (IOS ≥ 0.5) merge into the enclosing box with the larger score."""
+    a, b = _d([100, 100, 200, 160], 0.8), _d([140, 100, 230, 160], 0.6)
+    out = tiling.merge([], [a, b], "sahi")
+    assert len(out) == 1
+    assert out[0]["box"] == [100.0, 100.0, 230.0, 160.0] and out[0]["score"] == 0.8
+
+
+def test_sahi_absorbs_a_box_inside_another_of_the_same_class():
+    """IOS divides by the smaller box area, so a small box inside a large one has IOS 1 —
+    SAHI absorbs it by default (nmm keeps both since they do not touch at a seam)."""
+    big, small = _d([0, 0, 200, 200], 0.9, src="full"), _d([50, 50, 80, 80], 0.5)
+    assert len(tiling.merge([big], [small], "sahi")) == 1
+    assert len(tiling.merge([big], [small], "nmm")) == 2
+
+
+def test_sahi_is_class_wise_and_keeps_disjoint_boxes():
+    a, b = _d([0, 0, 100, 100], 0.9, label=1), _d([10, 10, 100, 100], 0.8, label=2)
+    c = _d([300, 300, 350, 350], 0.7, label=1)
+    out = tiling.merge([a], [b, c], "sahi")
+    assert sorted(d["label"] for d in out) == [1, 1, 2]
+
+
+def test_sahi_matches_on_original_boxes_then_rechecks_against_the_merged_box():
+    """Assignment to a keep uses IOS against the original box (greedy); the actual merge
+    rechecks against the merged keep — below IOS 0.5 after merging, that box is
+    dropped (SAHI _apply_merge)."""
+    keep = _d([0, 0, 100, 100], 0.9)
+    m1 = _d([50, 0, 400, 100], 0.8)      # IOS 0.5 with keep — merged, keep becomes [0,0,400,100]
+    m2 = _d([90, 0, 110, 10], 0.7)       # IOS 0.5 with the original keep → assigned; IOS 1 with the merged keep too
+    m3 = _d([95, 90, 105, 190], 0.6)     # IOS 0.05 with the original keep → not assigned, kept on its own
+    out = tiling.merge([keep], [m1, m2, m3], "sahi")
+    assert [d["box"] for d in out] == [[0.0, 0.0, 400.0, 100.0], [95.0, 90.0, 105.0, 190.0]]
+
+
+def test_sahi_ties_break_by_coordinates_like_sahi():
+    """On equal scores SAHI keeps the box first in (x1, y1, x2, y2) ascending order."""
+    left, right = _d([0, 0, 100, 100], 0.5), _d([20, 0, 120, 100], 0.5)
+    out = tiling.merge([], [right, left], "sahi")
+    assert out[0]["box"] == [0.0, 0.0, 120.0, 100.0]
+
+
+def test_sahi_unions_sources():
+    out = tiling.merge([_d([0, 0, 100, 100], 0.9, src="full")],
+                       [_d([10, 0, 100, 100], 0.8, src="tile")], "sahi")
+    assert out[0]["sources"] == ["full", "tile"]
+
+
+def test_sahi_is_fast_on_topk_sized_inputs():
+    import random
+    import time
+    rng = random.Random(0)
+    results, tiles = _random_pieces(rng, 640, 640, 3, n_per_piece=300, n_labels=1)
+    t0 = time.perf_counter()
+    tiling.merge_from_results(results, tiles, False, 640, 640,
+                              {"grid": 3, "overlap": 0.5, "merge": "sahi"})
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_merge_min_score_only_gates_who_merges_and_keeps_low_scores():
+    """min_score is the score at which detections take part in the merge (why SAHI
+    filters by confidence before merging — a large low-score box absorbs high-score
+    boxes and grows). Those below it are kept, minus the ones overlapping a merged
+    result — so τ_c can be picked from the floor up."""
+    small_hi = {"box": [10.0, 10.0, 30.0, 30.0], "score": 0.9, "label": 1}
+    big_lo = {"box": [0.0, 0.0, 300.0, 300.0], "score": 0.1, "label": 1}
+    dup_lo = {"box": [11.0, 10.0, 31.0, 30.0], "score": 0.2, "label": 1}       # duplicate of small_hi
+    other_lo = {"box": [400.0, 10.0, 440.0, 50.0], "score": 0.15, "label": 1}  # a separate object
+    other_cls = {"box": [10.0, 10.0, 30.0, 30.0], "score": 0.2, "label": 2}    # another class
+    tiles = [(0, 0, 320, 320), (160, 0, 480, 320)]
+    results = [[small_hi, big_lo, dup_lo, other_lo, other_cls], [], []]
+    cfg = {"grid": 2, "overlap": 0.5, "merge": "sahi"}
+    merged = tiling.merge_from_results(results, tiles, False, 480, 320, cfg)
+    assert merged[0]["box"] == [0.0, 0.0, 300.0, 300.0]          # without the threshold it absorbs and grows
+    merged = tiling.merge_from_results(results, tiles, False, 480, 320, {**cfg, "min_score": 0.3})
+    got = sorted((d["label"], d["score"], tuple(d["box"])) for d in merged)
+    assert got == sorted([(1, 0.9, (10.0, 10.0, 30.0, 30.0)), (1, 0.1, (0.0, 0.0, 300.0, 300.0)),
+                          (1, 0.15, (400.0, 10.0, 440.0, 50.0)), (2, 0.2, (10.0, 10.0, 30.0, 30.0))])
+
+
+def test_search_tiling_defaults_to_sahi_with_min_score():
+    from agentic_configuration_search.config import ConfigError, config_from_dict
+    cfg = config_from_dict({"dataset": "x"})
+    assert cfg.search.tiling_merge == "sahi" and cfg.search.tiling_merge_min_score == 0.3
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ConfigError, match="tiling_merge_min_score"):
+            config_from_dict({"dataset": "x", "search": {"tiling_merge_min_score": bad}})

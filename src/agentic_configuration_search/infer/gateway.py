@@ -115,33 +115,53 @@ def dedup_class_duplicates(dets: list[dict], iou_thr: float) -> list[dict]:
 # Reuses inference for the same input under the same request conditions. Exact
 # only while the detector runs each image of a call on its own (the YOLOE
 # backend predicts with batch=1); batched forwards could shift scores with the
-# batch composition. Keys hash what the detector actually receives (file bytes
-# for a path, the pixel buffer for an in-memory image), so a changed file under
-# the same path is a different key. When the detector state (weights, artifact)
-# changes, invalidate_pass_cache() empties it — the runner wraps the
-# detector_hooks controls. Embedding requests are not cached.
+# batch composition. If the backend ever moves to batched prediction, measure
+# that shift on YOLOE before relying on this cache. Keys hash what the detector
+# actually receives (file bytes for a path, the pixel buffer for an in-memory
+# image), so a changed file under the same path is a different key. When the
+# detector state (weights, artifact) changes, invalidate_pass_cache() empties
+# it — the runner wraps the detector_hooks controls. Embedding requests are not
+# cached.
 PASS_CACHE_MAX = 8192            # entry cap (pieces) — responses kept as JSON strings
 _pass_cache: OrderedDict | None = None
+# Running counts in the block — hits/misses per piece (image or tile) and
+# invalidation calls. The runner logs and records the per-round difference (the
+# effect has to be visible to decide whether to keep it on).
+_pass_stats: dict | None = None
+
+
+def _new_stats() -> dict:
+    return {"hits": 0, "misses": 0, "invalidations": 0}
 
 
 @contextmanager
 def pass_cache(max_entries: int = PASS_CACHE_MAX):
     """Reuse infer_config results inside this block (outside it, nothing changes)."""
-    global _pass_cache, PASS_CACHE_MAX
+    global _pass_cache, PASS_CACHE_MAX, _pass_stats
     if max_entries < 0:
         raise ValueError(f"pass_cache max_entries must be >= 0 (got {max_entries})")
-    prev, prev_max = _pass_cache, PASS_CACHE_MAX
-    _pass_cache, PASS_CACHE_MAX = OrderedDict(), max_entries
+    prev, prev_max, prev_stats = _pass_cache, PASS_CACHE_MAX, _pass_stats
+    _pass_cache, PASS_CACHE_MAX, _pass_stats = OrderedDict(), max_entries, _new_stats()
     try:
         yield
     finally:
-        _pass_cache, PASS_CACHE_MAX = prev, prev_max
+        _pass_cache, PASS_CACHE_MAX, _pass_stats = prev, prev_max, prev_stats
+
+
+def pass_cache_stats() -> dict | None:
+    """Running counts of the current pass_cache block (a copy) plus the number of
+    pieces held — None outside the block."""
+    if _pass_cache is None or _pass_stats is None:
+        return None
+    return {**_pass_stats, "entries": len(_pass_cache)}
 
 
 def invalidate_pass_cache() -> None:
     """The detector state changed — the same input is a different inference."""
     if _pass_cache is not None:
         _pass_cache.clear()
+        if _pass_stats is not None:
+            _pass_stats["invalidations"] += 1
 
 
 def _content_key(image) -> str:
@@ -185,6 +205,9 @@ def _cached_predict_images(client, batch, queries, sig, **kw) -> list:
             cache.move_to_end(k)
             got[k] = cache[k]
     todo = [k for k in dict.fromkeys(keys) if k not in got]
+    if _pass_stats is not None:
+        _pass_stats["hits"] += len(got)
+        _pass_stats["misses"] += len(todo)
     if todo:
         first = {k: im for k, im in zip(reversed(keys), reversed(batch))}
         for k, p in zip(todo, client.predict_images([first[k] for k in todo],

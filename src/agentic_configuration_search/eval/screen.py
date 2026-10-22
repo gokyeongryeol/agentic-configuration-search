@@ -83,6 +83,19 @@ def evaluate_grid(cfg, client, split, ontology, materials: Materials,
     return rows, dets_by_config
 
 
+def tiling_f(grid: list[dict], mean_f: dict[int, float]) -> dict | None:
+    """Best per-class-mean F(β) of the tiled and of the untiled configs — the same
+    yardstick as the shared-config pick (max sum of per-class F(β)). The planner
+    reads how far tiling fell short when it went unused. None if either side is
+    missing from the grid."""
+    by_id = {c["config_id"]: c for c in grid}
+    tiled = [f for i, f in mean_f.items() if by_id[i].get("tiling")]
+    untiled = [f for i, f in mean_f.items() if not by_id[i].get("tiling")]
+    if not tiled or not untiled:
+        return None
+    return {"tiled": round(max(tiled), 4), "untiled": round(max(untiled), 4)}
+
+
 def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
                      neg_eta_grid=(), tiling_variants=()) -> dict:
     """Fix one candidate's setting and score it on fit_dev.
@@ -97,10 +110,13 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
     have_semantic = any(materials.exemplars.values())
     rows: list[dict] = []
     dets_by_config: dict[int, list] = {}
+    n_classes = max(len(ontology.classes), 1)
+    tile_f = None
     if have_semantic:
         rows, dets_by_config = evaluate_grid(cfg, client, fit_dev, ontology,
                                              materials, grid)
         best = select_shared_config(rows, grid)
+        tile_f = tiling_f(grid, _mean_f(rows, n_classes))
     else:
         best = {}
     per_class: dict[int, dict] = {
@@ -168,6 +184,7 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
                     rows_t.append({"config_id": config_id, "category_id": c.id,
                                    "threshold": thr, "f_beta": f1})
             best_t = select_shared_config(rows_t, grid)
+            tile_f = tiling_f(grid, _mean_f(rows_t, n_classes))
             shared_id = (next(iter(best_t.values()))["config_id"] if best_t
                          else 0)
         for c in ontology.classes:
@@ -197,6 +214,17 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
             recs, [c.id for c in ontology.classes],
             iou_thr=cfg.detector.iou_threshold, beta=cfg.beta))
 
-    return {"configs": grid, "per_class": per_class,
-            "fit_dev_micro_f_beta": micro,
-            "modality_diagnostic": modality_diagnostic}
+    out = {"configs": grid, "per_class": per_class,
+           "fit_dev_micro_f_beta": micro,
+           "modality_diagnostic": modality_diagnostic}
+    if tile_f:
+        out["tiling_f"] = tile_f
+    return out
+
+
+def _mean_f(rows: list[dict], n_classes: int) -> dict[int, float]:
+    """Per-config mean of the per-class F(β) rows."""
+    sums: dict[int, float] = {}
+    for r in rows:
+        sums[r["config_id"]] = sums.get(r["config_id"], 0.0) + r["f_beta"]
+    return {i: v / n_classes for i, v in sums.items()}
