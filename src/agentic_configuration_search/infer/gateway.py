@@ -115,11 +115,13 @@ def dedup_class_duplicates(dets: list[dict], iou_thr: float) -> list[dict]:
 # Reuses inference for the same input under the same request conditions. Exact
 # only while the detector runs each image of a call on its own (the YOLOE
 # backend predicts with batch=1); batched forwards could shift scores with the
-# batch composition. Keys hash what the detector actually receives (file bytes
-# for a path, the pixel buffer for an in-memory image), so a changed file under
-# the same path is a different key. When the detector state (weights, artifact)
-# changes, invalidate_pass_cache() empties it — the runner wraps the
-# detector_hooks controls. Embedding requests are not cached.
+# batch composition. If the backend ever moves to batched prediction, measure
+# that shift on YOLOE before relying on this cache. Keys hash what the detector
+# actually receives (file bytes for a path, the pixel buffer for an in-memory
+# image), so a changed file under the same path is a different key. When the
+# detector state (weights, artifact) changes, invalidate_pass_cache() empties
+# it — the runner wraps the detector_hooks controls. Embedding requests are not
+# cached.
 PASS_CACHE_MAX = 8192            # entry cap (pieces) — responses kept as JSON strings
 _pass_cache: OrderedDict | None = None
 # Running counts in the block — hits/misses per piece (image or tile) and
