@@ -3,8 +3,7 @@
 #
 # Why a standalone script: launch code used to be inlined in several scripts, and
 # those copies had already drifted on --max-model-len (copy 8192 / actually served
-# 16384). Launching happens in exactly one place (run_parallel.sh and
-# run_seeds_yoloe.sh both call this).
+# 16384). Launching happens in exactly one place (run_parallel.sh calls this).
 #
 # Properties:
 #   · **Idempotent** — if health already returns 200, exit without doing anything.
