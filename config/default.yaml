@@ -94,7 +94,8 @@ search:                                   # value space of the screen (fit_dev) 
   # tiling axis (2–6); only parameters shared by every grid live here.
   # Zoom (g-1)(1-overlap)+1, 1+g² passes per image — resolution-independent.
   tiling_overlap: 0.5                     # overlap 0.5: grid 2 → 1.5×, grid 3 → 2.0×
-  tiling_merge: nmm                       # nmm (union seam fragments) | nms
+  tiling_merge: sahi                      # sahi (SAHI GreedyNMM, IOS 0.5 — default) | nmm (union seam fragments) | nms
+  tiling_merge_min_score: 0.3             # score to take part in the merge — below it, kept minus those overlapping a merged result
   modalities: [semantic, text]
   disabled_axes: []                       # axes the planner may not turn on in this run (e.g. [lora, tiling]) — a champion's own value is kept
   disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}

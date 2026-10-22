@@ -1129,7 +1129,7 @@ def _tiling_variants(search, axes: dict) -> tuple:
     if not g:
         return ()
     return ({"grid": int(g), "overlap": search.tiling_overlap,
-             "merge": search.tiling_merge},)
+             "merge": search.tiling_merge, "min_score": search.tiling_merge_min_score},)
 
 
 def setting_forwards(setting: dict) -> int:

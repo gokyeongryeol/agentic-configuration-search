@@ -518,7 +518,7 @@ def test_tiling_variants_follow_axis_grid():
     s = config_from_dict({"dataset": "x"}).search
     assert _tiling_variants(s, {"tiling": False}) == ()
     assert _tiling_variants(s, {"tiling": 3}) == (
-        {"grid": 3, "overlap": 0.5, "merge": "nmm"},)
+        {"grid": 3, "overlap": 0.5, "merge": "sahi", "min_score": 0.3},)
 
 
 def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch):

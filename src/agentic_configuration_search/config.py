@@ -149,7 +149,15 @@ class SearchCfg:
     # on resolution. merge=nmm unions only fragments touching a seam (containment
     # union would swallow instances).
     tiling_overlap: float = 0.5
-    tiling_merge: str = "nmm"
+    # Merge rule — sahi (default): SAHI GreedyNMM (IOS 0.5, class-wise); nmm:
+    # union only fragments at a seam; nms. min_score is the score at which
+    # detections **take part in the merge** (not a drop threshold) — only those
+    # at or above it are merged (SAHI filters by confidence before merging
+    # because a large low-score box absorbs high-score boxes and grows); those
+    # below it are kept, minus the ones overlapping a merged result, so τ_c can
+    # still be picked from the floor up.
+    tiling_merge: str = "sahi"
+    tiling_merge_min_score: float = 0.3
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -340,6 +348,9 @@ def _validate(cfg: Config) -> None:
     o = cfg.search.tiling_overlap
     if isinstance(o, bool) or not isinstance(o, (int, float)) or not (0.0 <= o < 1.0):
         raise ConfigError(f"search.tiling_overlap: outside [0,1) ({o!r})")
+    s = cfg.search.tiling_merge_min_score
+    if isinstance(s, bool) or not isinstance(s, (int, float)) or not (0.0 <= s < 1.0):
+        raise ConfigError(f"search.tiling_merge_min_score: outside [0,1) ({s!r})")
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")
@@ -355,7 +366,7 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"lora.margin cannot be negative ({cfg.lora.margin})")
 
 
-TILING_MERGES = ("nmm", "nms")
+TILING_MERGES = ("nmm", "nms", "sahi")
 
 
 def load_config(path: str | Path) -> Config:
