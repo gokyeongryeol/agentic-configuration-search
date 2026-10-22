@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .axes import (BASELINE, TILING_GRIDS, DatasetFacts, merge_onto, uses_disabled_axes,
                    validate_axes)
+from .gates import tiling_gate
 
 # Error kind → (axis, value) pairs that can address it, most promising first.
 # If a value equals the champion's (already on), move to the next. exemplar
@@ -147,6 +148,7 @@ def propose(history: list[dict], diagnosis: dict, *,
     champion = validate_axes(
         (history[-1].get("champion", {}).get("axes") if history else None) or BASELINE)
     tried = tried_combos(history)
+    gate = tiling_gate(history)
 
     def _applicable(kind) -> list[dict]:
         out = []
@@ -171,6 +173,8 @@ def propose(history: list[dict], diagnosis: dict, *,
                                               # training would be skipped — DatasetFacts)
             if tuple(sorted(axes.items())) in tried:
                 continue                      # block only exact retries of the same combination
+            if axis == "tiling" and gate.block(axes):
+                continue                      # fold gate (planner.gates) — the runner blocks it too
             out.append({"id": f"{kind}:{axis}={value}", "axes": axes,
                         "rationale": f"{axis} axis remedy for {kind} errors"})
         return out

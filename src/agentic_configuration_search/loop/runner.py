@@ -29,7 +29,7 @@ from pathlib import Path
 import yaml
 
 from ..config import Config, config_from_dict
-from ..core.data import Dataset, load_dataset
+from ..core.data import Dataset, load_dataset, prescreen_subset
 from ..diagnose import describe
 from ..diagnose.errors import diagnose
 from ..eval.evaluate import evaluate_on_holdout, gate
@@ -39,6 +39,7 @@ from ..fitting.materials import Materials
 from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
+from ..planner.gates import tiling_gate
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
@@ -154,15 +155,19 @@ class Loop:
                   "weights": champion.get("weights"),
                   "adapt_root": champion.get("adapt_root"),
                   "rescorer_path": champion.get("rescorer_path"),
-                  "forwards_per_image": setting_forwards(champion["setting"])})
+                  "forwards_per_image": setting_forwards(champion["setting"]),
+                  "fit_dev_micro_f_beta":
+                      champion["setting"].get("fit_dev_micro_f_beta")})
         _write(self.out_dir / "champion_eval.json", champion["eval"])
 
     def _load_champion(self) -> dict:
         meta = json.loads((self.out_dir / "champion.json").read_text())
         ev = json.loads((self.out_dir / "champion_eval.json").read_text())
         ev["tau_test"] = {int(k): v for k, v in ev["tau_test"].items()}
+        setting = _setting_load(meta["setting"])
+        setting["fit_dev_micro_f_beta"] = meta["fit_dev_micro_f_beta"]
         return {"round": meta["round"], "id": meta["id"], "axes": meta["axes"],
-                "setting": _setting_load(meta["setting"]),
+                "setting": setting,
                 "materials_dir": meta["materials_dir"], "eval": ev,
                 "weights": meta.get("weights"),
                 "adapt_root": meta.get("adapt_root"),
@@ -173,6 +178,14 @@ class Loop:
         entry.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
         if getattr(self, "_round_t0", None) is not None:
             entry.setdefault("dur_s", round(time.monotonic() - self._round_t0, 1))
+        pc = _pass_cache_delta(getattr(self, "_pass_t0", None),
+                               gateway.pass_cache_stats())
+        if pc is not None:
+            entry.setdefault("pass_cache", pc)
+            log.info("round %s pass cache: hit %d · miss %d (hit rate %.0f%%) · "
+                     "invalidate %d · %d pieces held", entry.get("round"), pc["hits"],
+                     pc["misses"], 100 * pc["hit_rate"], pc["invalidations"],
+                     pc["entries"])
         with open(self.out_dir / "history.jsonl", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
@@ -228,7 +241,8 @@ class Loop:
             log.info("resume: restored champion reclassification artifact %s", adapt_root)
             self._adapt_ctl(Path(adapt_root))
 
-    def _screen(self, materials: Materials, axes: dict) -> dict:
+    def _screen(self, materials: Materials, axes: dict, split=None) -> dict:
+        """Fix the candidate setting on fit_dev (or a subset of it — prescreen)."""
         s = self.cfg.search
         # text-only candidate: the text pass sweeps the text-negative suppression
         # IoU (neg_eta) over the grid (text-only branch of screen_candidate). With
@@ -236,7 +250,8 @@ class Loop:
         text_neg_sweep = (axes.get("text_negatives")
                           and axes.get("exemplar") == "none")
         return screen_candidate(
-            self.cfg, self.client, self.ds.fit_dev, self.ds.ontology, materials,
+            self.cfg, self.client, self.ds.fit_dev if split is None else split,
+            self.ds.ontology, materials,
             neg_eta_grid=(s.neg_eta_grid
                           if (axes.get("visual_negatives") or text_neg_sweep)
                           else ()),
@@ -325,7 +340,8 @@ class Loop:
                                   token_budget=_token_budget(self.cfg),
                                   disabled_axes=self.disabled_axes,
                                   disabled_values=self.disabled_values,
-                                  facts=self._facts()).propose(
+                                  facts=self._facts(),
+                                  tiling_overlap=self.cfg.search.tiling_overlap).propose(
                 history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
@@ -351,8 +367,18 @@ class Loop:
         # champion changes is allowed. The LLM can forget failures outside the
         # prompt window (MAX_HISTORY), so this filter is the only permanent barrier.
         tried = tried_combos(history)
+        gate = tiling_gate(history)
         fresh, dropped = [], []
         for c in merged:
+            # tiling fold gate (planner.gates) — screening a grid at or above an
+            # unused one costs 1+g² forwards per image. Only planner candidates are
+            # blocked: a person decides for human candidates, and carried ones
+            # already passed the holdout gate.
+            why = (gate.block(c["axes"])
+                   if c.get("source") not in ("human", "carryover") else None)
+            if why:
+                dropped.append({**c, "skipped": "tiling_blocked", "note": why})
+                continue
             key = tuple(sorted(c["axes"].items()))
             if key in tried:
                 # no silent drops — record as combo_tried in skipped so it flows via
@@ -432,6 +458,62 @@ class Loop:
         return rescore.rescored_screen(self.cfg, self.ds, setting,
                                        rescorer, dev_preds)
 
+    def _prescreen(self, c: dict, axes: dict, materials: Materials, entry: dict,
+                   skipped: list) -> bool:
+        """Screen a large-grid tiling candidate on a fit_dev subset first — if no
+        class uses a tile there, reject it without the full screen (True).
+
+        A grid g screen costs 1+g² forwards, so from g ≥ screen.prescreen_min_grid
+        the full fit_dev is expensive. If tiles are used on the subset
+        (core.data.prescreen_subset — inside fit_dev, deterministic), the full
+        fit_dev is screened as before, so the final numbers equal those without
+        a prescreen (the pass cache reuses the subset's passes).
+
+        Only for single increments that change tiling alone — a candidate that
+        also changes other axes is not the champion even if tiles go unused, so
+        it cannot be rejected."""
+        s = self.cfg.screen
+        champ = (getattr(self, "_champion", None) or {}).get("axes") or {}
+        g = axes.get("tiling")
+        if not g or g < s.prescreen_min_grid or g == champ.get("tiling"):
+            return False
+        if {k for k, v in c["axes"].items() if champ.get(k) != v} != {"tiling"}:
+            return False
+        sub = prescreen_subset(self.ds.fit_dev, s.prescreen_fraction,
+                               s.prescreen_min_images)
+        if sub is None:
+            return False
+        setting = self._screen(materials, axes, split=sub)
+        info = {"n_images": len(sub.images), "of": len(self.ds.fit_dev.images),
+                "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
+                "passed": _uses_tiling(setting)}
+        if setting.get("tiling_f"):
+            info["tiling_f"] = setting["tiling_f"]
+        entry["prescreen"] = info
+        if info["passed"]:
+            return False
+        rec = {**c, "skipped": "axis_unused", "unused_axes": ["tiling"],
+               "tiling_used": False, "prescreen": info,
+               "note": f"prescreen: no class picked the grid {g} tile config on "
+                       f"fit_dev {info['n_images']}/{info['of']} images — the full "
+                       "screen is skipped"}
+        if setting.get("tiling_f"):
+            rec["tiling_f"] = setting["tiling_f"]
+        log.info("candidate %s: %s", c["id"], rec["note"])
+        skipped.append(rec)
+        return True
+
+    def _materialize_timed(self, axes: dict, mat_dir, wall: dict) -> Materials:
+        """materialize — records the time taken (seconds) in wall["materialize"]
+        (even on failure)."""
+        t0 = time.monotonic()
+        try:
+            return materialize(self.cfg, self.ds, axes, mat_dir,
+                               seed=self.cfg.run_seed,
+                               **self._parent_kw(), **self._mat_kw)
+        finally:
+            wall["materialize"] = time.monotonic() - t0
+
     def _screen_one(self, c: dict, mat_dir, entry: dict,
                     screened: list, skipped: list) -> None:
         """materialize + screen for one candidate — the caller records failures as rejections."""
@@ -439,10 +521,11 @@ class Loop:
             # the rescorer is a post-processing layer on the setting fixed by the
             # other axes — discriminator on fit_train, α grid on fit_dev (loop.rescore)
             base_axes = {**c["axes"], "rescorer": False}
-            materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                    seed=self.cfg.run_seed,
-                                    **self._parent_kw(), **self._mat_kw)
+            materials = self._materialize_timed(base_axes, mat_dir,
+                                                entry.setdefault("_wall", {}))
             if self._guard_material(c, materials, skipped):
+                return
+            if self._prescreen(c, base_axes, materials, entry, skipped):
                 return
             setting0 = self._screen(materials, base_axes)
             # judge sameness **before** the refit — if the served state equals the
@@ -465,10 +548,11 @@ class Loop:
             entry["_rescorer"] = rescorer
             entry["rescorer_path"] = str(Path(mat_dir) / "rescorer.json")
         else:
-            materials = materialize(self.cfg, self.ds, c["axes"], mat_dir,
-                                    seed=self.cfg.run_seed,
-                                    **self._parent_kw(), **self._mat_kw)
+            materials = self._materialize_timed(c["axes"], mat_dir,
+                                                entry.setdefault("_wall", {}))
             if self._guard_material(c, materials, skipped):
+                return
+            if self._prescreen(c, c["axes"], materials, entry, skipped):
                 return
             setting = self._screen(materials, c["axes"])
             if self._skip_same(c, entry, setting, materials, skipped):
@@ -517,11 +601,23 @@ class Loop:
                            "earlier round — evaluation skipped"}
         else:
             return False
+        if rec["skipped"] == "same_setting":
+            # what was the same — the planner sees whether another k refined to
+            # the same material (e.g. text_negative_k 2 and 4 both to one phrase)
+            # and folds variations of that axis
+            mat = _material_summary(setting, materials)
+            if mat:
+                rec["material"] = mat
+                rec["note"] += f" — served material: {mat}"
         rec |= _modality_record(setting, self.ds.ontology)
+        if entry.get("prescreen"):
+            rec["prescreen"] = entry["prescreen"]
         if unused:
             rec.setdefault("unused_axes", unused)
             if "tiling" in unused:
                 rec["tiling_used"] = False
+                if setting.get("tiling_f"):
+                    rec["tiling_f"] = setting["tiling_f"]   # how far it fell short
         log.info("candidate %s: %s", c["id"], rec["note"])
         skipped.append(rec)
         return True
@@ -548,6 +644,7 @@ class Loop:
 
     def baseline(self) -> dict:
         self._round_t0 = time.monotonic()
+        self._pass_t0 = gateway.pass_cache_stats()
         rd = self._round_dir(0)
         mat_dir = rd / "settings" / "baseline"
         materials = materialize(self.cfg, self.ds, BASELINE, mat_dir,
@@ -573,6 +670,7 @@ class Loop:
     def run_round(self, r: int, champion: dict, history: list[dict]) -> tuple[dict, dict]:
         """One round — returns (decision, champion)."""
         self._round_t0 = time.monotonic()
+        self._pass_t0 = gateway.pass_cache_stats()
         self._champion = champion          # parent for material inheritance
         self._champion.pop("_fp", None)
         self._seen_fps: set[str] = set()     # served states that passed screen this round
@@ -642,13 +740,15 @@ class Loop:
         screened = []
         for c in wired:
             mat_dir = rd / "settings" / _slug(c["id"])
-            entry = {**c, "materials_dir": str(mat_dir)}
+            entry = {**c, "materials_dir": str(mat_dir), "_wall": {}}
+            t0, n_skip = time.monotonic(), len(skipped)
             try:
                 self._screen_one(c, mat_dir, entry, screened, skipped)
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("candidate %s failed — rejected, round continues", c["id"])
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
+            _close_wall(entry["_wall"], t0, skipped[n_skip:])
         _write(rd / "screen.json",
                [{k: c[k] for k in ("id", "axes", "fit_dev_micro_f_beta")}
                 for c in screened])
@@ -666,7 +766,9 @@ class Loop:
                         beta=self.cfg.beta)
 
         for c in top:
+            t0 = time.monotonic()
             ev = self._evaluate_candidate(c, c["setting"], c["_materials"])
+            c["_wall"]["holdout"] = time.monotonic() - t0
             evaluated.append({**c, "eval": ev, "gate": _gate(ev)})
 
         # --- lora candidates — they swap the client's weights, so always last ---
@@ -679,16 +781,17 @@ class Loop:
         for c in lora_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
+            wall, t0, n_skip = {}, time.monotonic(), len(skipped)
             try:
-                materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                        seed=self.cfg.run_seed,
-                                        **self._parent_kw(), **self._mat_kw)
+                materials = self._materialize_timed(base_axes, mat_dir, wall)
             except Exception as exc:  # noqa: BLE001
                 log.exception("lora candidate %s material failed — rejected", c["id"])
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
                 continue
             if self._guard_material(c, materials, skipped):
+                _close_wall(wall, t0, skipped[n_skip:])
                 continue
             try:
                 # lora axis = tail fine-tune + λ-interpolation arms —
@@ -708,7 +811,9 @@ class Loop:
                 served_w = champion.get("weights")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
                 continue
+            _close_wall(wall, t0, ())
             entry = {**c, "materials_dir": str(mat_dir),
                      "setting": res["setting"],
                      "fit_dev_micro_f_beta": max((g["f_beta"] for g in res["grid"]),
@@ -718,14 +823,18 @@ class Loop:
             screened.append({k: entry[k] for k in
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
-                            | _requested(entry) | _unused_record(entry))
+                            | _requested(entry) | _unused_record(entry)
+                            | {"_wall": wall})
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
-                                "note": res["decision"].get("reason", "")})
+                                "note": res["decision"].get("reason", ""),
+                                "wall_min": _wall_min(wall)})
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
+            t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
+            wall["holdout"] = time.monotonic() - t1
             evaluated.append({**entry, "_materials": materials,
                               "_weights": str(res["weights"]),
                               "eval": ev, "gate": _gate(ev)})
@@ -749,11 +858,11 @@ class Loop:
         for c in classifier_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "crop_classifier": False}
+            wall, t0, n_skip = {}, time.monotonic(), len(skipped)
             try:
-                materials = materialize(self.cfg, self.ds, base_axes, mat_dir,
-                                        seed=self.cfg.run_seed,
-                                        **self._parent_kw(), **self._mat_kw)
+                materials = self._materialize_timed(base_axes, mat_dir, wall)
                 if self._guard_material(c, materials, skipped):
+                    _close_wall(wall, t0, skipped[n_skip:])
                     continue
                 res = adapt_round.run_classifier_candidate(
                     self.cfg, self.ds, base_axes, materials, mat_dir,
@@ -770,7 +879,9 @@ class Loop:
                 served_a = champion.get("adapt_root")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
+                _close_wall(wall, t0, skipped[n_skip:])
                 continue
+            _close_wall(wall, t0, ())
             entry = {**c, "materials_dir": str(mat_dir),
                      "setting": res["setting"],
                      "fit_dev_micro_f_beta":
@@ -781,7 +892,8 @@ class Loop:
                              ("id", "axes", "materials_dir", "setting",
                               "fit_dev_micro_f_beta")}
                             | {"crop_classifier": res["decision"]}
-                            | _requested(entry) | _unused_record(entry))
+                            | _requested(entry) | _unused_record(entry)
+                            | {"_wall": wall})
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -790,11 +902,14 @@ class Loop:
                 dead = ({"empty_axis": "crop_classifier"}
                         if res["decision"].get("tripwire") else {})
                 skipped.append({**c, "skipped": "classifier_gate", **dead,
-                                "note": res["decision"].get("reason", "")})
+                                "note": res["decision"].get("reason", ""),
+                                "wall_min": _wall_min(wall)})
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
+            t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)
+            wall["holdout"] = time.monotonic() - t1
             evaluated.append({**entry, "_materials": materials,
                               "_adapt_root": str(res["adapt_root"]),
                               "eval": ev, "gate": _gate(ev)})
@@ -858,10 +973,13 @@ class Loop:
                             | {"adopted": bool(winner and c["id"] == winner["id"]),
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
                             | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
+                            | ({"prescreen": c["prescreen"]} if c.get("prescreen") else {})
                             | _unused_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
                             | _modality_record(c["setting"], self.ds.ontology)
                             | {"forwards": setting_forwards(c["setting"])}
+                            | ({"wall_min": _wall_min(c["_wall"])}
+                               if c.get("_wall") else {})
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | ({"source": c["source"]} if c.get("source") else {})
                             for c in screened] + skipped),
@@ -966,6 +1084,41 @@ def _invalidating_hooks(hooks: dict) -> dict:
     return out
 
 
+def _pass_cache_delta(before: dict | None, now: dict | None) -> dict | None:
+    """Pass cache counts during the round (per piece) — history's pass_cache key.
+    entries is the number of pieces held at the end of the round. None outside
+    the cache block."""
+    if now is None:
+        return None
+    before = before or {}
+    out = {k: now[k] - before.get(k, 0) for k in ("hits", "misses", "invalidations")}
+    seen = out["hits"] + out["misses"]
+    out["hit_rate"] = round(out["hits"] / seen, 4) if seen else 0.0
+    out["entries"] = now["entries"]
+    return out
+
+
+def _wall_min(wall: dict) -> dict:
+    """One candidate's wall clock (seconds) → history's wall_min (minutes), per
+    stage and total.
+
+    materialize (material mining) · screen (fit_dev scoring — including the
+    prescreen, the rescorer refit and lora/classifier training) · holdout
+    (evaluation). The planner reads per-axis cost from it."""
+    out = {k: round(v / 60, 2) for k, v in wall.items()}
+    out["total"] = round(sum(wall.values()) / 60, 2)
+    return out
+
+
+def _close_wall(wall: dict, t0: float, new_skips) -> None:
+    """Close screen as the time since t0 minus materialize. Candidate rows
+    rejected in between (new_skips) get wall_min right away — they never reach
+    holdout, so this is their whole cost."""
+    wall["screen"] = max(time.monotonic() - t0 - wall.get("materialize", 0.0), 0.0)
+    for rec in new_skips:
+        rec.setdefault("wall_min", _wall_min(wall))
+
+
 def _tiling_variants(search, axes: dict) -> tuple:
     """The one grid the candidate chose — screen compares only it against tiling off.
 
@@ -997,6 +1150,7 @@ def _champion_summary(champion: dict) -> dict:
     """The champion summary in a history row — with its serving cost (forwards_per_image)."""
     return {"axes": champion["axes"], "round": champion["round"],
             "id": champion["id"], "micro_f_beta": champion["eval"]["micro_f_beta"],
+            "fit_dev_micro_f_beta": champion["setting"]["fit_dev_micro_f_beta"],
             "forwards_per_image": setting_forwards(champion["setting"])}
 
 
@@ -1015,7 +1169,12 @@ def _tiling_record(c: dict) -> dict:
     requested = c.get("requested_axes") or c["axes"]
     if not requested.get("tiling") or not c.get("setting"):
         return {}
-    return {"tiling_used": _uses_tiling(c["setting"])}
+    out = {"tiling_used": _uses_tiling(c["setting"])}
+    if c["setting"].get("tiling_f"):
+        # per-class-mean fit_dev F(β) of the tiled and untiled configs — by how
+        # much it won or fell short
+        out["tiling_f"] = c["setting"]["tiling_f"]
+    return out
 
 
 def _neg_eta_record(c: dict) -> dict:
@@ -1097,6 +1256,36 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
                        "rescorer": bool(axes.get("rescorer")), "server": server},
                       sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+MATERIAL_SUMMARY_MAX = 160    # cap on the material summary in same_setting rows
+
+
+def _material_summary(setting: dict, materials: Materials) -> str:
+    """A short summary of the material in the served state (_served_fp) — carried
+    in same_setting rows.
+
+    For text-modality classes, per-class suppression phrases and aliases
+    verbatim (what refinement converged to is the point); for semantic ones,
+    only exemplar and visual negative counts. Truncated at MATERIAL_SUMMARY_MAX."""
+    mods = {e.get("modality", "semantic")
+            for e in (setting.get("per_class") or {}).values()}
+    parts = []
+    if "text" in mods:
+        neg = {n: v for n, v in sorted(materials.text_negatives.items()) if v}
+        parts.append("text_negatives " + ("; ".join(
+            f"{n}=[{', '.join(sorted(v))}]" for n, v in neg.items()) or "none"))
+        if materials.aliases:
+            parts.append("aliases " + "; ".join(
+                f"{k}={v}" for k, v in sorted(materials.aliases.items())))
+    if "semantic" in mods:
+        n_ex = sum(len(v) for v in materials.exemplars.values())
+        n_vn = sum(len(v) for v in materials.visual_negatives.values())
+        parts.append(f"exemplars {n_ex}" + (f", visual_negatives {n_vn}"
+                                             if n_vn else ""))
+    out = " | ".join(parts)
+    return out if len(out) <= MATERIAL_SUMMARY_MAX \
+        else out[:MATERIAL_SUMMARY_MAX - 1] + "…"
 
 
 def _modality_record(setting: dict, ontology) -> dict:

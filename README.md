@@ -76,7 +76,7 @@ line) that equals the baseline behavior exactly.
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
 | `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
 | `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility |
-| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges. Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner is told to raise it one step at a time |
+| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges. Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes. If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
 
 An axis that is on may still go unused by the setting — screen picks whichever
 is better on fit_dev (exemplar against text prompts per class, tiling against
@@ -98,7 +98,12 @@ them off or inherit the champion's value are kept.
 propose → materialize → screen (fit_dev) → evaluate (holdout) → decide → diagnose → record
 ```
 
-- **screen** passes only the top-K candidates to holdout.
+- **screen** passes only the top-K candidates to holdout. A candidate that
+  changes only tiling and turns on grid ≥ `screen.prescreen_min_grid` is first
+  screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
+  `prescreen_min_images`); if no class uses tiles there, it is rejected without
+  the full screen. If they are used, the full fit_dev is screened as before
+  (numbers unchanged).
 - **decide** adopts a candidate only if the paired-bootstrap lower bound of its
   holdout Δ clears the margin; otherwise the champion stays.
 - **saturation** stops the run after `saturation.rounds` rounds without a
@@ -163,12 +168,16 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   `carried_duplicate` and the freed slots are asked for again.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
+- The planner also sees time cost — candidate rows' wall clock (`wall_min`) and
+  the per-axis median of observed cost, the shortfall of unused tiling
+  (`tiling_f`), the served material of same_setting rows (`material`), and axes
+  repeatedly left unused under the current champion (folded axes).
 
 ### Outputs
 
 ```
 runs/<dataset>/run/
-  history.jsonl        # round ledger
+  history.jsonl        # round ledger (per-candidate wall_min, per-round pass_cache counts)
   run_summary.json     # stop reason, final champion, holdout_split
   champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image)
   champion_eval.json   # champion holdout evaluation, incl. tau_test

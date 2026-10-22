@@ -70,6 +70,14 @@ class SaturationCfg:
 @dataclass(frozen=True)
 class ScreenCfg:
     top_k: int = 2                       # candidates sent to holdout eval after fit_dev scoring
+    # tiling prescreen — a candidate turning on grid ≥ prescreen_min_grid is first
+    # scored on a deterministic fit_dev subset (max(min_images, ⌈fraction·N⌉)
+    # images). If no class uses a tile there it is rejected without the full
+    # screen; otherwise the full fit_dev is screened as before. fraction 0 turns
+    # it off.
+    prescreen_fraction: float = 0.25
+    prescreen_min_images: int = 20
+    prescreen_min_grid: int = 3
 
 
 @dataclass(frozen=True)
@@ -298,6 +306,15 @@ def _validate(cfg: Config) -> None:
                           f"(got {type(cfg.dataset_notes).__name__})")
     if cfg.screen.top_k < 1:
         raise ConfigError(f"screen.top_k: must be >= 1 ({cfg.screen.top_k})")
+    if not (0.0 <= cfg.screen.prescreen_fraction <= 1.0):
+        raise ConfigError("screen.prescreen_fraction: outside [0,1] — 0 is off "
+                          f"({cfg.screen.prescreen_fraction})")
+    if cfg.screen.prescreen_min_images < 1:
+        raise ConfigError("screen.prescreen_min_images: must be >= 1 "
+                          f"({cfg.screen.prescreen_min_images})")
+    if cfg.screen.prescreen_min_grid < 2:
+        raise ConfigError("screen.prescreen_min_grid: must be >= 2 — the smallest "
+                          f"grid is 2 ({cfg.screen.prescreen_min_grid})")
     if cfg.gate.bootstrap < 1:
         raise ConfigError(f"gate.bootstrap: must be >= 1 ({cfg.gate.bootstrap})")
     if not (0.0 < cfg.gate.confidence < 1.0):

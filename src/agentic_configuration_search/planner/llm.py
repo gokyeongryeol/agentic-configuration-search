@@ -16,11 +16,13 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import statistics
 from pathlib import Path
 
 from ..diagnose.sample import pick_detail
 from . import deterministic
 from .axes import DatasetFacts, axis_values, sanitize_candidates
+from .gates import tiling_gate, under_champion
 
 log = logging.getLogger(__name__)
 
@@ -205,6 +207,39 @@ def _kind_counts(diagnosis: dict) -> dict[str, int]:
     return counts
 
 
+# Detector input side — converts missed_small's size_ratio to input px. YOLOE
+# letterboxes the long side to its imgsz (640, clients.yoloe); size_ratio is
+# √(box/image area), so this is exact for square images and an approximation
+# otherwise (the same assumption as DiagnoseCfg's 0.04 ≈ 26 px).
+INPUT_SIDE = 640
+
+
+def _small_block(diagnosis: dict, overlap: float) -> str:
+    """Input-px quantiles of train missed_small and the median after each grid's
+    magnification — evidence for picking the first tiling grid. Samples are a
+    coverage selection, not a distribution, so this counts the full fn list.
+    Holdout shows only aggregates, so only train is used."""
+    from .axes import TILING_GRIDS
+
+    fn = (diagnosis.get("train") or {}).get("fn") or []
+    sizes = sorted(float(e["size_ratio"]) * INPUT_SIDE for e in fn
+                   if isinstance(e, dict) and e.get("kind") == "missed_small"
+                   and e.get("size_ratio") is not None)
+    if not sizes:
+        return ""
+
+    def q(p):
+        return round(sizes[min(len(sizes) - 1, int(p * len(sizes)))])
+    p50 = sizes[len(sizes) // 2]
+    grids = "\n".join(
+        f"- grid {g}: {(g - 1) * (1 - overlap) + 1:.2g}x -> median "
+        f"{round(p50 * ((g - 1) * (1 - overlap) + 1))} px, cost {1 + g * g} passes"
+        for g in TILING_GRIDS)
+    return SMALL_BLOCK.format(n=len(sizes), side=INPUT_SIDE, p25=q(0.25),
+                              p50=round(p50), p75=q(0.75), overlap=overlap,
+                              grids=grids)
+
+
 def _leverage_lines(diagnosis: dict) -> list[str]:
     """One line per axis with **the error count it touches this round**, largest first.
 
@@ -250,6 +285,78 @@ def _dead_axis_lines(history: list[dict]) -> list[str]:
         lines.append(f"- {axis}" + (f" (values tried: {', '.join(vals)})"
                                     if vals else ""))
     return lines
+
+
+MAX_COST_LINES = 12      # cap on per-axis observed-cost lines in the prompt
+
+
+def _cost_label(axis: str, value) -> str:
+    """Group name in the cost summary — tiling includes the value since cost
+    grows as 1+g² per grid; other axes use the axis name only (cost differs
+    little between their values)."""
+    return f"{axis}={value}" if axis == "tiling" and value else axis
+
+
+def _cost_lines(history: list[dict]) -> list[str]:
+    """Per-candidate wall clock observed in this run (wall_min.total, minutes),
+    by axis — median and count.
+
+    A candidate is attributed to each axis of its increment (by request) over
+    the champion at the **start** of its round (the same basis as
+    _compact_history). A candidate changing several axes counts once for each.
+    Collected over the whole history — cost changes little when the champion
+    changes, and forgetting an expensive attempt that slid out of the window
+    means paying it again."""
+    costs: dict[str, list[float]] = {}
+    for i, e in enumerate(history):
+        champ = ((history[i - 1].get("champion", {}).get("axes") if i > 0 else None)
+                 or e.get("champion", {}).get("axes") or {})
+        for c in e.get("candidates", []):
+            total = (c.get("wall_min") or {}).get("total")
+            if total is None:
+                continue
+            delta = _delta_axes(c.get("requested_axes") or c.get("axes"), champ)
+            for axis in {_cost_label(k, v) for k, v in delta.items()}:
+                costs.setdefault(axis, []).append(float(total))
+    rows = sorted(costs.items(), key=lambda kv: -statistics.median(kv[1]))
+    return [f"- {label}: median {statistics.median(v):.0f} min per candidate "
+            f"(n={len(v)}, max {max(v):.0f})"
+            for label, v in rows[:MAX_COST_LINES]]
+
+
+FOLD_MIN_UNUSED = 2      # axes unused this many times under the current champion are listed as folded
+
+
+def _folded_axis_lines(history: list[dict]) -> list[str]:
+    """Axes screen repeatedly left unused under the current champion
+    (unused_axes) — a hint to fold them.
+
+    Unlike empty_axis (material exhausted), the material was there but the
+    setting did not pick it. At FOLD_MIN_UNUSED or more, other values likely
+    end the same way. A champion change changes the context, so only records
+    under it count (the same principle as planner.gates). Tiling is folded
+    after one unused grid by the gate, which the runner enforces, so its state
+    is listed instead (TilingGate.describe). Other axes are a hint only, not
+    blocked."""
+    gate = tiling_gate(history)
+    counts: dict[str, int] = {}
+    values: dict[str, set] = {}
+    for e in under_champion(history):
+        for c in e.get("candidates", []):
+            asked = c.get("requested_axes") or c.get("axes") or {}
+            for axis in c.get("unused_axes") or ():
+                counts[axis] = counts.get(axis, 0) + 1
+                values.setdefault(axis, set()).add(str(asked.get(axis)))
+    lines = []
+    for axis in sorted(counts):
+        if counts[axis] < FOLD_MIN_UNUSED or (axis == "tiling"
+                                              and gate.folded_at is not None):
+            continue
+        lines.append(f"- {axis}: screened and not used by {counts[axis]} candidates "
+                     f"under the current champion (values: "
+                     f"{', '.join(sorted(values[axis]))}) — treat as folded until "
+                     "the champion changes")
+    return lines + gate.describe()
 
 
 def _on_axes(axes: dict) -> dict:
@@ -387,6 +494,8 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
+            if c.get("tiling_f"):
+                row["tiling_f"] = c["tiling_f"]      # best tiled vs untiled F — how far short
             if "neg_eta_used" in c:
                 row["neg_eta_used"] = c["neg_eta_used"]
                 row["neg_eta_grid"] = c.get("neg_eta_grid")
@@ -396,8 +505,12 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
                 row["modality"] = _modality_summary(c["modality_f"])
             if c.get("gate_passed_but_lost"):
                 row["gate_passed_but_lost"] = True   # carried over — see CARRY_BLOCK
+            if (c.get("wall_min") or {}).get("total") is not None:
+                row["wall_min"] = c["wall_min"]["total"]   # per stage only in the artifact
             if c.get("note"):
                 row["note"] = str(c["note"])[:MAX_NOTE]
+            if c.get("material"):
+                row["material"] = c["material"]   # same_setting — what was the same
             ev = evaluated.get(c.get("id"))
             if ev:
                 row["test_micro_f_beta"] = ev.get("micro_f_beta")
@@ -408,6 +521,10 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
         out.append({
             "round": e.get("round"),
             "champion_micro_f_beta": e.get("champion", {}).get("micro_f_beta"),
+            # the same yardstick as candidates' fit_dev_micro_f_beta — whether
+            # tiling "helped"
+            "champion_fit_dev_micro_f_beta":
+                e.get("champion", {}).get("fit_dev_micro_f_beta"),
             "champion_axes": _on_axes(e.get("champion", {}).get("axes")),
             "adopted": d.get("adopted"), "adopted_id": d.get("id"),
             "candidates": cands,
@@ -435,10 +552,20 @@ Rules:
   is often worth one more try, while a clearly negative gate_delta is not.
 - "tiling" is a grid g: every image is also cut into g x g tiles and each tile
   is detected at magnification (g-1)(1-overlap)+1 (1.5x at g=2, 2x at g=3 with
-  overlap 0.5), costing 1 + g^2 detector passes per image. Raise g one step at a
-  time. A history row with tiling_used=false means no class benefited from that
-  grid on fit_dev (the setting fell back to no tiling); tiling_used=true on an
-  adopted grid while small-object misses remain suggests trying g+1.
+  overlap 0.5). Cost: 1 + g^2 detector passes per image (5 at g=2, 10 at g=3,
+  17 at g=4, 26 at g=5, 37 at g=6) — each step up costs much more than the
+  last. Pick the first grid from the missed-small sizes below: the grid whose
+  magnification brings the typical missed object to a detectable size, no
+  larger. Raising g further is worth it only when the previous grid was used
+  and helped (tiling_used=true and its fit_dev score beat the champion's)
+  while small-object misses remain. tiling_f compares the mean per-class
+  fit_dev F of the best tiled vs untiled config. A row with tiling_used=false
+  means the screen preferred no tiling at that grid (the setting fell back to
+  no tiling): fold the axis — a larger grid costs more and rarely helps. The
+  loop enforces the fold: under the current champion, a grid at or above an
+  unused one is dropped as skipped="tiling_blocked" without being screened. A
+  note starting "prescreen" means the grid was first screened on a subset of
+  fit_dev and not used there, so the full screen was skipped.
 - A row with unused_axes lists axes the candidate had on that the screened
   setting did not use (exemplar: the text pass beat the semantic pass for every
   class; visual_negatives: no semantic class kept a negative config). Other
@@ -465,6 +592,11 @@ Rules:
   exact axes combination was already tried — never repeat it verbatim; vary it
   or move on. skipped="carried_duplicate" means it repeated a re-queued
   candidate; that combination is handled by the carry_<id> row instead.
+  skipped="same_setting" means the screened setting served exactly the same
+  thing as the champion or an already-evaluated candidate; its material field
+  shows what was served (e.g. text negatives that a larger k refined down to
+  the same phrases) — another value of that axis will likely collapse the same
+  way.
 
 Current champion axes (only axes that are ON are listed; an empty object means
 the baseline — every axis at its safe point):
@@ -496,8 +628,16 @@ says how much is at stake if the axis works, not that it will. Weigh them
 against the diagnosis above (aggregate counts, then per-class, then the
 individual samples and their notes) rather than picking the largest number.
 {leverage}
-{dead_block}{carry_block}{notes_block}
+{small_block}{dead_block}{fold_block}{cost_block}{carry_block}{notes_block}
 Propose up to {max_candidates} candidates."""
+
+# Inserted only when train has missed_small — evidence for the first tiling grid.
+SMALL_BLOCK = """
+Missed-small sizes (train, {n} objects) — box side at the detector input
+(sqrt of box/image area x {side} px, long side resized to {side}): p25 {p25} px,
+median {p50} px, p75 {p75} px. After tiling magnification (overlap {overlap}):
+{grids}
+"""
 
 # Inserted only when some axis had empty material — otherwise omitted.
 DEAD_BLOCK = """
@@ -506,6 +646,26 @@ dataset (the candidate was rejected without evaluation, so it cost a slot for
 nothing). Their material pool is exhausted here — re-propose one only with a
 different source value, or after the champion has changed:
 {dead}
+"""
+
+# Inserted only when an axis went unused repeatedly under the current champion
+# — otherwise omitted.
+FOLD_BLOCK = """
+Axes folded under the current champion — the screen had them on but the chosen
+setting did not use them, repeatedly (or, for tiling, at a grid the loop now
+blocks). Other values of these axes are unlikely to change the setting; spend
+slots elsewhere until the champion changes:
+{folded}
+"""
+
+# Inserted only once candidate wall clocks (wall_min) are recorded — otherwise
+# omitted.
+COST_BLOCK = """
+Observed wall-clock cost per candidate in this run (materialize + fit_dev
+screen + held-out eval, minutes), grouped by the axes a candidate changed from
+the champion of its round. The run's time budget is shared by every candidate
+— weigh the expected gain of an expensive axis value against what it has cost:
+{costs}
 """
 
 # Inserted only when some candidate is carried over — otherwise omitted.
@@ -561,8 +721,9 @@ class LLMPlanner:
     def __init__(self, chat, artifact_dir: Path, *, max_candidates: int = 3,
                  notes: str = "", token_budget: int = DEFAULT_TOKEN_BUDGET,
                  disabled_axes=(), disabled_values=None,
-                 facts: DatasetFacts | None = None):
+                 facts: DatasetFacts | None = None, tiling_overlap: float = 0.5):
         self.chat = chat
+        self.tiling_overlap = tiling_overlap   # search.tiling_overlap — magnification
         self.artifact_dir = Path(artifact_dir)
         self.max_candidates = max_candidates
         self.notes = notes or ""
@@ -669,6 +830,8 @@ class LLMPlanner:
             ln for ln in _leverage_lines(diagnosis)
             if not any(ln.startswith(f"- {a}:") for a in self.disabled_axes)]
         dead_lines = _dead_axis_lines(history)
+        cost_lines = _cost_lines(history)
+        fold_lines = _folded_axis_lines(history)
         carried = deterministic.carryover(history, self.disabled_axes,
                                           self.disabled_values, facts=self.facts)
         carry_lines = [", ".join(f"{k}={v}" for k, v in
@@ -686,6 +849,11 @@ class LLMPlanner:
                     tried="\n".join(f"- {x}" for x in tried_lines) or "- (none)",
                     diagnosis=diag_json,
                     leverage="\n".join(leverage_lines) or "- (no errors observed)",
+                    small_block=_small_block(diagnosis, self.tiling_overlap),
+                    fold_block=(FOLD_BLOCK.format(folded="\n".join(fold_lines))
+                                if fold_lines else ""),
+                    cost_block=(COST_BLOCK.format(costs="\n".join(cost_lines))
+                                if cost_lines else ""),
                     dead_block=(
                         (DISABLED_BLOCK.format(disabled=", ".join(banned))
                          if banned else "")
