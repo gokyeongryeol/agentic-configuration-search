@@ -262,7 +262,7 @@ def test_classifier_candidate_runs_on_champion_weights(root, tmp_path, monkeypat
     weights** — the winning arm of an earlier lora candidate must not stay loaded."""
     _, result, seen = _detector_state_round(root, tmp_path, monkeypatch,
                                             _LORA_AND_CLS, _either_fixes)
-    assert "human_adapt" in result.decisions[1]["evaluated"], \
+    assert "r1_human_adapt" in result.decisions[1]["evaluated"], \
         "lora candidate did not pass its arm gate — scenario invalid"
     assert seen, "classifier candidate did not run — scenario invalid"
     assert all(w is None for w in seen), (
@@ -293,6 +293,6 @@ def test_detector_keeps_winner_state_when_later_candidate_restores(
              f"  rationale: no effect\n")
     state, result, _ = _detector_state_round(root, tmp_path, monkeypatch, cands, fixed_by)
     dec = result.decisions[1]
-    assert dec["id"] == "human_good", f"scenario invalid — good did not win: {dec}"
-    assert "human_bad" in dec["skipped"], f"scenario invalid — bad was not rejected: {dec}"
+    assert dec["id"] == "r1_human_good", f"scenario invalid — good did not win: {dec}"
+    assert "r1_human_bad" in dec["skipped"], f"scenario invalid — bad was not rejected: {dec}"
     _assert_state_is_champion(state, result.champion)

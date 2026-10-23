@@ -94,21 +94,21 @@ def test_empty_round_reasks_planner_within_the_round(big_root, tmp_path,  # noqa
     msg = follow[-1]["content"]
     assert "t2" in msg and "axis_unused" in msg and "tiling=2" in msg
     d1 = out.decisions[1]
-    assert d1["adopted"] is True and d1["id"] == "ex"
+    assert d1["adopted"] is True and d1["id"] == "r1_ex"
     assert d1["reasks"] == 1
     rows = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
-    assert rows["t2"]["skipped"] == "axis_unused" and "reask" not in rows["t2"]
-    assert rows["ex"]["reask"] == 1 and rows["ex"]["adopted"] is True
+    assert rows["r1_t2"]["skipped"] == "axis_unused" and "reask" not in rows["r1_t2"]
+    assert rows["r1_ex"]["reask"] == 1 and rows["r1_ex"]["adopted"] is True
     rd = tmp_path / "run" / "rounds" / "round_001"
     stored = json.loads((rd / "proposal_reask1.json").read_text())
     assert stored["message"] == msg and stored["response"]["candidates"][0]["id"] == "ex"
-    assert (rd / "settings" / "ex").is_dir()
+    assert (rd / "settings" / "r1_ex").is_dir()
     # the round diagnosis (train + holdout) runs once. The other 2 calls are the
     # end-of-run final champion diagnosis (rounds/final) — round 1 adopted, so
     # the champion changed
     assert len(n_diag) == 4
     assert json.loads((tmp_path / "run" / "rounds" / "final" / "diagnosis_key.json")
-                      .read_text())["champion"]["id"] == "ex"
+                      .read_text())["champion"]["id"] == "r1_ex"
 
 
 def test_reask_is_capped_and_can_be_disabled(big_root, tmp_path, monkeypatch):  # noqa: F811
@@ -152,9 +152,9 @@ def test_reask_candidates_go_through_the_same_filters(big_root, tmp_path,  # noq
                cfg=_cfg(big_root, rounds=1), **_fakes())
     assert "no_material" in calls[1][-1]["content"]
     rows = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
-    assert rows["tn"]["skipped"] == "no_material"
-    assert rows["again"]["skipped"] == "combo_tried" and rows["again"]["reask"] == 1
-    assert rows["t3"]["skipped"] == "tiling_blocked" and rows["t3"]["reask"] == 1
+    assert rows["r1_tn"]["skipped"] == "no_material"
+    assert rows["r1_again"]["skipped"] == "combo_tried" and rows["r1_again"]["reask"] == 1
+    assert rows["r1_t3"]["skipped"] == "tiling_blocked" and rows["r1_t3"]["reask"] == 1
     assert not any(a.get("tiling") == 3 for a in seen)
 
 
@@ -169,7 +169,7 @@ def test_reask_ids_never_collide_with_the_first_answer(big_root, tmp_path,  # no
     run_rounds(big_root, out_dir=tmp_path / "run", llm_chat=chat, rounds=1,
                cfg=_cfg(big_root, rounds=1), **_fakes())
     ids = [c["id"] for c in _hist(tmp_path / "run")[1]["candidates"]]
-    assert len(ids) == len(set(ids)) and "c_2" in ids, ids
+    assert len(ids) == len(set(ids)) and "r1_c_2" in ids, ids
 
 
 def test_reask_replays_on_resume_without_llm(big_root, tmp_path, monkeypatch):  # noqa: F811
@@ -177,11 +177,14 @@ def test_reask_replays_on_resume_without_llm(big_root, tmp_path, monkeypatch):  
     proposal_reask<k>.json — zero LLM calls, the same candidates and decisions."""
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     # the re-asked alias is evaluated but at Δ=0 — champion.json must stay at the
-    # baseline to mimic a round that died just before writing history
+    # baseline to mimic a round that died just before writing history. The alias
+    # equals the champion on fit_dev, so by default it would drop out before
+    # holdout (fit_dev_identical) — that verdict is turned off; this test only
+    # checks the replay contract
     chat, calls, _ = _planner_chat(_cands(("t2", {"tiling": 2})),
                                    _cands(("al", {"alias": "vlm"})))
     out_dir = tmp_path / "run"
-    cfg = _cfg(big_root, rounds=1)
+    cfg = _cfg(big_root, rounds=1, screen={"skip_fit_dev_losers": False})
     first = run_rounds(big_root, out_dir=out_dir, llm_chat=chat, rounds=1, cfg=cfg,
                        **_fakes())
     assert first.decisions[1]["evaluated"] and not first.decisions[1]["adopted"]
@@ -372,14 +375,19 @@ def test_diagnosis_is_recomputed_after_adoption_or_config_change(big_root, tmp_p
     assert out.decisions[1]["adopted"] and len(out.decisions) == 3
     assert len(n_diag) == 4
 
-    # a changed diagnosis input (config) recomputes even with the same champion
+    # a changed diagnosis input (config) recomputes even with the same champion.
+    # The alias equals the champion on fit_dev, so by default it drops out before
+    # holdout (fit_dev_identical) and the re-ask spends the second answer in
+    # round 1 — that verdict is turned off
     n_diag.clear()
+    keep = {"skip_fit_dev_losers": False}
     chat, _, _ = _planner_chat(_cands(("al", {"alias": "vlm"})),
                                _cands(("tn", {"text_negatives": "fp_crop"})))
     run_rounds(big_root, out_dir=tmp_path / "b", llm_chat=chat, rounds=1,
-               cfg=_cfg(big_root, rounds=1), **_fakes())
+               cfg=_cfg(big_root, rounds=1, screen=keep), **_fakes())
     assert len(n_diag) == 2
     run_rounds(big_root, out_dir=tmp_path / "b", llm_chat=chat, rounds=2,
-               cfg=_cfg(big_root, rounds=2, diagnose={"small_object_ratio": 0.3}),
+               cfg=_cfg(big_root, rounds=2, diagnose={"small_object_ratio": 0.3},
+                        screen=keep),
                resume=True, **_fakes())
     assert len(n_diag) == 4

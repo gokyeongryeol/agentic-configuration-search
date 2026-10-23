@@ -16,9 +16,9 @@ from .gates import tiling_gate
 # steps up none → base → fn_arm.
 #
 # **This is a coverage relation, not a decision rule.** The deterministic
-# planner uses the order as its policy, but the LLM prompt inverts the same
-# relation into "error count this axis touches this round"
-# (planner.llm._leverage_lines). So each list must contain everything that
+# planner uses the order as its policy, but the LLM prompt carries the same
+# relation as "this round's count per cause and the axes that target it"
+# (planner.llm._digest_lines). So each list must contain everything that
 # *can* address the kind, not just what to try first.
 REMEDY: dict[str, tuple] = {
     # For misses, lora comes before alias — if alias eats the candidate budget
@@ -99,6 +99,15 @@ def carryover(history: list[dict], disabled_axes=(), disabled_values=None, *,
     (which would reuse holdout). Pure function of history, so resume yields the
     same candidates. Skipped when the result equals the new champion, is blocked
     by the data (facts), or turns on a disabled axis/value.
+
+    A carried candidate is a new row (id, axes, source, rationale only) — it
+    carries none of the previous row's screen fields (prescreen, tiling_f,
+    fit_dev_cmp, wall_min …) and goes through the tiling prescreen, screen and
+    pre-holdout fit_dev verdict afresh like a planner candidate. Only the
+    lost-value prescreen leaves carried candidates out (runner._filter), but a
+    carry only arises when the previous round changed the champion, so the
+    ledger at that point (under the current champion) is always empty and it
+    makes no difference.
     """
     if len(history) < 2:
         return []

@@ -239,13 +239,20 @@ def merge(full_dets: list[dict], tile_dets: list[dict], mode: str = "nmm",
     return kept
 
 
+def magnification(grid: int, overlap_ratio: float) -> float:
+    """How much a grid g tile enlarges objects at the detector input,
+    (g-1)(1-o)+1 — resolution-independent (_grid_positions divides the tile
+    side by this value)."""
+    return (int(grid) - 1) * (1 - overlap_ratio) + 1
+
+
 def _grid_positions(size: int, n: int, overlap_ratio: float) -> tuple[int, list[int]]:
     """(tile side, start positions) covering one axis with n tiles.
 
     side = ceil(size / ((n-1)(1-o)+1)) — the zoom is resolution-independent, and
     positions are spread evenly between both ends, so the actual overlap is at
     least o (the ceiling leaves slack)."""
-    side = min(size, math.ceil(size / ((n - 1) * (1 - overlap_ratio) + 1)))
+    side = min(size, math.ceil(size / magnification(n, overlap_ratio)))
     span = size - side
     return side, sorted({round(i * span / (n - 1)) for i in range(n)})
 

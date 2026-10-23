@@ -330,14 +330,19 @@ def bootstrap_ci(records_a: list[dict], records_b: list[dict], stat_fn, *,
     for reports and A/B. "lower" gives a **one-sided lower bound** (alpha
     percentile) with upper None. The gate asks only "is Δ above the margin", a
     one-sided test; a two-sided bound would halve the effective significance
-    level and be overly conservative — so that path uses "lower".
+    level and be overly conservative — so that path uses "lower". "upper" gives a
+    **one-sided upper bound** (1-alpha percentile) with lower None — used by the
+    tiling near-miss (eval.screen), which asks "can B not being better than A be
+    ruled out".
     """
     if len(records_a) != len(records_b):
         raise ValueError(f"records length mismatch: {len(records_a)} vs {len(records_b)} — "
                          "a paired comparison requires the same image set")
     n = len(records_a)
+    if tail not in ("two", "lower", "upper"):
+        raise ValueError(f"tail: two|lower|upper ({tail!r})")
     if n == 0:
-        return {"delta": 0.0, "lo": 0.0,
+        return {"delta": 0.0, "lo": None if tail == "upper" else 0.0,
                 "hi": None if tail == "lower" else 0.0, "n_images": 0}
     rng = np.random.default_rng(seed)
     point = stat_fn(records_b) - stat_fn(records_a)
@@ -349,6 +354,8 @@ def bootstrap_ci(records_a: list[dict], records_b: list[dict], stat_fn, *,
         deltas[b] = stat_fn(sample_b) - stat_fn(sample_a)
     if tail == "lower":
         lo, hi = float(np.quantile(deltas, alpha)), None
+    elif tail == "upper":
+        lo, hi = None, float(np.quantile(deltas, 1 - alpha))
     else:
         q = np.quantile(deltas, [alpha / 2, 1 - alpha / 2])
         lo, hi = float(q[0]), float(q[1])
@@ -395,6 +402,14 @@ FN_KINDS = ["below_threshold", "missed_small", "missed"]
 SMALL_OBJECT_RATIO = 0.04
 
 
+def _size_ratio(box, rec: dict) -> float:
+    """r = √(box area / image area) — the size the detector sees (the axis of
+    the missed_small cut)."""
+    x1, y1, x2, y2 = box
+    return float(np.sqrt(max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
+                         / max(rec["width"] * rec["height"], 1e-9)))
+
+
 def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float], *,
                     iou_thr: float, floor_detections: list[dict] | None = None,
                     small_ratio: float = SMALL_OBJECT_RATIO) -> dict:
@@ -414,8 +429,11 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
     class would produce "small" misses even on a dataset of only large objects.
     An FN record's size_ratio is that r — material for judging how much zoom is
     needed.
+
+    Matched GT (TP) keep their r in `tp` too — the yardstick "objects this small
+    are already detected" (s* of the tiling near-miss, planner.gates.tp_floor).
     """
-    fp_records, fn_records = [], []
+    fp_records, fn_records, tp_records = [], [], []
 
     for img_idx, rec in enumerate(per_image):
         dets = rec["detections"]
@@ -464,11 +482,13 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
                 kind = "background"
             fp_records.append({"image_index": img_idx, "kind": kind, **{k: d[k] for k in ("box", "score", "category_id")}})
 
-        # FN causes
+        # FN causes (matched GT only leave their TP size)
         floor_dets = (floor_detections[img_idx]["detections"]
                       if floor_detections is not None else [])
         for j, g in enumerate(gts):
             if j in matched_gt:
+                tp_records.append({"category_id": g["category_id"],
+                                   "size_ratio": round(_size_ratio(g["box"], rec), 4)})
                 continue
             cid = g["category_id"]
             gt_box = np.array([g["box"]], dtype=float)
@@ -476,9 +496,7 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
                      if d["category_id"] == cid
                      and d["score"] < per_class_threshold.get(cid, float("inf"))
                      and iou_matrix(np.array([d["box"]], dtype=float), gt_box)[0, 0] >= iou_thr]
-            x1, y1, x2, y2 = g["box"]
-            ratio = float(np.sqrt(max(x2 - x1, 0.0) * max(y2 - y1, 0.0)
-                                  / max(rec["width"] * rec["height"], 1e-9)))
+            ratio = _size_ratio(g["box"], rec)
             if below:
                 kind = "below_threshold"
             elif ratio < small_ratio:
@@ -492,7 +510,7 @@ def classify_errors(per_image: list[dict], per_class_threshold: dict[int, float]
     def _summary(records, kinds):
         return {k: sum(1 for r in records if r["kind"] == k) for k in kinds}
 
-    return {"fp": fp_records, "fn": fn_records,
+    return {"fp": fp_records, "fn": fn_records, "tp": tp_records,
             "fp_summary": _summary(fp_records, FP_KINDS),
             "fn_summary": _summary(fn_records, FN_KINDS)}
 

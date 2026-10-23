@@ -66,3 +66,38 @@ def diagnose(records: list[dict], floor_records: list[dict] | None,
         out["fp"] = _named(raw["fp"])
         out["fn"] = _named(raw["fn"])
     return out
+
+
+def size_profile(floor_records: list[dict], thresholds: dict[int, float], ontology, *,
+                 iou_thr: float,
+                 small_ratio: float = metrics.SMALL_OBJECT_RATIO) -> dict:
+    """Per-class size ratios r (ascending) of TP and missed_small GT — the material
+    for s* and m of the tiling near-miss (planner.gates.tp_floor).
+
+    thresholds are the champion's **fit_dev screen thresholds**
+    (setting.per_class[*].threshold), applied directly to the floor records.
+    Using the diagnosis classified at tau_test (estimated on holdout) would make
+    s* → tiling_shortfall → the fold gate's exception (a screen decision) lean on
+    holdout. Detections of classes without a threshold (not adopted by screen)
+    are dropped. The returned "thresholds" marks the source."""
+    thr = {int(k): float(v) for k, v in thresholds.items()}
+    kept = [{**rec, "detections": [d for d in rec["detections"]
+                                   if d["category_id"] in thr
+                                   and d["score"] >= thr[d["category_id"]]]}
+            for rec in floor_records]
+    raw = metrics.classify_errors(kept, thr, iou_thr=iou_thr,
+                                  floor_detections=floor_records,
+                                  small_ratio=small_ratio)
+    names = {c.id: c.name for c in ontology.classes}
+
+    def _by_class(rows) -> dict[str, list[float]]:
+        out: dict[str, list[float]] = {}
+        for r in rows:
+            name = names.get(r["category_id"])
+            if name is not None:
+                out.setdefault(name, []).append(float(r["size_ratio"]))
+        return {k: sorted(v) for k, v in sorted(out.items())}
+    return {"thresholds": "fit_dev",
+            "tp": _by_class(raw["tp"]),
+            "missed_small": _by_class(r for r in raw["fn"]
+                                      if r["kind"] == "missed_small")}

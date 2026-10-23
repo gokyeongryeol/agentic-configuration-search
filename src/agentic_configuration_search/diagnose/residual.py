@@ -25,7 +25,7 @@ from ..core import metrics
 
 # Detector input side — converts size_ratio to input px. YOLOE letterboxes the
 # long side to 640; size_ratio is √(box/image area), so this is exact for square
-# images (the same assumption as planner.llm.INPUT_SIDE).
+# images (planner.gates and planner.llm use this value).
 INPUT_SIDE = 640
 LARGE_FACTOR = 3.0        # small < r ≤ medium < LARGE_FACTOR·r ≤ large
 TINY_GT_PX = 3            # GT with a short side at or below this — annotation error suspected

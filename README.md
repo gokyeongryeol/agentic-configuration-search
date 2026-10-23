@@ -76,7 +76,7 @@ line) that equals the baseline behavior exactly.
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
 | `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
 | `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility. On disk a candidate keeps only the tuned tail subset (`tuned_tail.pt`) and one small descriptor JSON per λ > 0 arm — arms are interpolated in memory, λ = 0 is the base itself, and the trainer's full-model checkpoints are deleted after training |
-| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes. If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
+| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes and the TP sizes the champion already detects (s*). If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Exception: if g lost to no tiling on fit_dev only within noise (one-sided paired-bootstrap upper bound `tiling_f.gap_ub` ≥ 0) and fell short on zoom (for the median m of the class with the most missed_small, m·zoom(g) < s* ≤ m·zoom(g+1), s* = the `search.tiling_tp_quantile` quantile of that class's champion TP sizes — m and s* are both train sizes counted at the champion's fit_dev screen thresholds, so holdout plays no part; with fewer than `search.tiling_tp_min` TPs there is no verdict), g+1 is opened — once, until a g+1 reaches screen (several g+1 candidates in the same proposal all pass). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
 
 An axis that is on may still go unused by the setting — screen picks whichever
 is better on fit_dev (exemplar against text prompts per class, tiling against
@@ -140,7 +140,35 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
   `prescreen_min_images`); if no class uses tiles there, it is rejected without
   the full screen. If they are used, the full fit_dev is screened as before
-  (numbers unchanged).
+  (numbers unchanged). If the subset is `screen.prescreen_max_share` (0.5) of
+  fit_dev or more, the full screen runs directly without a prescreen — a pass
+  would be measured again, so nothing is saved.
+- **lost-value prescreen**: a planner candidate containing a value that clearly
+  lost on fit_dev under the current champion (a candidate changing only that
+  value had a (candidate − champion) fit_dev micro F(β) paired-bootstrap upper
+  bound `fit_dev_cmp.ub` < 0, and no candidate containing it had an upper
+  bound ≥ 0) is not blocked but measured on the same subset first (without a
+  subset — fit_dev is small or the subset is `screen.prescreen_max_share` or
+  more — the same comparison runs on the full fit_dev screen directly, and if
+  it passes that screen is used as is). With an upper bound ≥ 0 it proceeds
+  (no point-estimate win is required); otherwise it is rejected as
+  `lost_value_prescreen` without the rescorer refit, full screen or holdout
+  (`screen.lost_value_prescreen`, on by default). A value is the axis's main
+  value (alias=vlm, exemplar=fn_arm …) and quantity axes (`exemplar_k`,
+  `fn_k`, …) are its variants. A combination containing any clearly-lost value
+  is a variant too. The axes covered are alias, exemplar, text_negatives,
+  visual_negatives and tiling — rescorer, lora and crop_classifier are left out
+  because their expensive part (refit, training) comes before the comparison,
+  as are values that ever changed the champion and human or carried
+  candidates. Holdout results are not used for the verdict.
+- **pre-holdout fit_dev verdict**: among screened candidates, those that
+  clearly lost to the champion on fit_dev (`fit_dev_cmp.ub` < 0 →
+  `fit_dev_lost`) and those whose per-image fit_dev (tp, fp, fn) all equal the
+  champion's (`fit_dev_identical`) are not sent to holdout
+  (`screen.skip_fit_dev_losers`, on by default). The same rule applies to plain
+  and carried candidates and to the lora and classifier arms, and `top_k`
+  counts only sendable candidates (the next candidate fills a freed slot).
+  Without comparison rows nothing is filtered.
 - **decide** adopts a candidate only if the paired-bootstrap lower bound of its
   holdout Δ clears the margin; otherwise the champion stays.
 - **re-ask**: if every candidate is rejected before holdout (by the filters or
@@ -151,12 +179,27 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   champion are reused. Re-asked candidates go through the same filters, screen
   and holdout and stay in the same round's history as `reask: k`. LLM planner
   only (the deterministic planner is not re-asked).
+- **candidate ids**: the loop adds an `r<round>_` prefix before recording
+  (`r2_cand_0`, re-ask `r2_reask1_0`, human candidate `r2_human_x`) — ids stay
+  unique within the run even when the planner reuses them every round. Carried
+  candidates are `carry_<original id>` (e.g. `carry_r1_cand_1`) — only carried
+  candidates made by the loop (`source: carryover`) are exempt from the prefix.
+  If the planner imitates a `carry_` id, `carry_` is stripped and the round
+  prefix added (the report also tells carried rows by source).
+- **candidate count**: the planner proposes up to `planner.max_candidates`
+  (default 3) per round (and per re-ask) — the prompt, the response schema and
+  the deterministic planner follow the same value. The range is 1–3 — larger
+  responses can exceed the output cap (4096 tokens), and a cut response silently
+  falls back to deterministic, so config rejects it.
 - **saturation** stops the run after `saturation.rounds` rounds without a
   meaningful adoption, or when the planner has nothing left to try. A round
   that measured nothing on holdout even after re-asking (an empty round) stops
   the run earlier after `saturation.empty_rounds` (default 2, 0 = off)
   consecutive ones (`stopped: "empty_rounds"`). Empty rounds are also stagnant
-  and count toward `saturation.rounds`.
+  and count toward `saturation.rounds`. A round that missed holdout only
+  because of the pre-holdout fit_dev verdict (`fit_dev_lost`,
+  `fit_dev_identical`) is not counted as empty (it is still stagnant) — the
+  skip only saves holdout time and does not change when the run stops.
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
   previous round's are copied (`diagnosis_key.json`).
@@ -232,19 +275,34 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   `carried_duplicate` and the freed slots are asked for again.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
-- The planner also sees time cost — candidate rows' wall clock (`wall_min`) and
-  the per-axis median of observed cost, the shortfall of unused tiling
-  (`tiling_f`), the served material of same_setting rows (`material`), and axes
-  repeatedly left unused under the current champion (folded axes).
+- The prompt is organized in sections.
+
+  | Section | Content |
+  |---|---|
+  | Rules | axis increment rules; how to read the gate, `fit_dev_cmp`, the tiling fold and skip reasons |
+  | Budget | rounds left, stop counters (rounds without adoption vs `saturation.rounds`, empty rounds in a row vs `saturation.empty_rounds`), per-axis median of observed wall clock per candidate (axes not yet observed get a static note — tiling 1+g² passes, tail and classifier training, rescorer refit) |
+  | Current champion | axes on, holdout and fit_dev micro F, adoption round, passes per image |
+  | Axis ledger | per (axis=value) under the current champion: tries (alone), best fit_dev Δ (upper bound), best holdout Δ (lower bound — shown only), status (clearly-lost (prescreened), near-miss, folded, unused, no_material, …), minutes spent. Below it, one line of combinations already tried |
+  | Allowed moves | tiling fold and a grid opened once by the near-miss exception, folded axes, axes with empty material, prescreened values with their evidence, carried candidates |
+  | Round history | the last 3 rounds in per-candidate detail (JSON), earlier rounds one line each (adopted increment and Δ, or no adoption and the number of candidates) |
+  | Diagnosis digest | counts per cause (train, holdout) and the axes that target it, missed-small sizes, per-class aggregates and samples |
+  | Response | per candidate `axes`, `expected_gain` (expected holdout Δ), `cost_min` (expected minutes), `differs` (for a variant of a clearly-lost value, what is different) and `rationale` |
+
+  If the response's `expected_gain`, `cost_min` or `differs` is missing or
+  malformed only that field is dropped — the candidate is neither discarded
+  nor sent to the deterministic planner. They are recorded as the candidate
+  row's `plan`.
 
 ### Outputs
 
 ```
 runs/<dataset>/run/
-  history.jsonl        # round ledger (per-candidate wall_min and reask, per-round pass_cache counts)
+  history.jsonl        # round ledger (per-candidate wall_min, reask, fit_dev_cmp, lost_values, plan;
+                       # per-round pass_cache counts)
   run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
                        # holdout_split, final_diagnosis (reused or not, duration)
-  champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image)
+  champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image,
+                       # per-image fit_dev (tp, fp, fn) — the baseline of the next fit_dev_cmp)
   champion_eval.json   # champion holdout evaluation, incl. tau_test
   rounds/round_NNN/    # proposal (+ proposal_reask<k>), settings/<cand>/ materials, screen, eval,
                        # decision, diagnosis (+ diagnosis_key), crop_notes
