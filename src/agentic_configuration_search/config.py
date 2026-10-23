@@ -75,6 +75,7 @@ class PlannerCfg:
 @dataclass(frozen=True)
 class GateCfg:
     margin: float = 0.0                  # adopt iff holdout Δ micro F(β) CI lower bound ≥ margin and Δ > 0
+    min_delta: float = 0.005             # …and point estimate Δ ≥ min_delta (blocks noise-level adoptions, 0 turns it off)
     bootstrap: int = 2000                # number of paired bootstrap resamples
     confidence: float = 0.95
 
@@ -423,6 +424,9 @@ def _validate(cfg: Config) -> None:
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")
+    if cfg.gate.min_delta < 0:
+        raise ConfigError("gate.min_delta: must not be negative — 0 is off "
+                          f"({cfg.gate.min_delta})")
     if cfg.rescorer.margin < 0:
         raise ConfigError(f"rescorer.margin cannot be negative ({cfg.rescorer.margin})")
     if cfg.rescorer.ensemble_members < 1:

@@ -39,6 +39,7 @@ planner:
 
 gate:                                     # adoption gate
   margin: 0.0                             # adopt iff one-sided CI lower bound of holdout Δ micro F(β) ≥ margin **and** Δ > 0
+  min_delta: 0.005                        # …and point estimate Δ ≥ min_delta — blocks noise-level adoptions (0=off)
   bootstrap: 2000                         # paired bootstrap resamples
   confidence: 0.95                        # CI confidence level (alpha = 1 - confidence)
 

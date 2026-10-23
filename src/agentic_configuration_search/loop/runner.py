@@ -1162,6 +1162,7 @@ class Loop:
         return gate(champion["eval"]["records"], ev["records"],
                     cat_ids=self.cat_ids, iou_thr=self.iou,
                     margin=self.cfg.gate.margin,
+                    min_delta=self.cfg.gate.min_delta,
                     n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
                     alpha=1.0 - self.cfg.gate.confidence,
                     beta=self.cfg.beta)
