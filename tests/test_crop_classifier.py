@@ -135,3 +135,99 @@ def test_arm_tripwire_skips_training(dataset_root, tmp_path, monkeypatch):
     assert out["decision"]["adopted"] is False
     assert "training skipped" in out["decision"]["reason"]
     assert calls == []                               # training was not invoked
+
+
+# --- the checkpoint keeps only the trained parameters ---------------------------------
+
+def _tiny_peft(seed: int):
+    """A small module with the same parameter naming as the SigLIP classifier
+    (attention q/k/v/out projections + a `classifier` head) under peft LoRA."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj, self.k_proj = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+            self.v_proj, self.out_proj = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.out_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+            self.classifier = torch.nn.Linear(8, 3)
+
+        def forward(self, x):
+            return self.classifier(self.attn(x))
+
+    torch.manual_seed(seed)
+    model = get_peft_model(Tiny(), LoraConfig(
+        r=2, lora_alpha=4, target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]))
+    return model
+
+
+def test_worker_saves_only_trainable_params(tmp_path):
+    """The saved keys are exactly the parameters training changes (requires_grad
+    after freeze_to_trainable), with the format marker."""
+    import torch
+    from agentic_configuration_search.workers import adapt as worker
+
+    model = _tiny_peft(0)
+    worker.freeze_to_trainable(model)
+    worker.save_checkpoint(model, 3, tmp_path / "classifier.pt")
+    ckpt = torch.load(tmp_path / "classifier.pt", weights_only=True)
+    assert ckpt["state_dict_format"] == "trainable" and ckpt["num_classes"] == 3
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    assert set(ckpt["state_dict"]) == trainable
+    assert any("lora_" in k for k in trainable) and any("classifier" in k for k in trainable)
+    assert not any("base_layer" in k for k in ckpt["state_dict"])   # no backbone weights
+
+
+def test_loader_round_trips_trainable_checkpoint(tmp_path):
+    """A trainable checkpoint put onto a freshly rebuilt model gives the trained
+    model's outputs exactly; a missing key is refused; an old full checkpoint
+    still loads strictly."""
+    import torch
+    from agentic_configuration_search.clients.yoloe import _load_classifier_state
+    from agentic_configuration_search.workers import adapt as worker
+
+    trained = _tiny_peft(0)
+    worker.freeze_to_trainable(trained)
+    with torch.no_grad():                        # stand in for training
+        for n, p in trained.named_parameters():
+            if p.requires_grad:
+                p.add_(torch.randn_like(p))
+    worker.save_checkpoint(trained, 3, tmp_path / "c.pt")
+    ckpt = torch.load(tmp_path / "c.pt", weights_only=True)
+
+    # the backbone (base_layer) is the same pretrained weights on both sides —
+    # here the same seed; the adapter and head differ until loaded
+    fresh = _tiny_peft(0)
+    x = torch.randn(4, 8)
+    assert not torch.equal(fresh(x), trained(x))
+    _load_classifier_state(fresh, ckpt, tmp_path)
+    assert torch.equal(fresh(x), trained(x))
+
+    lora_b = next(k for k in ckpt["state_dict"] if "lora_B" in k)
+    broken = {**ckpt, "state_dict": {k: v for k, v in ckpt["state_dict"].items()
+                                     if k != lora_b}}
+    with pytest.raises(ValueError, match="missing"):
+        _load_classifier_state(_tiny_peft(0), broken, tmp_path)
+
+    full = {"state_dict": trained.state_dict(), "num_classes": 3,
+            "classifier_model": "siglip"}            # an older run's format
+    old = _tiny_peft(1)
+    _load_classifier_state(old, full, tmp_path)
+    assert torch.equal(old(x), trained(x))
+
+
+def test_trainable_key_rule_matches_loader():
+    from agentic_configuration_search.clients.yoloe import _is_trainable_key
+    from agentic_configuration_search.workers import adapt as worker
+
+    names = [n for n in _tiny_peft(0).state_dict()] + [
+        "base_model.model.classifier.weight", "vision_model.encoder.layers.0.mlp.fc1.weight"]
+    assert [worker.is_trainable_key(n) for n in names] == [_is_trainable_key(n) for n in names]

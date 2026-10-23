@@ -350,6 +350,34 @@ def _reclassify(reclassifier, image, dets: list[dict]) -> list[dict]:
     return out
 
 
+def _is_trainable_key(name: str) -> bool:
+    """Parameters the classifier worker trains and saves — the LoRA adapter and
+    the classification head. Same rule as workers.adapt.is_trainable_key
+    (clients may not import workers; tests/test_crop_classifier.py pins them
+    together)."""
+    return "lora_" in name or "classifier" in name
+
+
+def _load_classifier_state(model, ckpt: dict, where) -> None:
+    """Put a classifier checkpoint onto the rebuilt model.
+
+    "trainable" checkpoints hold only the LoRA adapter and head; the backbone
+    stays the pretrained weights the model was rebuilt from. Every trainable
+    key the model has must be present and nothing else — a missing one would
+    silently leave a freshly initialized layer. Checkpoints without the marker
+    (older runs) hold the full state dict and load strictly as before."""
+    state = ckpt["state_dict"]
+    if ckpt.get("state_dict_format") != "trainable":
+        model.load_state_dict(state, strict=True)
+        return
+    want = {k for k in model.state_dict() if _is_trainable_key(k)}
+    missing, extra = sorted(want - set(state)), sorted(set(state) - want)
+    if missing or extra:
+        raise ValueError(f"{where}: trainable checkpoint does not match the model — "
+                         f"missing {missing[:5]}, unexpected {extra[:5]}")
+    model.load_state_dict(state, strict=False)
+
+
 class _CropReclassifier:
     """Serving component that loads the artifact (classifier.pt /
     classifier_config.json) and reclassifies crops — rebuilt with the same
@@ -382,7 +410,7 @@ class _CropReclassifier:
                           target_modules=self._TARGETS[cfg["classifier_lora_target"]],
                           bias="none")
         model = get_peft_model(model, lora)
-        model.load_state_dict(ckpt["state_dict"], strict=True)
+        _load_classifier_state(model, ckpt, root)
         self.model = model.eval().to(device)
         self.processor = AutoImageProcessor.from_pretrained(
             cfg["classifier_model_name"])
