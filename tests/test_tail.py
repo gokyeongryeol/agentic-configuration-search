@@ -256,3 +256,60 @@ def test_tail_candidate_restores_on_rejection(root, tmp_path, monkeypatch):
     # key point: the detector is restored to base (None)
     assert server.weights is None
     assert result.champion.get("weights") in (None, "None")
+
+
+# --- trainer checkpoints are not kept ------------------------------------------------
+
+class _FakeProc:
+    def __init__(self, rc):
+        self.rc = rc
+
+    def wait(self):
+        return self.rc
+
+
+def _fake_training(rc=0, write_subset=True):
+    """A popen double that does what the worker does on disk: the ultralytics
+    trainer leaves full checkpoints in <project>/train/weights/, and the worker
+    saves the tail subset to --out."""
+    def popen(cmd, env=None, stdout=None, stderr=None):
+        args = dict(zip(cmd[::1], cmd[1::1]))
+        wdir = Path(args["--project"]) / "train" / "weights"
+        wdir.mkdir(parents=True, exist_ok=True)
+        (wdir / "last.pt").write_bytes(b"x" * 1000)
+        (wdir / "best.pt").write_bytes(b"x" * 1000)
+        (wdir.parent / "args.yaml").write_text("epochs: 1\n")
+        if write_subset:
+            Path(args["--out"]).write_bytes(b"subset")
+        return _FakeProc(rc)
+    return popen
+
+
+def test_train_tail_drops_trainer_checkpoints(dataset_root, tmp_path):
+    """Only the tail subset is used, so the trainer's full-model checkpoints
+    (written at the final epoch whatever `save` says) are deleted once the
+    subset exists; the small run record stays."""
+    from agentic_configuration_search.fitting.tail import train_tail
+    ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
+    cfg = config_from_dict({"dataset": str(dataset_root)})
+    out = tmp_path / "tail"
+    tuned = train_tail(cfg, fit_train=ds.fit_train, ontology=ds.ontology,
+                       base_weights=tmp_path / "base.pt", out_dir=out, seed=0,
+                       log_path=out / "train.log", popen=_fake_training())
+    assert tuned.read_bytes() == b"subset"
+    assert not (out / "ultralytics" / "train" / "weights").exists()
+    assert (out / "ultralytics" / "train" / "args.yaml").exists()
+
+
+def test_train_tail_keeps_checkpoints_when_training_fails(dataset_root, tmp_path):
+    """A failed run keeps whatever the trainer left, for diagnosis."""
+    from agentic_configuration_search.fitting.tail import train_tail
+    ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
+    cfg = config_from_dict({"dataset": str(dataset_root)})
+    for i, popen in enumerate((_fake_training(rc=1), _fake_training(write_subset=False))):
+        out = tmp_path / f"tail{i}"
+        with pytest.raises(RuntimeError):
+            train_tail(cfg, fit_train=ds.fit_train, ontology=ds.ontology,
+                       base_weights=tmp_path / "base.pt", out_dir=out, seed=0,
+                       log_path=out / "train.log", popen=popen)
+        assert (out / "ultralytics" / "train" / "weights" / "last.pt").exists()
