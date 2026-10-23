@@ -239,7 +239,7 @@ def test_screen_records_gap_ub_with_gate_settings(big_root, tmp_path,  # noqa: F
                             "gate": {"bootstrap": 200}})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=cfg, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["tiling_used"] is False
     assert rec["tiling_f"]["gap_ub"] == pytest.approx(0.0)
     # big_root's GT are all above the cut (0.04) — without missed_small there is
@@ -414,7 +414,7 @@ def test_adopted_tiling_row_carries_tiling_f(big_root, tmp_path,  # noqa: F811
                             "gate": {"bootstrap": 200}})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=cfg, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["tiling_used"] is True
     assert {"tiled", "untiled", "gap_ub"} <= set(rec["tiling_f"])
 
@@ -462,16 +462,16 @@ def test_loop_opens_g_plus_1_once(big_root, tmp_path, monkeypatch):  # noqa: F81
                rounds=3, cfg=cfg, **_fakes())
     h = _hist(tmp_path / "run")
     r1 = {c["id"]: c for c in h[1]["candidates"]}
-    t2 = r1["t2"]
+    t2 = r1["r1_t2"]
     assert t2["tiling_used"] is False and t2["tiling_f"]["gap_ub"] >= 0
     assert t2["tiling_shortfall"]["shortfall"] is True
     assert t2["tiling_shortfall"]["class"] == "cat b"
     r2 = {c["id"]: c for c in h[2]["candidates"]}
-    assert r2["t3"].get("skipped") != "tiling_blocked"      # opened by the exception
-    assert "tiling_used" in r2["t3"]
-    assert r2["t4"]["skipped"] == "tiling_blocked"            # g+2 is blocked
+    assert r2["r2_t3"].get("skipped") != "tiling_blocked"      # opened by the exception
+    assert "tiling_used" in r2["r2_t3"]
+    assert r2["r2_t4"]["skipped"] == "tiling_blocked"            # g+2 is blocked
     r3 = {c["id"]: c for c in h[3]["candidates"]}
-    assert r3["t3b"]["skipped"] == "tiling_blocked"           # spent after one use
+    assert r3["r3_t3b"]["skipped"] == "tiling_blocked"           # spent after one use
 
 
 def test_shortfall_does_not_depend_on_holdout_thresholds(big_root, tmp_path,  # noqa: F811

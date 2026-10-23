@@ -208,8 +208,8 @@ def attempts(hist: list[dict]) -> list[dict]:
                 "axis": _axis_label(delta), "outcome": _outcome(c, evaluated),
                 "gate_delta": gate.get("delta"), "gate_lo": gate.get("lo"),
                 "wall": c.get("wall_min") or {}, "reask": c.get("reask"),
-                "carry": (str(c.get("id", "")).startswith("carry_")
-                          or c.get("source") == "carryover"),
+                # by source, not id shape (carry_) — the planner can imitate ids
+                "carry": c.get("source") == "carryover",
                 "unused": c.get("unused_axes") or []})
     return out
 
@@ -397,9 +397,14 @@ def _time_section(run_dir: Path, t: dict, hist: list[dict]) -> list[str]:
                 + ", ".join(f"R{r} {n}" for r, n in sorted(reasks.items()))
                 + f") — of {len(asked)} re-asked candidates, adopted "
                 f"{sum(a['outcome'] == 'adopted' for a in asked)}"]
+    # The same rule as the loop's empty_rounds counter (runner._empty_round) — a
+    # round whose candidates only dropped out at the pre-holdout fit_dev verdict
+    # (fit_dev_skipped) is not empty
     empty = [e["round"] for e in hist if e.get("round", 0) > 0
-             and not (e.get("decision") or {}).get("evaluated")]
-    out += [f"- **empty rounds** (nothing measured on holdout): {len(empty)}"
+             and not (e.get("decision") or {}).get("evaluated")
+             and not (e.get("decision") or {}).get("fit_dev_skipped")]
+    out += [f"- **empty rounds** (nothing measured on holdout — excluding rounds "
+            f"with candidates skipped by the fit_dev verdict): {len(empty)}"
             + (" — " + ", ".join(f"R{r}" for r in empty) if empty else "")
             + (f"; stop reason `{summary['stopped']}`" if summary.get("stopped") else "")]
     if final:

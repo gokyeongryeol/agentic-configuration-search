@@ -1010,11 +1010,13 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
         seen.update(kw)
         return {"candidates": [], "stop": True}
 
-    LLMPlanner(chat=chat, artifact_dir=tmp_path, max_candidates=3).propose(
+    from agentic_configuration_search.config import PLANNER_MAX_CANDIDATES as K
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path, max_candidates=K).propose(
         [{"round": 0, "champion": {"axes": validate_axes({})}, "candidates": []}], {})
     assert seen["max_tokens"] == L.OUTPUT_MAX_TOKENS
     cands = seen["schema"]["schema"]["properties"]["candidates"]
-    assert cands["maxItems"] == 3
+    assert cands["maxItems"] == K
     props = cands["items"]["properties"]
     assert props["rationale"]["maxLength"] == L.RATIONALE_MAX_CHARS
     assert props["id"]["maxLength"] <= 80
@@ -1024,7 +1026,8 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
     # the two number fields (expected_gain, cost_min) and key names. differs is
     # the longest string field, so it is counted too
     assert props["differs"]["maxLength"] <= 300
-    worst = 3 * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"]
+    # counted with the most candidates config allows (planner.max_candidates ≤ K)
+    worst = K * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"]
                  + props["differs"]["maxLength"] + 600 + 100)
     assert worst / 2.0 < L.OUTPUT_MAX_TOKENS
 
@@ -1201,6 +1204,36 @@ def test_carried_duplicate_note_does_not_claim_evaluation():
                   {tuple(sorted(validate_axes({}).items()))}, dropped)
     assert "evaluated" not in dropped[0]["note"] and "carry_" in dropped[0]["note"]
     assert "evaluated anyway" not in PROMPT
+
+
+def test_tried_combos_name_the_champion_itself_first(tmp_path):
+    """The current champion's own combination is not a candidate — it is named as
+    the first item of the tried-combination list (an empty increment is dropped
+    as no_change). Carried even without history."""
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.llm import LLMPlanner
+
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 8})
+    history = [
+        {"round": 0, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
+         "candidates": [], "decision": {"adopted": True, "id": "baseline"}},
+        {"round": 1, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
+         "candidates": [{"id": "k4", "axes": validate_axes(
+             {"exemplar": "fn_arm", "exemplar_k": 4})}],
+         "decision": {"adopted": False}},
+    ]
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["p"] = messages[-1]["content"]
+        return {"candidates": [], "stop": True}
+
+    LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history, {})
+    line = next(l for l in seen["p"].splitlines()
+                if l.startswith("Combos already tried"))
+    items = line.split("): ", 1)[1]
+    assert items.startswith("{} = the current champion itself")
+    assert "no_change" in items and items.index("{exemplar_k=4}") > 0
 
 
 def test_refill_respects_disabled_axes(tmp_path):

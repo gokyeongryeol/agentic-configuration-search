@@ -598,7 +598,10 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
 STATIC_COST = {
     "tiling": "tiling=g: every detector pass costs 1+g^2 forwards per image "
               "(champion: {forwards})",
-    "lora": "lora: fine-tunes the detector tail before screening (the slowest axis)",
+    # Facts only — no value judgment ("the slowest axis") or time estimate for an
+    # axis not observed yet. Durations differ per dataset; once observed, the
+    # measured minutes above (_cost_lines) take over
+    "lora": "lora: fine-tunes the detector tail before screening",
     "crop_classifier": "crop_classifier: trains a crop classifier before screening",
     "rescorer": "rescorer: re-infers fit_train and fit_dev to refit the rescorer",
 }
@@ -621,8 +624,10 @@ def _budget_lines(budget: dict | None, history: list[dict], disabled=()) -> list
         lines.append(f"- Rounds in a row without adoption: {b.get('stagnant', 0)}; "
                      f"the run stops at {b['saturation_rounds']}.")
     if b.get("empty_rounds"):
-        lines.append(f"- Rounds in a row that measured nothing on the held-out split: "
-                     f"{b.get('empty', 0)}; the run stops at {b['empty_rounds']}.")
+        lines.append(f"- Rounds in a row that measured nothing on the held-out split "
+                     f"(a round where a candidate was dropped for losing on fit_dev "
+                     f"does not count): {b.get('empty', 0)}; the run stops at "
+                     f"{b['empty_rounds']}.")
     cost = _cost_lines(history)
     if cost:
         lines.append("- Measured wall-clock per candidate in this run (materialize + "
@@ -703,10 +708,18 @@ def _ledger_block(history: list[dict]) -> str:
         if len(rows) > MAX_LEDGER_ROWS:
             lines.append(f"... and {len(rows) - MAX_LEDGER_ROWS} more values")
     tried = tried_under_champion(history)[-MAX_TRIED:]
+    # the current champion's own combination (empty increment) comes first —
+    # stating it is not a candidate
     lines.append("Combos already tried, as differences from the champion (an exact "
                  "repeat is dropped as skipped=\"combo_tried\"): "
-                 + ("; ".join(f"{{{t}}}" for t in tried) if tried else "(none)"))
+                 + "; ".join([CHAMPION_COMBO] + [f"{{{t}}}" for t in tried]))
     return "\n".join(lines)
+
+
+# first item of the tried-combination list — the current champion itself.
+# Re-proposing it has no increment and is dropped
+CHAMPION_COMBO = ("{} = the current champion itself (not a candidate: re-proposing "
+                  "it changes nothing and is dropped as skipped=\"no_change\")")
 
 
 def _allowed_lines(history: list[dict], *, prescreen: dict | None, dead: list[str],
@@ -847,7 +860,9 @@ Rules:
   screened setting served exactly what the champion or an evaluated candidate
   serves; its material field shows what (e.g. text negatives that a larger k
   refined to the same phrases) — another value of that axis will likely
-  collapse the same way.
+  collapse the same way. skipped="fit_dev_lost" / "fit_dev_identical": it was
+  screened but clearly lost on fit_dev (ub < 0) / matched the champion image
+  for image there, so it never reached the held-out gate.
 - If nothing promising remains, return stop=true with no candidates.
 
 ## Budget

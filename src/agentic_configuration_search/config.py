@@ -39,6 +39,14 @@ class VllmLaunchCfg:
     persist: bool = True
 
 
+# Cap on planner.max_candidates — the most candidates for which the longest
+# response the schema allows (about 1.1k tokens per candidate) fits in
+# planner.llm.OUTPUT_MAX_TOKENS (4096). Raising it means re-sizing the output
+# cap (and the prompt budget it takes away) too (the truncation guard in
+# tests/test_planner.py is pinned to this value).
+PLANNER_MAX_CANDIDATES = 3
+
+
 @dataclass(frozen=True)
 class PlannerCfg:
     kind: str = "deterministic"          # one of PLANNER_KINDS
@@ -54,6 +62,11 @@ class PlannerCfg:
     # same round — diagnosis and champion are reused. 0 turns it off. kind=llm
     # only (the deterministic planner is not re-asked)
     max_reasks: int = 1
+    # Planner candidates per round — the prompt's "Propose up to N", the response
+    # schema's maxItems and the re-ask cap follow it, as do the deterministic
+    # planner (and the LLM's fallback). 1..PLANNER_MAX_CANDIDATES — the response
+    # must fit in the output cap
+    max_candidates: int = 3
     launch: VllmLaunchCfg = field(default_factory=VllmLaunchCfg)
 
     _NESTED: ClassVar[dict] = {"launch": VllmLaunchCfg}
@@ -72,7 +85,8 @@ class SaturationCfg:
     epsilon: float = 0.0                 # a round is stagnant if the Δ CI lower bound <= this
     # Stop (stopped="empty_rounds") after this many consecutive rounds that
     # measured nothing on holdout (even after re-asking). 0 turns it off — such
-    # rounds still count toward rounds
+    # rounds still count toward rounds. A round with candidates that skipped
+    # holdout for losing on fit_dev (fit_dev_lost, identical) is not counted
     empty_rounds: int = 2
 
 
@@ -96,6 +110,13 @@ class ScreenCfg:
     # bound of (candidate − champion) micro F(β) is below 0 it is rejected without
     # the rescorer refit, full screen or holdout. false turns it off
     lost_value_prescreen: bool = True
+    # Pre-holdout fit_dev verdict — a screened candidate whose (candidate −
+    # champion) fit_dev micro F(β) bootstrap upper bound is below 0
+    # (fit_dev_lost), or whose per-image fit_dev (tp, fp, fn) all equal the
+    # champion's (fit_dev_identical), is not sent to holdout. top_k counts only
+    # sendable candidates (the next one fills a freed slot). Applies to plain,
+    # carried and lora/classifier arm candidates. false turns it off
+    skip_fit_dev_losers: bool = True
 
 
 @dataclass(frozen=True)
@@ -360,6 +381,12 @@ def _validate(cfg: Config) -> None:
     if cfg.saturation.empty_rounds < 0:
         raise ConfigError("saturation.empty_rounds: must be >= 0 — 0 is off "
                           f"({cfg.saturation.empty_rounds})")
+    if not 1 <= cfg.planner.max_candidates <= PLANNER_MAX_CANDIDATES:
+        raise ConfigError(
+            f"planner.max_candidates: must be in 1..{PLANNER_MAX_CANDIDATES} "
+            f"({cfg.planner.max_candidates}) — larger, the planner response runs "
+            "past the output cap (planner.llm.OUTPUT_MAX_TOKENS) and is cut, and a "
+            "cut response silently falls back to deterministic")
     if cfg.planner.max_reasks < 0:
         raise ConfigError("planner.max_reasks: must be >= 0 — 0 is off "
                           f"({cfg.planner.max_reasks})")

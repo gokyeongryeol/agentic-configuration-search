@@ -161,6 +161,14 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   because their expensive part (refit, training) comes before the comparison,
   as are values that ever changed the champion and human or carried
   candidates. Holdout results are not used for the verdict.
+- **pre-holdout fit_dev verdict**: among screened candidates, those that
+  clearly lost to the champion on fit_dev (`fit_dev_cmp.ub` < 0 →
+  `fit_dev_lost`) and those whose per-image fit_dev (tp, fp, fn) all equal the
+  champion's (`fit_dev_identical`) are not sent to holdout
+  (`screen.skip_fit_dev_losers`, on by default). The same rule applies to plain
+  and carried candidates and to the lora and classifier arms, and `top_k`
+  counts only sendable candidates (the next candidate fills a freed slot).
+  Without comparison rows nothing is filtered.
 - **decide** adopts a candidate only if the paired-bootstrap lower bound of its
   holdout Δ clears the margin; otherwise the champion stays.
 - **re-ask**: if every candidate is rejected before holdout (by the filters or
@@ -171,12 +179,27 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   champion are reused. Re-asked candidates go through the same filters, screen
   and holdout and stay in the same round's history as `reask: k`. LLM planner
   only (the deterministic planner is not re-asked).
+- **candidate ids**: the loop adds an `r<round>_` prefix before recording
+  (`r2_cand_0`, re-ask `r2_reask1_0`, human candidate `r2_human_x`) — ids stay
+  unique within the run even when the planner reuses them every round. Carried
+  candidates are `carry_<original id>` (e.g. `carry_r1_cand_1`) — only carried
+  candidates made by the loop (`source: carryover`) are exempt from the prefix.
+  If the planner imitates a `carry_` id, `carry_` is stripped and the round
+  prefix added (the report also tells carried rows by source).
+- **candidate count**: the planner proposes up to `planner.max_candidates`
+  (default 3) per round (and per re-ask) — the prompt, the response schema and
+  the deterministic planner follow the same value. The range is 1–3 — larger
+  responses can exceed the output cap (4096 tokens), and a cut response silently
+  falls back to deterministic, so config rejects it.
 - **saturation** stops the run after `saturation.rounds` rounds without a
   meaningful adoption, or when the planner has nothing left to try. A round
   that measured nothing on holdout even after re-asking (an empty round) stops
   the run earlier after `saturation.empty_rounds` (default 2, 0 = off)
   consecutive ones (`stopped: "empty_rounds"`). Empty rounds are also stagnant
-  and count toward `saturation.rounds`.
+  and count toward `saturation.rounds`. A round that missed holdout only
+  because of the pre-holdout fit_dev verdict (`fit_dev_lost`,
+  `fit_dev_identical`) is not counted as empty (it is still stagnant) — the
+  skip only saves holdout time and does not change when the run stops.
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
   previous round's are copied (`diagnosis_key.json`).

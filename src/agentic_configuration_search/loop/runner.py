@@ -476,6 +476,7 @@ class Loop:
             raise ValueError("planner.kind=llm requires planner.base_url or "
                              "an injected llm_chat")
         return LLMPlanner(chat=chat, artifact_dir=round_dir,
+                          max_candidates=self.cfg.planner.max_candidates,
                           notes=self.cfg.dataset_notes,
                           token_budget=_token_budget(self.cfg),
                           disabled_axes=self.disabled_axes,
@@ -505,6 +506,7 @@ class Loop:
             proposal = self._llm_planner(round_dir).propose(history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
+                                             max_candidates=self.cfg.planner.max_candidates,
                                              disabled_axes=self.disabled_axes,
                                              disabled_values=self.disabled_values,
                                              facts=self._facts())
@@ -547,9 +549,12 @@ class Loop:
             return None
         rows = acc.skipped + [{k_: c[k_] for k_ in ("id", "axes")} | _requested(c)
                               | _unused_record(c) | _tiling_record(c)
-                              | _ledger_record(c) for c in acc.screened]
+                              | _ledger_record(c) | _skip_record(c)
+                              for c in acc.screened]
+        # screen rows dropped by the pre-holdout fit_dev verdict are reported as rejections too
+        outcomes = acc.skipped + [r for r in rows[len(acc.skipped):] if r.get("skipped")]
         proposal = self._llm_planner(round_dir).reask(
-            history, diagnosis, acc.skipped, k=k, taken={c["id"] for c in rows})
+            history, diagnosis, outcomes, k=k, taken={c["id"] for c in rows})
         if proposal is None:              # no conversation to continue (first call failed)
             return None
         for c in proposal["candidates"] + proposal["dropped"]:
@@ -559,9 +564,10 @@ class Loop:
         fresh, dropped = self._filter(proposal["candidates"], so_far)
         log.info("round %d: no candidate reached holdout, re-asked (%d) — %d new candidates",
                  r, k, len(fresh))
-        return {**proposal, "candidates": fresh,
-                "dropped": proposal["dropped"] + dropped,
-                "stop": proposal["stop"] and not fresh}
+        return _with_round_ids({**proposal, "candidates": fresh,
+                                "dropped": proposal["dropped"] + dropped,
+                                "stop": proposal["stop"] and not fresh},
+                               r, {c["id"] for c in rows})
 
     def _filter(self, merged: list[dict],
                 history: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -702,7 +708,9 @@ class Loop:
         prescreen of a candidate inheriting the rescorer runs before the refit).
         If split is a subset of fit_dev, the champion rows are cut down to its
         images. Reads fit_dev only — the champion's rows were also counted by
-        screen at fit_dev thresholds. None if there are no rows to compare."""
+        screen at fit_dev thresholds. None if there are no rows to compare. If
+        every per-image row equals the champion's, `identical: True` is set (the
+        pre-holdout verdict — _fit_dev_skip)."""
         champ = (getattr(self, "_champion", None) or {}).get("setting") or {}
         base = ((champ.get("fit_dev_counts_raw") or champ.get("fit_dev_counts"))
                 if raw else champ.get("fit_dev_counts"))
@@ -715,8 +723,13 @@ class Loop:
         if len(base) != len(rows):
             return None
         g = self.cfg.gate
-        return fit_dev_gap(base, rows, beta=self.cfg.beta, n_boot=g.bootstrap,
-                           seed=self.cfg.run_seed, alpha=1.0 - g.confidence)
+        out = fit_dev_gap(base, rows, beta=self.cfg.beta, n_boot=g.bootstrap,
+                          seed=self.cfg.run_seed, alpha=1.0 - g.confidence)
+        # Identity is only an exact match of every per-image (tp, fp, fn) row — a
+        # rounded delta and ub of 0 cannot tell "the same" from "very close"
+        if _as_rows(base) == _as_rows(rows):
+            out["identical"] = True
+        return out
 
     def _prescreen(self, c: dict, axes: dict, materials: Materials, entry: dict,
                    skipped: list) -> bool:
@@ -1016,7 +1029,7 @@ class Loop:
         # thresholds)
         self._diag_train = diagnosis.get("train")
         self._crop_notes(diagnosis, rd)      # merge VLM notes (diagnostic signal only)
-        proposal = self._propose(history, diagnosis, rd)
+        proposal = _with_round_ids(self._propose(history, diagnosis, rd), r, set())
         # served_* is what the detector has loaded right now — detector-state
         # candidates swap it in turn
         acc = _RoundAcc(served_w=champion.get("weights"),
@@ -1070,8 +1083,17 @@ class Loop:
                                     "gate": {k: c["gate"][k] for k in
                                              ("delta", "lo", "hi", "adopted")}}
                           for c in evaluated},
-            "skipped": [c["id"] for c in skipped],
+            "skipped": [c["id"] for c in skipped]
+                       + [c["id"] for c in screened if c.get("skipped")],
         } | reask_mark
+        # Candidates dropped only by the pre-holdout fit_dev verdict — with any,
+        # the round is not empty (_empty_round: the skip saves holdout time but
+        # does not change when the run stops)
+        fd_skipped = list(dict.fromkeys(
+            c["id"] for c in [*skipped, *screened]
+            if c.get("skipped") in FIT_DEV_SKIPS))
+        if fd_skipped:
+            decision["fit_dev_skipped"] = fd_skipped
         if proposal["stop"]:
             # the planner declared "nothing to try" while re-asked — this round
             # measured nothing (which is why it was re-asked) and the run stops here
@@ -1130,7 +1152,8 @@ class Loop:
                             | ({"wall_min": _wall_min(c["_wall"])}
                                if c.get("_wall") else {})
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
-                            | ({"source": c["source"]} if c.get("source") else {})
+                            | _source_record(c)
+                            | _skip_record(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -1142,6 +1165,23 @@ class Loop:
                     n_boot=self.cfg.gate.bootstrap, seed=self.cfg.run_seed,
                     alpha=1.0 - self.cfg.gate.confidence,
                     beta=self.cfg.beta)
+
+    def _arm_skip(self, row: dict) -> bool:
+        """The pre-holdout fit_dev verdict for the lora and classifier arms — the
+        same rule as plain candidates (_holdout_pick). The arm's own fit_dev
+        margin gate (arm vs the same candidate's base setting, point estimate)
+        asks "did training gain anything"; this asks whether the final setting,
+        rescorer refit included, clearly lost to or equals **the champion** —
+        different questions, so both are kept. If filtered, the reason goes on
+        the row and True is returned."""
+        if not self.cfg.screen.skip_fit_dev_losers:
+            return False
+        why = _fit_dev_skip(row)
+        if why is None:
+            return False
+        row.update(why)
+        log.info("candidate %s: %s", row["id"], why["note"])
+        return True
 
     def _attempt(self, rd: Path, champion: dict, proposal: dict,
                  acc: "_RoundAcc") -> None:
@@ -1212,8 +1252,8 @@ class Loop:
                                 "note": f"{type(exc).__name__}: {exc}"})
             _close_wall(entry["_wall"], t0, skipped[n_skip:])
 
-        top = sorted(screened, key=lambda c: -c["fit_dev_micro_f_beta"])
-        top = top[: self.cfg.screen.top_k]
+        top = _holdout_pick(screened, self.cfg.screen.top_k,
+                            skip=self.cfg.screen.skip_fit_dev_losers)
         evaluated = acc.evaluated
         _gate = lambda ev: self._gate(champion, ev)  # noqa: E731
 
@@ -1275,7 +1315,8 @@ class Loop:
                     ("id", "axes", "materials_dir", "setting",
                      "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
                    | _requested(entry) | _unused_record(entry)
-                   | _reask_record(entry) | _ledger_record(entry) | {"_wall": wall})
+                   | _reask_record(entry) | _ledger_record(entry)
+                   | _source_record(entry) | {"_wall": wall})
             screened.append(row)
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
@@ -1285,6 +1326,8 @@ class Loop:
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             row.update(_cmp_of(self._fit_dev_cmp(setting)))
+            if self._arm_skip(row):
+                continue
             t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
             wall["holdout"] = time.monotonic() - t1
@@ -1338,7 +1381,8 @@ class Loop:
                      "fit_dev_micro_f_beta")}
                    | {"crop_classifier": res["decision"]}
                    | _requested(entry) | _unused_record(entry)
-                   | _reask_record(entry) | _ledger_record(entry) | {"_wall": wall})
+                   | _reask_record(entry) | _ledger_record(entry)
+                   | _source_record(entry) | {"_wall": wall})
             screened.append(row)
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
@@ -1354,6 +1398,8 @@ class Loop:
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
             row.update(_cmp_of(self._fit_dev_cmp(setting)))
+            if self._arm_skip(row):
+                continue
             t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)
             wall["holdout"] = time.monotonic() - t1
@@ -1741,6 +1787,71 @@ def _cmp_of(cmp: dict | None) -> dict:
     return {"fit_dev_cmp": cmp} if cmp is not None else {}
 
 
+def _as_rows(rows) -> list:
+    """Normal form of per-image fit_dev rows for comparison — makes a JSON round
+    trip (lists) and computed values (tuples, numpy) the same shape."""
+    return json.loads(json.dumps(rows, default=lambda x: x.tolist()))
+
+
+# rejection reasons of the pre-holdout fit_dev verdict (_fit_dev_skip)
+FIT_DEV_SKIPS = ("fit_dev_lost", "fit_dev_identical")
+
+
+def _fit_dev_skip(c: dict) -> dict | None:
+    """The pre-holdout fit_dev verdict — {skipped, note} for a candidate not to
+    send, otherwise None.
+
+    Reads only fit_dev_cmp (per-image fit_dev rows counted at screen thresholds
+    — holdout plays no part).
+    (1) every per-image row equals the champion's (identical) — fit_dev_identical.
+    (2) the bootstrap upper bound of (candidate − champion) micro F(β) < 0 —
+    fit_dev_lost.
+    Without comparison rows (no champion rows etc.) nothing is filtered."""
+    cmp = c.get("fit_dev_cmp")
+    if not cmp or cmp.get("ub") is None:
+        return None
+    if cmp.get("identical"):
+        return {"skipped": "fit_dev_identical",
+                "note": "every per-image fit_dev (tp, fp, fn) equals the champion's — "
+                        "holdout evaluation is skipped"}
+    if cmp["ub"] < 0:
+        return {"skipped": "fit_dev_lost",
+                "note": f"clearly lost to the champion on fit_dev — (candidate − "
+                        f"champion) micro F(β) {cmp['delta']:+.4f}, upper bound "
+                        f"{cmp['ub']:+.4f} < 0, so holdout evaluation is skipped"}
+    return None
+
+
+def _holdout_pick(screened: list[dict], top_k: int, *, skip: bool) -> list[dict]:
+    """Candidates to send to the holdout gate — the top top_k by fit_dev score.
+
+    With skip, candidates that clearly lost on fit_dev or equal the champion
+    (_fit_dev_skip) get the reason and are left out. top_k counts **only
+    sendable candidates** — top_k is the budget of holdout reuse, so a slot a
+    dropped candidate did not use goes to the next one. Every screened candidate
+    gets the same verdict regardless of rank (so the record does not depend on
+    rank)."""
+    ranked = sorted(screened, key=lambda c: -c["fit_dev_micro_f_beta"])
+    if not skip:
+        return ranked[:top_k]
+    out = []
+    for c in ranked:
+        why = _fit_dev_skip(c)
+        if why is not None:
+            c.update(why)
+            log.info("candidate %s: %s", c["id"], why["note"])
+            continue
+        out.append(c)
+    return out[:top_k]
+
+
+def _skip_record(c: dict) -> dict:
+    """The reason of a candidate that passed screen but dropped out at the
+    pre-holdout fit_dev verdict."""
+    return {k: c[k] for k in ("skipped", "note") if c.get(k)} if c.get("skipped") \
+        else {}
+
+
 def _ledger_record(c: dict) -> dict:
     """Row fields the ledger (planner.ledger) reads — the fit_dev comparison, the
     clearly-lost variant mark (lost_values), and the planner's expected gain and
@@ -1753,6 +1864,12 @@ def _ledger_record(c: dict) -> dict:
 def _reask_record(c: dict) -> dict:
     """For a candidate from a re-ask in the same round, which re-ask it was (reask=k)."""
     return {"reask": c["reask"]} if c.get("reask") else {}
+
+
+def _source_record(c: dict) -> dict:
+    """The source of carried and human candidates — shared by plain candidates and
+    the lora and classifier arms (the report's carry verdict reads only this)."""
+    return {"source": c["source"]} if c.get("source") else {}
 
 
 def _unused_record(c: dict) -> dict:
@@ -1797,6 +1914,41 @@ def _empty_material(axes: dict, materials, manual_aliases: dict) -> str | None:
             (materials.text_negatives or {}).values()):
         return "text_negatives"
     return None
+
+
+_ROUND_PREFIX = re.compile(r"^(?:carry_)*(?:r\d+_)?")
+
+
+def _round_ids(items: list[dict], r: int, taken: set) -> list[dict]:
+    """Make candidate ids unique within the run — an r<round>_ prefix (if the
+    planner imitated an earlier round's prefix, it is stripped and re-added).
+    Carried candidates made by the loop (source=carryover, carry_<id>) keep
+    their id, since the original id already has a prefix. On a clash with taken
+    (ids already used this round) _2, _3… is appended. The input dicts are not
+    modified — replay artifacts (proposal*.json) keep the planner's ids, and
+    resume rebuilds the same ids by the same rule."""
+    out = []
+    for c in items:
+        cid = str(c["id"])
+        # Only real carried candidates are exempt — if the planner imitates a
+        # carry_ id, carry_ and the round prefix are stripped and this round's
+        # prefix is added (so ids do not clash across rounds)
+        if c.get("source") != "carryover":
+            cid = f"r{r}_" + _ROUND_PREFIX.sub("", cid)
+        base, n = cid, 2
+        while cid in taken:
+            cid, n = f"{base}_{n}", n + 1
+        taken.add(cid)
+        out.append({**c, "id": cid})
+    return out
+
+
+def _with_round_ids(proposal: dict, r: int, taken: set) -> dict:
+    """Put round ids on a proposal (passing candidates + drop rows) — once, before
+    recording."""
+    cands = _round_ids(proposal["candidates"], r, taken)
+    return {**proposal, "candidates": cands,
+            "dropped": _round_ids(list(proposal.get("dropped") or []), r, taken)}
 
 
 def _token_budget(cfg) -> int:
@@ -1889,8 +2041,16 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
 
 def _empty_round(decision: dict) -> bool:
     """Did the round measure nothing on holdout — evaluated still empty after the
-    re-asks (no_candidates and planner_stop included)? Not the baseline."""
-    return decision.get("kind") != "baseline" and not decision.get("evaluated")
+    re-asks (no_candidates and planner_stop included)? Not the baseline.
+
+    If some candidate dropped out at the pre-holdout fit_dev verdict
+    (fit_dev_lost, fit_dev_identical — the decision's `fit_dev_skipped`), the
+    round is not empty — without the skip it would have measured on holdout.
+    The skip only saves holdout time; it does not change when the run stops.
+    With no adoption it still counts as stagnant toward saturation.rounds
+    (_stagnant)."""
+    return (decision.get("kind") != "baseline" and not decision.get("evaluated")
+            and not decision.get("fit_dev_skipped"))
 
 
 def _trailing_empty(history: list[dict]) -> int:

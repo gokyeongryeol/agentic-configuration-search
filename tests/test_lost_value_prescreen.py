@@ -86,6 +86,30 @@ def test_near_miss_is_never_lost_even_after_a_clear_loss():
     assert led["alias=vlm"].status == "near-miss"
 
 
+def test_fit_dev_identical_row_is_not_a_near_miss():
+    """A row whose per-image fit_dev rows all equal the champion's
+    (fit_dev_identical — delta=0, ub=0) is neither a near miss nor a loss — it
+    does not release a clearly-lost value."""
+    same = _cand("b", ub=0.0, delta=0.0, skipped="fit_dev_identical", alias="vlm")
+    same["fit_dev_cmp"]["identical"] = True
+    hist = [_round(0, 0, []),
+            _round(1, 0, [_cand("a", ub=-0.01, alias="vlm")]),
+            _round(2, 0, [same])]
+    led = _ledger(hist)
+    rec = led["alias=vlm"]
+    assert not rec.near_miss and rec.clearly_lost and rec.status != "near-miss"
+    from agentic_configuration_search.planner.ledger import lost_values
+    assert ("alias", "vlm") in lost_values(hist)
+
+
+def test_fit_dev_identical_alone_is_not_a_clear_loss():
+    same = _cand("b", ub=-0.0, delta=0.0, skipped="fit_dev_identical", alias="vlm")
+    same["fit_dev_cmp"]["identical"] = True
+    same["fit_dev_cmp"]["ub"] = -1e-9                 # an identical row is ignored whatever its ub
+    rec = _ledger([_round(0, 0, []), _round(1, 0, [same])])["alias=vlm"]
+    assert not rec.near_miss and not rec.single_loss and rec.evidence is None
+
+
 def test_combo_loss_does_not_mark_its_values_lost():
     """A combination's loss cannot be attributed to one value."""
     hist = [_round(0, 0, []),
@@ -325,9 +349,9 @@ def test_clear_loss_is_recorded_then_variant_is_prescreened(big_root, tmp_path, 
         return real(self, r, *a, **k)
     monkeypatch.setattr(Loop, "run_round", marked)
     h = _run(big_root, tmp_path / "run", monkeypatch, calls)
-    r1 = {c["id"]: c for c in h[1]["candidates"]}["neg"]
+    r1 = {c["id"]: c for c in h[1]["candidates"]}["r1_neg"]
     assert r1["fit_dev_cmp"]["delta"] < 0 and r1["fit_dev_cmp"]["ub"] < 0
-    r2 = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+    r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2["skipped"] == "lost_value_prescreen"
     assert r2["lost_values"] == ["text_negatives=gt_crop"]
     assert "text_negatives=gt_crop" in r2["note"] and "upper bound" in r2["note"]
@@ -347,7 +371,7 @@ def test_clear_loss_is_recorded_then_variant_is_prescreened(big_root, tmp_path, 
 def test_prescreen_switch_off_screens_variant_fully(big_root, tmp_path,  # noqa: F811
                                                    monkeypatch):
     h = _run(big_root, tmp_path / "run", monkeypatch, lost_value_prescreen=False)
-    r2 = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+    r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2.get("skipped") != "lost_value_prescreen" and "lost_values" not in r2
     assert "prescreen" not in r2
 
@@ -357,7 +381,7 @@ def test_prescreen_without_subset_uses_full_fit_dev(big_root, tmp_path,  # noqa:
     """Without a subset (fit_dev is small) it is measured on the full fit_dev —
     that still saves holdout."""
     h = _run(big_root, tmp_path / "run", monkeypatch, prescreen_fraction=0.0)
-    r2 = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+    r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2["skipped"] == "lost_value_prescreen"
     assert r2["prescreen"]["n_images"] == r2["prescreen"]["of"]
 
@@ -385,7 +409,7 @@ def test_lost_value_skips_subset_when_it_is_most_of_fit_dev(big_root, tmp_path, 
     _round_marks(monkeypatch, calls)
     h = _run(big_root, tmp_path / "run", monkeypatch, calls, prescreen_max_share=0.5)
     n_dev = len(load_dataset(big_root).fit_dev.images)
-    r2 = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+    r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2["skipped"] == "lost_value_prescreen" and r2["fit_dev_cmp"]["ub"] < 0
     assert r2["prescreen"]["n_images"] == r2["prescreen"]["of"] == n_dev
     assert "neg_k2" not in (h[2]["decision"].get("evaluated") or {})
@@ -416,7 +440,7 @@ def test_full_fit_dev_prescreen_pass_is_not_screened_twice(big_root, tmp_path,  
         return real_screen(cfg, client, split, *a, **k)
     monkeypatch.setattr(runner_mod, "screen_candidate", screen)
     h = _run(big_root, tmp_path / "run", monkeypatch, prescreen_max_share=0.5)
-    r2 = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+    r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2.get("skipped") != "lost_value_prescreen"
     assert r2["prescreen"]["passed"] is True
     assert r2["prescreen"]["n_images"] == r2["prescreen"]["of"]
@@ -440,7 +464,7 @@ def test_human_candidates_are_not_prescreened(big_root, tmp_path, monkeypatch): 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=_llm_by_round({}), rounds=2, cfg=_cfg(big_root),
                candidates_file=cand, resume=True, **_fakes())
-    row = {c["id"]: c for c in _hist(tmp_path / "run")[2]["candidates"]}["human_k2"]
+    row = {c["id"]: c for c in _hist(tmp_path / "run")[2]["candidates"]}["r2_human_k2"]
     assert row.get("skipped") != "lost_value_prescreen" and "lost_values" not in row
 
 
@@ -481,7 +505,7 @@ def test_resume_reaches_the_same_prescreen_decision(big_root, tmp_path,  # noqa:
     split = _hist(tmp_path / "split")
 
     def r2(h):
-        c = {c["id"]: c for c in h[2]["candidates"]}["neg_k2"]
+        c = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
         return c["skipped"], c["fit_dev_cmp"], c["prescreen"]["n_images"]
     assert r2(whole) == r2(split)
 
@@ -541,6 +565,6 @@ def test_lost_value_prescreen_records_tiling_used(big_root, tmp_path,  # noqa: F
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=_llm_by_round(plan), rounds=2, cfg=_cfg(big_root),
                **_fakes())
-    r2 = {c["id"]: c for c in _hist(tmp_path / "run")[2]["candidates"]}["neg_t2"]
+    r2 = {c["id"]: c for c in _hist(tmp_path / "run")[2]["candidates"]}["r2_neg_t2"]
     assert r2["skipped"] == "lost_value_prescreen"
     assert isinstance(r2["tiling_used"], bool) and _screened(r2)

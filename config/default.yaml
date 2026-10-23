@@ -26,6 +26,7 @@ planner:
   crop_notes: true                        # show the VLM crops of every prompt sample and merge its descriptions into the diagnosis
                                           # (kind=llm only, diagnostic signal only — never on the decision path)
   max_reasks: 1                           # re-asks within the round when every candidate is rejected before holdout (0=off, kind=llm only)
+  max_candidates: 3                       # planner candidates per round 1..3 (prompt, schema and re-ask cap; deterministic follows too; larger responses exceed the output cap)
   launch:                                 # vLLM launch parameters when kind=llm and base_url is null
     gpu: 3
     port: 8104
@@ -44,7 +45,7 @@ gate:                                     # adoption gate
 saturation:                               # stopping rule
   rounds: 5                               # stop after this many consecutive stalled rounds
   epsilon: 0.0                            # a round is stalled if the Δ CI lower bound is ≤ this
-  empty_rounds: 2                         # stop after this many consecutive rounds that measured nothing on holdout (0=off)
+  empty_rounds: 2                         # stop after this many consecutive rounds that measured nothing on holdout (0=off; rounds with candidates skipped by the fit_dev verdict are excluded)
 
 screen:
   top_k: 2                                # candidates promoted to holdout after fit_dev scoring
@@ -64,6 +65,12 @@ screen:
   # lost_value_prescreen without the rescorer refit, full screen or holdout;
   # otherwise it proceeds
   lost_value_prescreen: true
+  # pre-holdout fit_dev verdict — a screened candidate whose (candidate − champion)
+  # bootstrap upper bound < 0 (fit_dev_lost) or whose per-image fit_dev
+  # (tp, fp, fn) all equal the champion's (fit_dev_identical) is not sent to
+  # holdout. top_k counts only sendable candidates (the next fills a freed slot).
+  # Plain, carried and lora/classifier arm candidates alike
+  skip_fit_dev_losers: true
 
 split:                                    # boundaries stay fixed across rounds
   fit_train_ratio: 0.8                    # fit_train share within train (image-level stratified)

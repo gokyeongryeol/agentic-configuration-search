@@ -87,7 +87,7 @@ def test_budget_card_shows_rounds_left_counters_and_costs():
     card = p.split("## Budget", 1)[1].split("## Current champion", 1)[0]
     assert "Round 4 of 8: 5 rounds left including this one." in card
     assert "without adoption: 2; the run stops at 5" in card
-    assert "measured nothing on the held-out split: 1; the run stops at 2" in card
+    assert "(a round where a candidate was dropped for losing on fit_dev does not count): 1; the run stops at 2" in card
     assert "- exemplar: median" in card                  # observed cost
     assert "lora: fine-tunes the detector tail" in card   # unobserved axes get a static note
     assert "- tiling=3: median 20 min" in card and "1+g^2" not in card
@@ -98,6 +98,18 @@ def test_budget_card_static_tiling_cost_uses_champion_forwards():
     card = _prompt(hist).split("## Budget", 1)[1].split("## Current champion", 1)[0]
     assert "tiling=g: every detector pass costs 1+g^2 forwards per image " \
            "(champion: 5)" in card
+
+
+def test_budget_card_states_unmeasured_costs_without_judging_them():
+    """The cost note for an unobserved axis states facts only — a value judgment
+    like "the slowest axis" makes the planner put that axis off (in a validation
+    run two datasets put LoRA off to R3–R4). No duration estimate either — it
+    differs per dataset."""
+    hist = _history()[:2]                                 # before lora and classifier are observed
+    card = _prompt(hist).split("## Budget", 1)[1].split("## Current champion", 1)[0]
+    assert "slowest" not in card and " min" not in card.split("Not measured yet", 1)[1]
+    assert ("lora: fine-tunes the detector tail before screening; crop_classifier: "
+            "trains a crop classifier before screening") in card
 
 
 def test_budget_card_skips_unknown_fields_and_disabled_axes():
@@ -303,5 +315,5 @@ def test_runner_feeds_budget_card_into_the_prompt(big_root, tmp_path,  # noqa: F
     assert "without adoption: 1; the run stops at 4" in prompts[1]
     hist = [json.loads(line) for line in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
-    row = {c["id"]: c for c in hist[1]["candidates"]}["t1"]
+    row = {c["id"]: c for c in hist[1]["candidates"]}["r1_t1"]
     assert row["plan"] == {"expected_gain": 0.01, "cost_min": 3.0}

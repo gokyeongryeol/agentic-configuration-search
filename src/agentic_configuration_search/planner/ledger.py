@@ -18,6 +18,10 @@ champion) fit_dev micro F(β) left by screen).
   the same value) has `ub < 0`, and no row containing the value (combinations
   included) has `ub ≥ 0`.
 - near miss: some row containing the value has `ub ≥ 0` — not prescreened.
+- a row whose per-image fit_dev rows all equal the champion's
+  (`fit_dev_cmp.identical`, fit_dev_identical — delta=0, ub=0) is neither a
+  near miss nor a loss — a variant that changed nothing must not release a lost
+  value.
 - holdout results (gate Δ) are only shown in the table, never used for the
   verdict — filtering future screens with a value that came from holdout would
   reuse holdout once more.
@@ -66,7 +70,9 @@ _BLOCKED = {"tiling_blocked", "combo_tried", "axis_disabled", "carried_duplicate
 _OUTCOME = {"lost_value_prescreen": "prescreened", "axis_unused": "unused",
             "same_setting": "same_setting", "no_material": "no_material",
             "rescorer_identity": "no_effect", "lora_gate": "arm_gate",
-            "classifier_gate": "arm_gate", "error": "error"}
+            "classifier_gate": "arm_gate", "error": "error",
+            # reached screen but dropped out at the pre-holdout fit_dev verdict
+            "fit_dev_lost": "screened", "fit_dev_identical": "same_setting"}
 
 
 def label(key: tuple) -> str:
@@ -132,7 +138,7 @@ class ValueRecord:
     best_fit_dev: dict | None = None     # best fit_dev_cmp (delta, ub, n)
     best_holdout: dict | None = None     # best holdout gate (delta, lo) — display only
     minutes: float = 0.0                 # summed wall clock of candidates containing it (min)
-    near_miss: bool = False              # some containing row has fit_dev ub ≥ 0
+    near_miss: bool = False              # some containing row has fit_dev ub ≥ 0 (identical rows excluded)
     single_loss: bool = False            # some single-increment row has fit_dev ub < 0
     evidence: dict | None = None         # evidence of the clear loss (single row with the worst ub)
     folded: bool = False                 # a grid the tiling fold gate blocks
@@ -219,7 +225,11 @@ def axis_ledger(history: list[dict]) -> dict[tuple, ValueRecord]:
                         rec.best_fit_dev is None
                         or cmp["delta"] > rec.best_fit_dev["delta"]):
                     rec.best_fit_dev = dict(cmp)
-                if ub is not None:
+                if ub is not None and not cmp.get("identical"):
+                    # a row whose per-image rows all equal the champion's
+                    # (fit_dev_identical) changed nothing — neither a near miss
+                    # nor a loss (with delta=0, ub=0 it would otherwise release
+                    # a lost value as a near miss)
                     # a prescreen-rejected row's ub is a subset value — it does not
                     # create a new loss (the value already lost) but can be a near miss
                     if ub >= 0:
