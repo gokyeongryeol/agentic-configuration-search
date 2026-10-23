@@ -123,6 +123,7 @@ def test_arm_candidate_with_rescorer_is_gated_on_calibrated_channel(
     monkeypatch.setattr(runner_mod, "evaluate_on_holdout", spy_raw)
 
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4},
     })
@@ -225,6 +226,7 @@ def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by
     _human_candidates_only(monkeypatch)
 
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4},
         "crop_classifier": {"min_samples": 4, "min_background": 0, "margin": 0.01},

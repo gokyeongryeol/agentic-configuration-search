@@ -70,6 +70,7 @@ def _fake_infer(root):
 
 def _cfg(root):
     return config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "rescorer": {"min_samples": 64, "min_samples_per_class": 1,
                      "margin": 0.005, "ensemble_members": 2},

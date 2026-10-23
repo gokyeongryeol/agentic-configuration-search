@@ -22,7 +22,6 @@ only the keys it changes (the rest come from
 ```yaml
 dataset: demo_data/soccer-players-5fuqs
 detector: {model: weights_yoloe/yoloe-26x-seg.pt, device: "cuda:0"}
-planner: {kind: llm}         # default deterministic
 mine: {device: "cuda:1"}
 ```
 ```bash
@@ -87,7 +86,7 @@ details in the [axis reference](docs/design.md#axis-reference).
 | key | default | meaning |
 |---|---|---|
 | `dataset` · `rounds` · `beta` | required · 10 · 1.0 | dataset, round cap, β of F(β) |
-| `planner.kind` | `deterministic` | `llm` for the vLLM planner |
+| `planner.kind` | `llm` | the vLLM planner. `deterministic` is the rule planner (A/B control, environments without an LLM) |
 | `planner.max_candidates` | 3 | candidates per round (1–3) |
 | `dataset_notes` | `""` | dataset description carried verbatim in the LLM prompt |
 | `search.disabled_axes` | `[]` | axes not to search |

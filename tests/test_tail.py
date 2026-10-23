@@ -189,6 +189,7 @@ def test_tail_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     monkeypatch.setattr(tail_round, "train_tail", fake_train)
 
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 0.5, 1.0], "margin": 0.01, "min_images": 4},
     })
@@ -241,6 +242,7 @@ def test_tail_candidate_restores_on_rejection(root, tmp_path, monkeypatch):
 
     monkeypatch.setattr(tail_round, "train_tail", fake_train)
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4},
     })

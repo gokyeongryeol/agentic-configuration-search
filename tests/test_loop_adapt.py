@@ -113,6 +113,7 @@ def test_classifier_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
 
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         # misclassified FPs sit on GT (IoU 1.0), so no background arises — relax the tripwire
         "crop_classifier": {"min_samples": 4, "min_background": 0,
@@ -151,6 +152,7 @@ def test_classifier_rejected_restores_state(root, tmp_path, monkeypatch):
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
 
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "crop_classifier": {"min_samples": 4, "min_background": 0},
     })
@@ -280,6 +282,7 @@ def test_classifier_trains_on_fit_train_only(root, tmp_path, monkeypatch):
     monkeypatch.setattr(ar, "mine_classifier_crops", spy_mine)
     monkeypatch.setattr(ar, "train_crop_classifier", train_fn)
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "crop_classifier": {"min_samples": 1, "min_background": 0, "margin": 0.01},
     })
@@ -312,7 +315,7 @@ def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server))
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
-    cfg = config_from_dict({"dataset": str(root),
+    cfg = config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root),
                             "crop_classifier": {"min_samples": 10_000}})
     cand_file = tmp_path / "candidates.yaml"
     cand_file.write_text("- id: fixcls\n  axes: {crop_classifier: true}\n")
@@ -339,7 +342,7 @@ def test_classifier_margin_rejection_is_not_dead(root, tmp_path, monkeypatch):
     server = FakeAdapt()
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(root, server, confuse=False))
     monkeypatch.setattr(ar, "train_crop_classifier", _fake_train(tmp_path))
-    cfg = config_from_dict({"dataset": str(root),
+    cfg = config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root),
                             "crop_classifier": {"min_samples": 1, "min_background": 0}})
     cand_file = tmp_path / "candidates.yaml"
     cand_file.write_text("- id: fixcls\n  axes: {crop_classifier: true}\n")

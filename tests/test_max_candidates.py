@@ -76,7 +76,7 @@ def test_deterministic_planner_follows_the_knob(big_root, tmp_path,  # noqa: F81
                                                 monkeypatch):
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     cfg = config_from_dict({"dataset": str(big_root), "rounds": 1,
-                            "planner": {"max_candidates": 1}})
+                            "planner": {"kind": "deterministic", "max_candidates": 1}})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                rounds=1, cfg=cfg, **_fakes())
     import json
