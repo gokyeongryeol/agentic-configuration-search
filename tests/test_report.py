@@ -361,3 +361,29 @@ def test_samples_cover_kinds_round_robin():
                 "box": [0, 0, 10, 10]}])
     picked = _samples(rows, [])
     assert len(picked) == 5 and picked[0]["kind"] == "missed"
+
+
+def test_time_section_fit_dev_skip_round_is_not_empty(tmp_path):
+    """A round whose candidates only dropped out at the pre-holdout fit_dev verdict
+    (decision.fit_dev_skipped) is not empty — the same rule as the loop's
+    empty_rounds counter (_empty_round)."""
+    run = _synthetic_run(tmp_path)
+    rows = [_json.loads(x) for x in (run / "history.jsonl").read_text().splitlines()]
+    rows[3]["decision"]["fit_dev_skipped"] = ["res"]
+    (run / "history.jsonl").write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    s = _section(render_report(run), "Time use")
+    assert ("empty rounds** (nothing measured on holdout — excluding rounds with "
+            "candidates skipped by the fit_dev verdict): 0") in s
+
+
+def test_planner_made_carry_id_is_not_reported_as_carried(tmp_path):
+    """Whether a row was carried is judged by source (source=carryover), not by id
+    shape (carry_)."""
+    from agentic_configuration_search.diagnose.report import attempts as _attempts
+
+    rows = _history_rows()
+    rows[2]["candidates"][0].pop("source")         # same carry_ id, no source
+    att = {a["id"]: a for a in _attempts(rows)}
+    assert not att["carry_neg"]["carry"]
+    att = {a["id"]: a for a in _attempts(_history_rows())}
+    assert att["carry_neg"]["carry"]

@@ -133,7 +133,7 @@ def test_human_candidates_are_injected(big_root, tmp_path, monkeypatch):
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
     screened = out.decisions[1]["screened"]
-    assert any(cid.startswith("human_") for cid in screened)
+    assert any(cid.startswith("r1_human_") for cid in screened)
 
 
 def test_rescorer_without_embeddings_skips_as_identity(big_root, tmp_path,
@@ -145,7 +145,7 @@ def test_rescorer_without_embeddings_skips_as_identity(big_root, tmp_path,
         "- id: try_rescorer\n  axes: {rescorer: true}\n  rationale: try rescoring\n")
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
-    assert "human_try_rescorer" in out.decisions[1]["skipped"]
+    assert "r1_human_try_rescorer" in out.decisions[1]["skipped"]
 
 
 def test_lora_without_deps_skips_and_records(big_root, tmp_path, monkeypatch):
@@ -156,7 +156,7 @@ def test_lora_without_deps_skips_and_records(big_root, tmp_path, monkeypatch):
         "- id: try_lora\n  axes: {lora: true}\n  rationale: try adaptation\n")
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
-    assert "human_try_lora" in out.decisions[1]["skipped"]
+    assert "r1_human_try_lora" in out.decisions[1]["skipped"]
 
 
 def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
@@ -194,9 +194,9 @@ def test_runner_filters_retried_combos_from_any_planner(big_root, tmp_path,
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=stubborn_llm, rounds=3, **_fakes())
     r1 = out.decisions[1]
-    assert "again" in r1["screened"]                    # first attempt is screened
+    assert "r1_again" in r1["screened"]                 # first attempt is screened
     for d in out.decisions[2:]:
-        assert "again" not in d.get("screened", []), \
+        assert f"r{d['round']}_again" not in d.get("screened", []), \
             "an already-tried combination was re-screened"
 
 
@@ -233,11 +233,11 @@ def test_dedup_dropped_recorded_as_combo_tried(big_root, tmp_path, monkeypatch):
 
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=stubborn_llm, rounds=2, **_fakes())
-    assert "again" in out.decisions[2].get("skipped", [])
+    assert "r2_again" in out.decisions[2].get("skipped", [])
     hist = [_json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     r2 = {c["id"]: c for c in hist[2]["candidates"]}
-    assert r2["again"]["skipped"] == "combo_tried"
+    assert r2["r2_again"]["skipped"] == "combo_tried"
 
 
 def test_stagnant_counts_adopted_below_epsilon():
@@ -432,14 +432,14 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=llm, rounds=1, **_fakes())
 
-    assert "bad_fn_k" in out.decisions[1].get("skipped", [])
+    assert "r1_bad_fn_k" in out.decisions[1].get("skipped", [])
     hist = [_json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
-    assert rec["bad_fn_k"]["skipped"] == "invalid_axes"
-    assert "fn_k" in rec["bad_fn_k"].get("note", "")
+    assert rec["r1_bad_fn_k"]["skipped"] == "invalid_axes"
+    assert "fn_k" in rec["r1_bad_fn_k"].get("note", "")
     # a valid candidate passes sanitization — it may still be rejected later (axis_unused etc.)
-    assert "ok_tiling" in rec and rec["ok_tiling"].get("skipped") != "invalid_axes"
+    assert "r1_ok_tiling" in rec and rec["r1_ok_tiling"].get("skipped") != "invalid_axes"
 
 
 def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
@@ -504,9 +504,9 @@ def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
     hist = [_json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
-    assert rec["g"]["skipped"] == "invalid_axes"
-    assert rec["human_hg"]["skipped"] == "invalid_axes"
-    assert rec["t"].get("skipped") != "invalid_axes"     # passes sanitization
+    assert rec["r1_g"]["skipped"] == "invalid_axes"
+    assert rec["r1_human_hg"]["skipped"] == "invalid_axes"
+    assert rec["r1_t"].get("skipped") != "invalid_axes"     # passes sanitization
 
 
 def test_tiling_variants_follow_axis_grid():
@@ -537,7 +537,7 @@ def test_history_records_whether_tiling_was_used(big_root, tmp_path, monkeypatch
     hist = [_json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
-    assert isinstance(rec["t3"]["tiling_used"], bool)
+    assert isinstance(rec["r1_t3"]["tiling_used"], bool)
 
 
 def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypatch):
@@ -586,7 +586,7 @@ def test_untrainable_lora_never_reaches_tail_round(big_root, tmp_path, monkeypat
     hist = [_json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
-    assert rec["l"]["skipped"] == "invalid_axes" and "min_images" in rec["l"]["note"]
+    assert rec["r1_l"]["skipped"] == "invalid_axes" and "min_images" in rec["r1_l"]["note"]
 
 
 # --- text-only tiling: measure whether tiles are actually used, align the label ---
@@ -624,7 +624,7 @@ def test_text_only_tiling_that_does_not_help_is_not_evaluated(big_root, tmp_path
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=_llm_tiling, rounds=1, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["skipped"] == "axis_unused" and rec["unused_axes"] == ["tiling"]
     assert rec["tiling_used"] is False
     assert "t2" not in (out.decisions[1].get("evaluated") or {})
@@ -636,10 +636,10 @@ def test_text_only_tiling_that_helps_keeps_its_label(big_root, tmp_path, monkeyp
     monkeypatch.setattr(gateway, "infer_config", _tile_helps_infer(_gt_lookup(big_root)))
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=_llm_tiling, rounds=1, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec.get("skipped") is None and rec["tiling_used"] is True
     assert rec["axes"]["tiling"] == 2 and "requested_axes" not in rec
-    assert "t2" in out.decisions[1]["evaluated"]
+    assert "r1_t2" in out.decisions[1]["evaluated"]
 
 
 def test_untiled_setting_is_relabelled_with_request_kept():
@@ -650,7 +650,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
     from agentic_configuration_search.loop.runner import _relabel_unused as _relabel_untiled, _tiling_record
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.deterministic import tried_combos
-    from agentic_configuration_search.planner.llm import _tried_lines
+    from agentic_configuration_search.planner.ledger import tried_under_champion
 
     setting = {"configs": [{"config_id": 0, "tiling": None},
                            {"config_id": 1, "tiling": {"grid": 2}}],
@@ -666,7 +666,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
              "candidates": [{"id": "x", "axes": entry["axes"],
                              "requested_axes": entry["requested_axes"]}]}]
     assert tuple(sorted(entry["requested_axes"].items())) in tried_combos(hist)
-    assert any("tiling=2" in l for l in _tried_lines(hist, validate_axes({})))
+    assert any("tiling=2" in l for l in tried_under_champion(hist))
 
 
 # --- forwards per image ---------------------------------------------------
@@ -790,7 +790,7 @@ def test_unused_exemplar_is_not_evaluated(big_root, tmp_path, monkeypatch):
 
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                      llm_chat=llm, rounds=1, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["ex"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_ex"]
     assert rec["skipped"] == "axis_unused" and rec["unused_axes"] == ["exemplar"]
     assert "ex" not in (out.decisions[1].get("evaluated") or {})
 
@@ -820,6 +820,19 @@ def test_unused_record_is_shared_by_all_candidate_paths():
     # (wiring, screen, arms)
     src = inspect.getsource(runner.Loop.run_round) + inspect.getsource(runner.Loop._attempt)
     assert src.count("_unused_record(") == 3
+
+
+def test_source_record_is_shared_by_all_candidate_paths():
+    """The source of carried and human candidates stays on plain, lora-arm and
+    classifier-arm rows alike — the report judges carry only by source, so a
+    missing source on an arm row drops it from the carry results table."""
+    import inspect
+    from agentic_configuration_search.loop import runner
+
+    assert runner._source_record({"source": "carryover"}) == {"source": "carryover"}
+    assert runner._source_record({}) == {}
+    src = inspect.getsource(runner.Loop.run_round) + inspect.getsource(runner.Loop._attempt)
+    assert src.count("_source_record(") == 3
 
 
 def test_neg_eta_record_reads_the_screened_setting():
@@ -899,7 +912,7 @@ def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_pa
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=llm, rounds=1, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["vn"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_vn"]
     assert rec["neg_eta_grid"] == sorted(SearchCfg().neg_eta_grid)
     assert rec.get("skipped") is None, rec.get("skipped")
     assert set(rec["neg_eta_used"]) <= set(rec["neg_eta_grid"])
@@ -925,9 +938,27 @@ def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,
     """A label equal to the champion's is not the same setting when the served
     materials differ — a candidate with exemplar on re-mines text negatives from
     the exemplar pass's FPs, so its suppression phrases differ from the
-    champion's even when exemplar goes unused. It must be evaluated."""
+    champion's even when exemplar goes unused. It must be evaluated.
+
+    The stub adds one more false positive on a single image per call in the text
+    pass carrying the newly mined suppression phrases (the 'look' of the _fakes
+    captions) — the fit_dev rows differ from the champion's (not
+    fit_dev_identical) by a difference within noise (not fit_dev_lost), so it
+    reaches the holdout gate."""
     import json as _json
-    monkeypatch.setattr(gateway, "infer_config", _semantic_fp_infer(_gt_lookup(big_root)))
+    base = _semantic_fp_infer(_gt_lookup(big_root))
+
+    def infer(ctx, client, config, queries, ontology, image_paths, **kw):
+        out = base(ctx, client, config, queries, ontology, image_paths, **kw)
+        semantic = bool(queries) and any("prompt_image" in q for q in queries)
+        if out and not semantic and "look" in _json.dumps(queries, default=str):
+            one = min(str(p) for p in image_paths)     # one image per call
+            for p, dets in zip(image_paths, out):
+                if str(p) == one:
+                    dets.append({"box": [80.0, 60.0, 90.0, 70.0], "score": 0.95,
+                                 "category_id": 1, "sources": ["full"]})
+        return out
+    monkeypatch.setattr(gateway, "infer_config", infer)
     run = tmp_path / "run"
     run_rounds(big_root, out_dir=run, planner="deterministic", rounds=0, **_fakes())
     # switch the champion to text_negatives=fp_crop (different suppression phrases)
@@ -943,8 +974,13 @@ def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,
     human.write_text("- {id: ex, axes: {exemplar: base}}\n")
     run_rounds(big_root, out_dir=run, planner="deterministic", rounds=1,
                resume=True, candidates_file=human, **_fakes())
-    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["human_ex"]
+    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["r1_human_ex"]
+    # blocked neither by the serving-state verdicts (same_setting, axis_unused)
+    # nor by the pre-holdout fit_dev verdict — it is evaluated on holdout
     assert rec.get("skipped") is None, rec.get("note")
+    cmp = rec["fit_dev_cmp"]
+    assert not cmp.get("identical") and cmp["ub"] >= 0
+    assert "r1_human_ex" in _hist(run)[1]["decision"]["evaluated"]
     assert rec["unused_axes"] == ["exemplar"]          # the label is still corrected
 
 
@@ -961,9 +997,11 @@ def test_same_served_setting_as_sibling_is_not_reevaluated(big_root, tmp_path,
                      rounds=1, candidates_file=human, **_fakes())
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
     evaluated = set(out.decisions[1].get("evaluated") or {})
-    assert len({"human_a", "human_b"} & evaluated) <= 1
-    dup = [k for k in ("human_a", "human_b") if rec[k].get("skipped") == "same_setting"]
-    assert dup == ["human_b"], {k: rec[k].get("skipped") for k in ("human_a", "human_b")}
+    assert len({"r1_human_a", "r1_human_b"} & evaluated) <= 1
+    dup = [k for k in ("r1_human_a", "r1_human_b")
+           if rec[k].get("skipped") == "same_setting"]
+    assert dup == ["r1_human_b"], {k: rec[k].get("skipped")
+                                   for k in ("r1_human_a", "r1_human_b")}
 
 
 def test_served_fingerprint_reads_content_not_config_ids():
@@ -1045,7 +1083,7 @@ def test_candidate_turning_off_lora_is_skipped_not_adopted(big_root, tmp_path,
     human.write_text("- {id: ex, axes: {exemplar: base, lora: false}}\n")
     out = run_rounds(big_root, out_dir=run, planner="deterministic", rounds=1,
                      resume=True, candidates_file=human, detector_hooks=hooks, **_fakes())
-    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["human_ex"]
+    rec = {c["id"]: c for c in _hist(run)[1]["candidates"]}["r1_human_ex"]
     assert rec["skipped"] == "detector_state_off" and "lora" in rec["note"]
     assert "human_ex" not in (out.decisions[-1].get("evaluated") or {})
     ch2 = _json.loads((run / "champion.json").read_text())
@@ -1082,8 +1120,9 @@ def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path
     run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                rounds=1, candidates_file=human, **_fakes())
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
-    assert rec["human_a"]["skipped"] == "error"
-    assert rec["human_b"].get("skipped") != "same_setting", rec["human_b"].get("note")
+    assert rec["r1_human_a"]["skipped"] == "error"
+    assert rec["r1_human_b"].get("skipped") != "same_setting", \
+        rec["r1_human_b"].get("note")
     assert len(calls) == 2                  # b got as far as the discriminator refit
 
 
@@ -1119,7 +1158,7 @@ def test_skipped_unused_exemplar_keeps_modality_scores(big_root, tmp_path,
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=llm, rounds=1, **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["ex"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_ex"]
     assert rec["skipped"] == "axis_unused"
     mf = rec["modality_f"]
     assert set(mf) == {"cat a", "cat b"}
@@ -1195,6 +1234,56 @@ def test_filtered_candidates_are_not_logged_as_unwired(big_root, tmp_path, monke
         run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                    rounds=1, candidates_file=human, **_fakes())
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
-    assert rec["human_bad"]["skipped"] == "invalid_axes"
+    assert rec["r1_human_bad"]["skipped"] == "invalid_axes"
     unwired = [r.message for r in caplog.records if "cannot be wired" in r.message]
     assert all("human_bad" not in m for m in unwired), unwired
+
+
+def test_carryover_starts_from_a_fresh_row_without_screen_fields():
+    """A carried candidate does not copy the previous row — screen-derived fields
+    (prescreen, tiling_f, fit_dev_cmp, tiling_shortfall, wall_min, setting_fp …)
+    are only recorded as measured again by the new round on the new champion.
+    (In a validation run, a carried candidate's prescreen matching the original
+    row was not a copy but the same base setting — tiling=3, before the
+    rescorer refit — measured again: pass cache hits 84%, tiling_shortfall and
+    wall_min differed.)"""
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.deterministic import carryover
+
+    champ0, champ1 = validate_axes({}), validate_axes({"rescorer": True})
+    stale = {"id": "cand_1", "axes": validate_axes({"tiling": 3}),
+             "gate_passed_but_lost": True, "fit_dev_micro_f_beta": 0.3,
+             "prescreen": {"n_images": 36}, "tiling_f": {"tiled": 0.3},
+             "tiling_used": True, "fit_dev_cmp": {"delta": 0.04, "ub": 0.07},
+             "tiling_shortfall": {"grid": 3}, "wall_min": {"total": 10.0},
+             "setting_fp": "x", "modality_f": {}, "forwards": 10,
+             "plan": {"expected_gain": 0.01}, "unused_axes": ["exemplar"]}
+    hist = [{"round": 0, "champion": {"axes": champ0}, "candidates": []},
+            {"round": 1, "champion": {"axes": champ1}, "candidates": [stale]}]
+    (c,) = carryover(hist)
+    assert set(c) == {"id", "axes", "source", "rationale"}
+    assert c["id"] == "carry_cand_1" and c["axes"]["tiling"] == 3
+
+
+def test_carried_row_records_only_this_rounds_measurement(big_root, tmp_path,
+                                                         monkeypatch):
+    """A carried row's fit_dev comparison is measured again against the new
+    champion — the previous row's values do not carry over."""
+    monkeypatch.setattr(gateway, "infer_config", _tile_helps_infer(_gt_lookup(big_root)))
+    human = tmp_path / "candidates.yaml"
+    human.write_text("- {id: ex, axes: {exemplar: base}}\n"
+                     "- {id: t2, axes: {tiling: 2}}\n")
+    out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
+                     rounds=2, candidates_file=human, **_fakes())
+    hist = _hist(tmp_path / "run")
+    loser = next(i for i, ev in out.decisions[1]["evaluated"].items()
+                 if ev["gate"]["adopted"] and i != out.decisions[1]["id"])
+    src = {c["id"]: c for c in hist[1]["candidates"]}[loser]
+    row = {c["id"]: c for c in hist[2]["candidates"]}[f"carry_{loser}"]
+    assert "gate_passed_but_lost" not in row and "plan" not in row
+    # if not measured this round (rejected by a filter etc.) there are no screen
+    # fields; if measured, they are against the new champion — either way the
+    # previous row's values do not stay
+    for k in ("prescreen", "fit_dev_cmp", "tiling_shortfall", "wall_min",
+              "setting_fp", "fit_dev_micro_f_beta"):
+        assert row.get(k) is None or row[k] != src.get(k), k

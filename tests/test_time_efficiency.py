@@ -168,7 +168,7 @@ def test_blocked_tiling_is_dropped_before_materialize(big_root, tmp_path,  # noq
                rounds=2, cfg=cfg, **_fakes())
     h = _hist(tmp_path / "run")
     assert h[1]["candidates"][0]["skipped"] == "axis_unused", h[1]["candidates"]
-    rec = {c["id"]: c for c in h[2]["candidates"]}["t3"]
+    rec = {c["id"]: c for c in h[2]["candidates"]}["r2_t3"]
     assert rec["skipped"] == "tiling_blocked" and "grid" in rec["note"]
     assert 3 not in seen
 
@@ -205,10 +205,11 @@ def test_prescreen_config_defaults_and_validation():
     from agentic_configuration_search.config import ConfigError, config_from_dict
 
     s = config_from_dict({"dataset": "x"}).screen
-    assert (s.prescreen_fraction, s.prescreen_min_images, s.prescreen_min_grid) \
-        == (0.25, 20, 3)
+    assert (s.prescreen_fraction, s.prescreen_min_images, s.prescreen_min_grid,
+            s.prescreen_max_share) == (0.25, 20, 3, 0.5)
     for bad in ({"prescreen_fraction": -0.1}, {"prescreen_fraction": 1.5},
-                {"prescreen_min_images": 0}, {"prescreen_min_grid": 1}):
+                {"prescreen_min_images": 0}, {"prescreen_min_grid": 1},
+                {"prescreen_max_share": 0.0}, {"prescreen_max_share": 1.5}):
         with pytest.raises(ConfigError):
             config_from_dict({"dataset": "x", "screen": bad})
 
@@ -220,14 +221,40 @@ def test_prescreen_subset_is_deterministic_fit_dev_only(dataset_root):
     ds = load_dataset(dataset_root)
     dev = ds.fit_dev
     names = [e.file_name for e in dev.images]
-    a = prescreen_subset(dev, 0.5, 1)
-    b = prescreen_subset(load_dataset(dataset_root).fit_dev, 0.5, 1)
+    a = prescreen_subset(dev, 0.5, 1, max_share=1.0)
+    b = prescreen_subset(load_dataset(dataset_root).fit_dev, 0.5, 1, max_share=1.0)
     assert a is not None and len(a.images) == 1
     assert [e.file_name for e in a.images] == [e.file_name for e in b.images]
     assert set(e.file_name for e in a.images) <= set(names)
     # 0 is off · equal to the whole split is pointless, so None
-    assert prescreen_subset(dev, 0.0, 1) is None
-    assert prescreen_subset(dev, 0.5, len(names)) is None
+    assert prescreen_subset(dev, 0.0, 1, max_share=1.0) is None
+    assert prescreen_subset(dev, 0.5, len(names), max_share=1.0) is None
+
+
+def _names_split(n):
+    from types import SimpleNamespace
+
+    from agentic_configuration_search.core.data import Split
+    sp = Split.__new__(Split)
+    sp.root = sp.raw = sp.ontology = None
+    sp.images = [SimpleNamespace(file_name=f"{i:03d}.jpg") for i in range(n)]
+    return sp
+
+
+@pytest.mark.parametrize("n_all,expect", [
+    (22, None),     # 20 of 22 — a passing candidate re-screens all 22, nothing saved
+    (40, None),     # 20/40 = 50% — the boundary skips
+    (41, 20),       # 20/41 < 50%
+    (200, 50),      # ⌈0.25·200⌉ = 50
+])
+def test_prescreen_subset_skipped_when_it_is_most_of_fit_dev(n_all, expect):
+    """When the subset is max_share of fit_dev or more, the prescreen saves no
+    time — a passing candidate is screened in full again. None (prescreen
+    skipped)."""
+    from agentic_configuration_search.core.data import prescreen_subset
+
+    sub = prescreen_subset(_names_split(n_all), 0.25, 20, max_share=0.5)
+    assert (None if sub is None else len(sub.images)) == expect
 
 
 def _recording(fake, log):
@@ -237,12 +264,13 @@ def _recording(fake, log):
     return wrapped
 
 
-def _prescreen_cfg(root, fraction=0.5):
+def _prescreen_cfg(root, fraction=0.5, max_share=1.0):
     from agentic_configuration_search.config import config_from_dict
     return config_from_dict({"dataset": str(root), "planner": {"kind": "llm"},
                              "screen": {"prescreen_fraction": fraction,
                                         "prescreen_min_images": 1,
-                                        "prescreen_min_grid": 2}})
+                                        "prescreen_min_grid": 2,
+                                        "prescreen_max_share": max_share}})
 
 
 def test_prescreen_skips_unused_tiling_without_full_screen(big_root, tmp_path,  # noqa: F811
@@ -256,12 +284,32 @@ def test_prescreen_skips_unused_tiling_without_full_screen(big_root, tmp_path,  
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=_prescreen_cfg(big_root), **_fakes())
     n_dev = len(load_dataset(big_root).fit_dev.images)
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["skipped"] == "axis_unused" and rec["tiling_used"] is False
     assert rec["note"].startswith("prescreen")
     assert rec["prescreen"]["n_images"] < rec["prescreen"]["of"] == n_dev
     # tile configs ran on the subset only — never on the full fit_dev
     assert calls and all(n < n_dev for tiled, n in calls if tiled)
+
+
+def test_prescreen_skipped_when_subset_is_most_of_fit_dev(big_root, tmp_path,  # noqa: F811
+                                                        monkeypatch):
+    """When the subset is half of fit_dev or more, the full screen runs directly
+    without a prescreen — tile configs never run at the subset size."""
+    from agentic_configuration_search.core.data import load_dataset
+
+    calls = []
+    monkeypatch.setattr(gateway, "infer_config",
+                        _recording(_fake_infer(_gt_lookup(big_root)), calls))
+    chat = _llm_by_round({1: [{"id": "t2", "axes": {"tiling": 2}, "rationale": "x"}]})
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
+               rounds=1, cfg=_prescreen_cfg(big_root, 0.5, max_share=0.5),
+               **_fakes())
+    n_dev = len(load_dataset(big_root).fit_dev.images)
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
+    assert rec["tiling_used"] is False and "prescreen" not in rec
+    assert not str(rec.get("note", "")).startswith("prescreen")
+    assert calls and all(n == n_dev for tiled, n in calls if tiled)
 
 
 def test_prescreen_pass_keeps_full_screen_numbers(big_root, tmp_path,  # noqa: F811
@@ -274,7 +322,7 @@ def test_prescreen_pass_keeps_full_screen_numbers(big_root, tmp_path,  # noqa: F
         run_rounds(big_root, out_dir=tmp_path / name, planner="llm",
                    llm_chat=_llm_by_round(dict(plan)), rounds=1,
                    cfg=_prescreen_cfg(big_root, frac), **_fakes())
-        recs.append({c["id"]: c for c in _hist(tmp_path / name)[1]["candidates"]}["t2"])
+        recs.append({c["id"]: c for c in _hist(tmp_path / name)[1]["candidates"]}["r1_t2"])
     on, off = recs
     assert on.get("skipped") is None and on["tiling_used"] is True
     assert on["fit_dev_micro_f_beta"] == off["fit_dev_micro_f_beta"]
@@ -293,7 +341,7 @@ def test_prescreen_only_for_tiling_only_increments(big_root, tmp_path,  # noqa: 
                                "rationale": "x"}]})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=_prescreen_cfg(big_root), **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["mix"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_mix"]
     assert "prescreen" not in rec
     assert not str(rec.get("note", "")).startswith("prescreen")
 
@@ -306,10 +354,10 @@ def test_unused_tiling_row_records_the_loss(big_root, tmp_path,  # noqa: F811
     chat = _llm_by_round({1: [{"id": "t2", "axes": {"tiling": 2}, "rationale": "x"}]})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=_prescreen_cfg(big_root, 0.0), **_fakes())
-    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["t2"]
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["tiling_used"] is False and "prescreen" not in rec
     tf = rec["tiling_f"]
-    assert set(tf) == {"tiled", "untiled"} and tf["tiled"] <= tf["untiled"]
+    assert set(tf) == {"tiled", "untiled", "gap_ub"} and tf["tiled"] <= tf["untiled"]
 
 
 # --- T4: per-candidate wall clock ----------------------------------------------
@@ -325,12 +373,12 @@ def test_candidate_rows_carry_wall_minutes(big_root, tmp_path,  # noqa: F811
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=1, cfg=_prescreen_cfg(big_root, 0.0), **_fakes())
     rows = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
-    ev = rows["ex"]["wall_min"]
+    ev = rows["r1_ex"]["wall_min"]
     assert set(ev) == {"materialize", "screen", "holdout", "total"}
     assert all(v >= 0 for v in ev.values())
     assert abs(ev["total"] - (ev["materialize"] + ev["screen"] + ev["holdout"])) < 0.02
-    assert rows["t2"]["skipped"] == "axis_unused"
-    assert set(rows["t2"]["wall_min"]) == {"materialize", "screen", "total"}
+    assert rows["r1_t2"]["skipped"] == "axis_unused"
+    assert set(rows["r1_t2"]["wall_min"]) == {"materialize", "screen", "total"}
 
 
 def test_compact_history_and_prompt_show_cost():
@@ -370,11 +418,11 @@ def test_same_setting_row_summarizes_served_material(big_root, tmp_path,  # noqa
     run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                rounds=1, candidates_file=human, **_fakes())
     hist = _hist(tmp_path / "run")
-    rec = {c["id"]: c for c in hist[1]["candidates"]}["human_b"]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}["r1_human_b"]
     assert rec["skipped"] == "same_setting"
     assert rec["material"].startswith("text_negatives ")
     assert "served material: text_negatives" in rec["note"]
-    row = {r["id"]: r for r in _compact_history(hist)[1]["candidates"]}["human_b"]
+    row = {r["id"]: r for r in _compact_history(hist)[1]["candidates"]}["r1_human_b"]
     assert row["material"] == rec["material"]
 
 

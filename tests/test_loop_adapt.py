@@ -131,7 +131,7 @@ def test_classifier_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     base = result.decisions[0]["micro_f_beta"]
     assert base == pytest.approx(0.5)            # all 4 cat2 images misclassified
     r1 = result.decisions[1]
-    assert r1["adopted"] is True and r1["id"] == "human_fixcls"
+    assert r1["adopted"] is True and r1["id"] == "r1_human_fixcls"
     assert result.champion["axes"]["crop_classifier"] is True
     assert result.champion["eval"]["micro_f_beta"] == pytest.approx(1.0)
     # champion carries the artifact, and the server stays in that state
@@ -164,7 +164,7 @@ def test_classifier_rejected_restores_state(root, tmp_path, monkeypatch):
                    "repo_root": tmp_path, "base_weights": tmp_path / "b-large"},
         **_fakes())
     assert result.decisions[1]["adopted"] is False
-    assert "human_fixcls" in result.decisions[1]["skipped"]
+    assert "r1_human_fixcls" in result.decisions[1]["skipped"]
     assert server.root is None                   # current state restored
     assert result.champion["adapt_root"] is None
 
@@ -177,7 +177,7 @@ def test_classifier_without_adapt_ctl_skips(root, tmp_path, monkeypatch):
         "- id: fixcls\n  axes: {crop_classifier: true}\n  rationale: correction\n")
     result = run_rounds(root, out_dir=tmp_path / "run", planner="deterministic",
                         rounds=1, candidates_file=cand_file, **_fakes())
-    assert "human_fixcls" in result.decisions[1]["skipped"]
+    assert "r1_human_fixcls" in result.decisions[1]["skipped"]
 
 
 def _ONTO_FOR(root):
@@ -323,7 +323,7 @@ def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
                **_fakes())
     hist = [json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
-    rec = {c["id"]: c for c in hist[1]["candidates"]}["human_fixcls"]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}["r1_human_fixcls"]
     assert rec["skipped"] == "classifier_gate"
     assert rec["empty_axis"] == "crop_classifier"
 
@@ -350,5 +350,5 @@ def test_classifier_margin_rejection_is_not_dead(root, tmp_path, monkeypatch):
                **_fakes())
     hist = [json.loads(l) for l in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
-    rec = {c["id"]: c for c in hist[1]["candidates"]}["human_fixcls"]
+    rec = {c["id"]: c for c in hist[1]["candidates"]}["r1_human_fixcls"]
     assert rec["skipped"] == "classifier_gate" and "empty_axis" not in rec

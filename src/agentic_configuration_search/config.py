@@ -39,6 +39,14 @@ class VllmLaunchCfg:
     persist: bool = True
 
 
+# Cap on planner.max_candidates — the most candidates for which the longest
+# response the schema allows (about 1.1k tokens per candidate) fits in
+# planner.llm.OUTPUT_MAX_TOKENS (4096). Raising it means re-sizing the output
+# cap (and the prompt budget it takes away) too (the truncation guard in
+# tests/test_planner.py is pinned to this value).
+PLANNER_MAX_CANDIDATES = 3
+
+
 @dataclass(frozen=True)
 class PlannerCfg:
     kind: str = "deterministic"          # one of PLANNER_KINDS
@@ -54,6 +62,11 @@ class PlannerCfg:
     # same round — diagnosis and champion are reused. 0 turns it off. kind=llm
     # only (the deterministic planner is not re-asked)
     max_reasks: int = 1
+    # Planner candidates per round — the prompt's "Propose up to N", the response
+    # schema's maxItems and the re-ask cap follow it, as do the deterministic
+    # planner (and the LLM's fallback). 1..PLANNER_MAX_CANDIDATES — the response
+    # must fit in the output cap
+    max_candidates: int = 3
     launch: VllmLaunchCfg = field(default_factory=VllmLaunchCfg)
 
     _NESTED: ClassVar[dict] = {"launch": VllmLaunchCfg}
@@ -72,7 +85,8 @@ class SaturationCfg:
     epsilon: float = 0.0                 # a round is stagnant if the Δ CI lower bound <= this
     # Stop (stopped="empty_rounds") after this many consecutive rounds that
     # measured nothing on holdout (even after re-asking). 0 turns it off — such
-    # rounds still count toward rounds
+    # rounds still count toward rounds. A round with candidates that skipped
+    # holdout for losing on fit_dev (fit_dev_lost, identical) is not counted
     empty_rounds: int = 2
 
 
@@ -83,10 +97,26 @@ class ScreenCfg:
     # scored on a deterministic fit_dev subset (max(min_images, ⌈fraction·N⌉)
     # images). If no class uses a tile there it is rejected without the full
     # screen; otherwise the full fit_dev is screened as before. fraction 0 turns
-    # it off.
+    # it off. If the subset would be max_share of fit_dev or more, the full
+    # screen runs directly — a passing candidate is re-screened in full, so a
+    # large subset saves nothing.
     prescreen_fraction: float = 0.25
     prescreen_min_images: int = 20
     prescreen_min_grid: int = 3
+    prescreen_max_share: float = 0.5
+    # lost-value prescreen — a planner candidate containing a value that clearly
+    # lost on fit_dev under the current champion (planner.ledger) is first measured
+    # on the same subset (the full fit_dev without one); if the bootstrap upper
+    # bound of (candidate − champion) micro F(β) is below 0 it is rejected without
+    # the rescorer refit, full screen or holdout. false turns it off
+    lost_value_prescreen: bool = True
+    # Pre-holdout fit_dev verdict — a screened candidate whose (candidate −
+    # champion) fit_dev micro F(β) bootstrap upper bound is below 0
+    # (fit_dev_lost), or whose per-image fit_dev (tp, fp, fn) all equal the
+    # champion's (fit_dev_identical), is not sent to holdout. top_k counts only
+    # sendable candidates (the next one fills a freed slot). Applies to plain,
+    # carried and lora/classifier arm candidates. false turns it off
+    skip_fit_dev_losers: bool = True
 
 
 @dataclass(frozen=True)
@@ -167,6 +197,15 @@ class SearchCfg:
     # still be picked from the floor up.
     tiling_merge: str = "sahi"
     tiling_merge_min_score: float = 0.3
+    # near-miss exception of the tiling fold gate (planner.gates) — from the train
+    # sizes counted at the champion's fit_dev screen thresholds
+    # (diagnose.errors.size_profile), s* ("objects this small are already
+    # detected") is this quantile of the TP sizes of the class with the most
+    # missed_small. With fewer TPs than tiling_tp_min in that class the exception
+    # is not judged. The first-grid hint (the prompt's missed-small block) shows
+    # the same s*.
+    tiling_tp_quantile: float = 0.1
+    tiling_tp_min: int = 20
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -332,6 +371,9 @@ def _validate(cfg: Config) -> None:
     if cfg.screen.prescreen_min_grid < 2:
         raise ConfigError("screen.prescreen_min_grid: must be >= 2 — the smallest "
                           f"grid is 2 ({cfg.screen.prescreen_min_grid})")
+    if not (0.0 < cfg.screen.prescreen_max_share <= 1.0):
+        raise ConfigError("screen.prescreen_max_share: outside (0,1] "
+                          f"({cfg.screen.prescreen_max_share})")
     if cfg.gate.bootstrap < 1:
         raise ConfigError(f"gate.bootstrap: must be >= 1 ({cfg.gate.bootstrap})")
     if not (0.0 < cfg.gate.confidence < 1.0):
@@ -339,6 +381,12 @@ def _validate(cfg: Config) -> None:
     if cfg.saturation.empty_rounds < 0:
         raise ConfigError("saturation.empty_rounds: must be >= 0 — 0 is off "
                           f"({cfg.saturation.empty_rounds})")
+    if not 1 <= cfg.planner.max_candidates <= PLANNER_MAX_CANDIDATES:
+        raise ConfigError(
+            f"planner.max_candidates: must be in 1..{PLANNER_MAX_CANDIDATES} "
+            f"({cfg.planner.max_candidates}) — larger, the planner response runs "
+            "past the output cap (planner.llm.OUTPUT_MAX_TOKENS) and is cut, and a "
+            "cut response silently falls back to deterministic")
     if cfg.planner.max_reasks < 0:
         raise ConfigError("planner.max_reasks: must be >= 0 — 0 is off "
                           f"({cfg.planner.max_reasks})")
@@ -366,6 +414,12 @@ def _validate(cfg: Config) -> None:
     s = cfg.search.tiling_merge_min_score
     if isinstance(s, bool) or not isinstance(s, (int, float)) or not (0.0 <= s < 1.0):
         raise ConfigError(f"search.tiling_merge_min_score: outside [0,1) ({s!r})")
+    q = cfg.search.tiling_tp_quantile
+    if not (0.0 < q < 1.0):
+        raise ConfigError(f"search.tiling_tp_quantile: outside (0,1) ({q!r})")
+    if cfg.search.tiling_tp_min < 1:
+        raise ConfigError("search.tiling_tp_min: must be >= 1 "
+                          f"({cfg.search.tiling_tp_min})")
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")
