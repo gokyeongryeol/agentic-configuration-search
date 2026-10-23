@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,12 @@ def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
     """Train the tail on fit_train and return the tuned subset (.pt) path.
 
     Hyperparameters come from cfg.lora (epochs, batch_size, lr, device). Fixed seed, few epochs.
+
+    The ultralytics trainer always writes full-model checkpoints (last.pt,
+    best.pt) at the final epoch, whatever `save` says. Only the tail subset is
+    used — arms reference it and are interpolated in memory — so once the
+    subset exists the checkpoints are deleted (_drop_trainer_checkpoints). On a
+    failed run they are kept for diagnosis.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -104,7 +111,24 @@ def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
         raise RuntimeError(f"yoloe tail training failed (exit {rc}) — log: {log_path}")
     if not tuned.exists():
         raise RuntimeError(f"tuned subset was not produced: {tuned}")
+    _drop_trainer_checkpoints(out_dir / "ultralytics")
     return tuned
+
+
+def _drop_trainer_checkpoints(project: Path) -> int:
+    """Delete the trainer's full-model checkpoints (<project>/*/weights/*.pt) and
+    return the bytes freed. The rest of the run directory (args.yaml and the
+    like) is small and stays as a record."""
+    freed = 0
+    for wdir in Path(project).glob("*/weights"):
+        if not wdir.is_dir():
+            continue
+        freed += sum(f.stat().st_size for f in wdir.glob("*.pt") if f.is_file())
+        shutil.rmtree(wdir)
+    if freed:
+        log.info("yoloe tail: removed trainer checkpoints under %s (%.1f MB)",
+                 project, freed / 1e6)
+    return freed
 
 
 def build_tail_arms(tuned: Path, lambdas, out_dir: Path) -> dict[float, Path]:
