@@ -1,6 +1,8 @@
 """embedder.py: k-center greedy + worker call argument assembly.
 
-`workers/dinov3.py` itself needs torch, so it is not unit-tested — covered end-to-end.
+The torch path of `workers/dinov3.py` is covered in test_dinov3_worker.py
+(skipped without torch); its batch plan (pure Python) is checked there without
+torch.
 """
 
 from pathlib import Path
@@ -182,56 +184,63 @@ def test_encode_crops_empty_skips_worker(tmp_path):
 
 def test_encode_crops_passes_absolute_paths(tmp_path, monkeypatch):
     """The worker's cwd is repo_root, not the caller's cwd — relative log/crop
-    paths from the caller must reach the worker (argv and manifest) as absolute."""
+    paths from the caller must reach the worker (argv, jobs and manifest) as
+    absolute."""
     import json
     import os
     repo = tmp_path / "repo"
-    (repo / embedder.VLLM_VENV / "bin").mkdir(parents=True)
-    (repo / embedder.VLLM_VENV / "bin" / "python").touch()
+    _fake_venv(repo)
     work = tmp_path / "work"
     work.mkdir()
     monkeypatch.chdir(work)                      # caller cwd != worker cwd (repo)
     captured = {}
-
-    class FakeProc:
-        def wait(self):
-            np.save(captured["out"], np.zeros((1, 4), dtype=np.float32))
-            return 0
-
-    def fake_popen(cmd, **kwargs):
-        captured["cmd"] = cmd
-        captured["out"] = cmd[cmd.index("--out") + 1]
-        return FakeProc()
-
     embedder.encode_crops(repo, [Path("crops/a.jpg")], "m", "cuda:0",
-                          Path("logs/e.log"), popen=fake_popen)
-    cmd = captured["cmd"]
-    for flag in ("--manifest", "--out"):
-        assert os.path.isabs(cmd[cmd.index(flag) + 1]), flag
-    manifest = json.loads(Path(cmd[cmd.index("--manifest") + 1]).read_text())
+                          Path("logs/e.log"), popen=_fake_worker(captured))
+    assert os.path.isabs(captured["jobs"])
+    job = json.loads(Path(captured["jobs"]).read_text())[0]
+    assert os.path.isabs(job["manifest"]) and os.path.isabs(job["out"])
+    manifest = json.loads(Path(job["manifest"]).read_text())
     assert manifest == [str(work / "crops" / "a.jpg")]
 
 
-def test_encode_crops_builds_worker_command(tmp_path, monkeypatch):
+def _fake_venv(tmp_path):
     (tmp_path / embedder.VLLM_VENV / "bin").mkdir(parents=True)
     (tmp_path / embedder.VLLM_VENV / "bin" / "python").touch()
-    crops = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
-    captured = {}
+
+
+def _fake_worker(captured, rows=None):
+    """A popen fake that reads the jobs file and writes each job's .npy instead.
+    Without rows, as many rows as the manifest has; row i = [job index, i]."""
+    import json
 
     class FakeProc:
         def wait(self):
-            # write the .npy the worker would produce
-            np.save(captured["out"], np.zeros((2, 4), dtype=np.float32))
+            jobs = json.loads(Path(captured["jobs"]).read_text())
+            for j, job in enumerate(jobs):
+                n = len(json.loads(Path(job["manifest"]).read_text()))
+                n = n if rows is None else rows[j]
+                np.save(job["out"], np.array([[float(j), float(i)] for i in range(n)],
+                                             dtype=np.float32).reshape(n, 2))
             return 0
 
     def fake_popen(cmd, **kwargs):
+        captured.setdefault("calls", []).append(cmd)
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
-        captured["out"] = cmd[cmd.index("--out") + 1]
+        captured["stdout"] = kwargs.get("stdout")
+        captured["jobs"] = cmd[cmd.index("--jobs") + 1]
         return FakeProc()
 
+    return fake_popen
+
+
+def test_encode_crops_builds_worker_command(tmp_path):
+    _fake_venv(tmp_path)
+    crops = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
+    captured = {}
     emb = embedder.encode_crops(tmp_path, crops, "facebook/dinov3-vitl16-pretrain-lvd1689m",
-                                "cuda:3", tmp_path / "logs" / "e.log", popen=fake_popen)
+                                "cuda:3", tmp_path / "logs" / "e.log",
+                                popen=_fake_worker(captured))
     cmd = captured["cmd"]
     # runs under the vllm-venv python — agentic_configuration_search itself has no torch
     assert cmd[0].endswith("external/vllm-venv/bin/python")
@@ -243,30 +252,98 @@ def test_encode_crops_builds_worker_command(tmp_path, monkeypatch):
     from agentic_configuration_search.services.paths import PACKAGE_PARENT
     assert captured["env"]["PYTHONPATH"] == str(PACKAGE_PARENT)
     assert (PACKAGE_PARENT / "agentic_configuration_search" / "workers").is_dir()
-    assert emb.shape == (2, 4)
+    assert emb.shape == (2, 2)
 
-    manifest = Path(cmd[cmd.index("--manifest") + 1])
     import json
-    assert json.loads(manifest.read_text()) == [str(p) for p in crops]
+    jobs = json.loads(Path(captured["jobs"]).read_text())
+    assert len(jobs) == 1
+    assert json.loads(Path(jobs[0]["manifest"]).read_text()) == [str(p) for p in crops]
+    assert Path(jobs[0]["out"]).name == "e.npy"
+
+
+def test_encode_crops_many_one_worker_for_all_jobs(tmp_path):
+    """A round's c1..cN embeddings finish in one worker run (one model load).
+    Per-job output names (log stems) and the return order follow the input
+    order."""
+    _fake_venv(tmp_path)
+    logs = tmp_path / "logs"
+    jobs_in = [([tmp_path / "a.jpg", tmp_path / "b.jpg"], logs / "embed_c1.log"),
+               ([], logs / "embed_c2.log"),                    # empty job — not sent to the worker
+               ([tmp_path / "c.jpg"], logs / "embed_c3.log")]
+    captured = {}
+    out = embedder.encode_crops_many(tmp_path, jobs_in, "m", "cuda:0",
+                                     popen=_fake_worker(captured))
+    assert len(captured["calls"]) == 1
+    import json
+    jobs = json.loads(Path(captured["jobs"]).read_text())
+    assert [Path(j["out"]).name for j in jobs] == ["embed_c1.npy", "embed_c3.npy"]
+    assert [len(o) for o in out] == [2, 0, 1]
+    assert out[0][:, 0].tolist() == [0.0, 0.0] and out[2][:, 0].tolist() == [1.0]
+    assert out[1].shape == (0, 1)
+    # the worker log goes to the first job's log; the other job logs point to it
+    assert "embed_c1.log" in (logs / "embed_c3.log").read_text()
+
+
+def test_encode_crops_many_passes_absolute_paths(tmp_path, monkeypatch):
+    """Only absolute paths cross the boundary — the worker's cwd may differ from
+    the caller's."""
+    _fake_venv(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+    embedder.encode_crops_many(tmp_path, [([Path("a.jpg")], Path("logs/e.log"))],
+                               "m", "cuda:0", popen=_fake_worker(captured))
+    import json
+    assert Path(captured["jobs"]).is_absolute()
+    job = json.loads(Path(captured["jobs"]).read_text())[0]
+    assert Path(job["manifest"]).is_absolute() and Path(job["out"]).is_absolute()
+    assert all(Path(p).is_absolute()
+               for p in json.loads(Path(job["manifest"]).read_text()))
+
+
+def test_encode_crops_many_all_empty_skips_worker(tmp_path):
+    called = []
+    out = embedder.encode_crops_many(tmp_path, [([], tmp_path / "a.log"), ([], tmp_path / "b.log")],
+                                     "m", "cuda:0", popen=lambda *a, **k: called.append(a))
+    assert called == [] and [o.shape for o in out] == [(0, 1), (0, 1)]
+
+
+def test_worker_env_raises_thread_cap_only_for_worker(tmp_path, monkeypatch):
+    """The orchestrator pins OMP/BLAS to 1 (cli), but the worker gets more threads
+    for preprocessing — the inherited "1" is overridden only in the worker env.
+    Tunable with ACS_EMBED_THREADS."""
+    _fake_venv(tmp_path)
+    for var in embedder.THREAD_ENV_VARS:
+        monkeypatch.setenv(var, "1")
+    monkeypatch.delenv("ACS_EMBED_THREADS", raising=False)
+    monkeypatch.delenv("ACS_EMBED_LOADERS", raising=False)
+    captured = {}
+    embedder.encode_crops(tmp_path, [tmp_path / "a.jpg"], "m", "cuda:0",
+                          tmp_path / "e.log", popen=_fake_worker(captured))
+    want = embedder.worker_threads()
+    assert want == min(8, embedder.available_cores()) and want >= 1
+    env, cmd = captured["env"], captured["cmd"]
+    assert {v: env[v] for v in embedder.THREAD_ENV_VARS} == \
+        {v: str(want) for v in embedder.THREAD_ENV_VARS}
+    assert cmd[cmd.index("--threads") + 1] == str(want)
+    assert cmd[cmd.index("--loaders") + 1] == str(embedder.worker_loaders())
+    import os
+    assert os.environ["OMP_NUM_THREADS"] == "1"        # the parent env is unchanged
+
+    monkeypatch.setenv("ACS_EMBED_THREADS", "3")
+    monkeypatch.setenv("ACS_EMBED_LOADERS", "2")
+    embedder.encode_crops(tmp_path, [tmp_path / "a.jpg"], "m", "cuda:0",
+                          tmp_path / "e.log", popen=_fake_worker(captured))
+    env, cmd = captured["env"], captured["cmd"]
+    assert env["OMP_NUM_THREADS"] == "3" and cmd[cmd.index("--threads") + 1] == "3"
+    assert cmd[cmd.index("--loaders") + 1] == "2"
 
 
 def test_encode_crops_count_mismatch_raises(tmp_path):
-    (tmp_path / embedder.VLLM_VENV / "bin").mkdir(parents=True)
-    (tmp_path / embedder.VLLM_VENV / "bin" / "python").touch()
-    state = {}
-
-    class FakeProc:
-        def wait(self):
-            np.save(state["out"], np.zeros((1, 4), dtype=np.float32))  # only 1
-            return 0
-
-    def fake_popen(cmd, **kwargs):
-        state["out"] = cmd[cmd.index("--out") + 1]
-        return FakeProc()
-
+    _fake_venv(tmp_path)
     with pytest.raises(RuntimeError, match="embedding count mismatch"):
         embedder.encode_crops(tmp_path, [tmp_path / "a.jpg", tmp_path / "b.jpg"],
-                              "m", "cuda:0", tmp_path / "e.log", popen=fake_popen)
+                              "m", "cuda:0", tmp_path / "e.log",
+                              popen=_fake_worker({}, rows=[1]))   # only 1
 
 
 def test_encode_crops_worker_failure_raises(tmp_path):
@@ -364,3 +441,93 @@ def test_cached_encoder_passes_extra_args_on_miss(tmp_path):
     enc([p], "embed_c1.log")
     enc([p], "embed_c2.log")                      # hit — the encoder is not called
     assert seen == ["embed_c1.log"]
+
+
+def test_cached_encoder_many_one_call_same_misses_as_sequential(tmp_path):
+    """Sending several classes at once (many) gives each group the same miss list
+    as sequential calls — what an earlier group already sent is left out of later
+    groups. The worker must get the same manifests for the embeddings to be
+    bit-identical."""
+    (tmp_path / "x").mkdir()
+    files = {}
+    for name, body in [("a", b"\x01"), ("b", b"\x02"), ("a2", b"\x01"), ("c", b"\x03")]:
+        files[name] = tmp_path / "x" / f"{name}.jpg"
+        files[name].write_bytes(body)
+    groups = [([files["a"], files["b"]], "c1.log"), ([files["a2"], files["c"]], "c2.log"),
+              ([], "c3.log")]
+
+    seq_calls = []
+
+    def encode(paths, log):
+        seq_calls.append(([p.name for p in paths], log))
+        return np.array([[float(p.read_bytes()[0]), 0.0] for p in paths])
+
+    seq = embedder.cached_encoder(encode, tmp_path / "seq.npz")
+    want = [seq(p, log) for p, log in groups[:2]]
+
+    many_calls = []
+
+    def encode_many(gs):
+        many_calls.append([([p.name for p in ps], log) for ps, log in gs])
+        return [encode(ps, log) for ps, log in gs]
+
+    seq_calls.clear()
+    enc = embedder.cached_encoder(encode, tmp_path / "many.npz", encode_many=encode_many)
+    got = enc.many(groups)
+    assert many_calls == [[(["a.jpg", "b.jpg"], "c1.log"), (["c.jpg"], "c2.log")]]
+    assert [g.tolist() for g in got[:2]] == [w.tolist() for w in want]
+    assert got[2].shape[0] == 0
+    # later single calls all hit — the encoder is not called again
+    seq_calls.clear()
+    many_calls.clear()
+    assert enc(groups[1][0], "c2.log").tolist() == want[1].tolist()
+    assert seq_calls == [] and many_calls == []
+    # the disk cache stays too (resume)
+    again = embedder.cached_encoder(encode, tmp_path / "many.npz")
+    assert again(groups[0][0], "c1.log").tolist() == want[0].tolist()
+    assert seq_calls == []
+
+
+def test_cached_encoder_single_call_goes_through_encode_many(tmp_path):
+    p = tmp_path / "x.jpg"
+    p.write_bytes(b"\x05")
+    calls = []
+
+    def encode_many(gs):
+        calls.append(len(gs))
+        return [np.ones((len(ps), 2)) for ps, *_ in gs]
+
+    enc = embedder.cached_encoder(None, tmp_path / "c.npz", encode_many=encode_many)
+    assert enc([p], "l").shape == (1, 2) and calls == [1]
+
+
+def test_hooks_encode_fn_prefetch_batches_classes_into_one_worker(tmp_path, monkeypatch):
+    """The real wiring: encode_fn.prefetch({cid: paths}) sends the missed crops in
+    one encode_crops_many call (job log = embed_c{cid}.log), and later
+    encode_fn(cid, paths) reads the run cache (embed_*.npz)."""
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop import hooks as hooks_mod
+
+    calls = []
+
+    def fake_many(repo_root, jobs, model, device, popen=None):
+        calls.append([(len(ps), Path(lp).name) for ps, lp in jobs])
+        return [np.full((len(ps), 2), float(i)) for i, (ps, _) in enumerate(jobs)]
+
+    monkeypatch.setattr(embedder, "encode_crops_many", fake_many)
+    cfg = config_from_dict({"dataset": str(tmp_path)})
+    out_dir = tmp_path / "run"
+    h = hooks_mod.build_hooks(cfg, tmp_path, out_dir)
+    crops = {}
+    for cid, n in [(1, 2), (2, 3)]:
+        crops[cid] = []
+        for i in range(n):
+            p = tmp_path / f"c{cid}_{i}.jpg"
+            p.write_bytes(bytes([cid, i]))
+            crops[cid].append(p)
+
+    h["encode_fn"].prefetch(crops)
+    assert calls == [[(2, "embed_c1.log"), (3, "embed_c2.log")]]
+    assert h["encode_fn"](2, crops[2]).tolist() == [[1.0, 1.0]] * 3
+    assert len(calls) == 1
+    assert list((out_dir / "_cache").glob("embed_*.npz"))

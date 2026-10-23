@@ -139,7 +139,7 @@ Layers `core ← clients ← infer ← fitting ← eval ← diagnose ← planner
 | `diagnose/` | FP/FN cause classification, VLM notes, residual analysis, `report.py` |
 | `planner/` | axes schema, deterministic and LLM planners, tiling gate, axis ledger |
 | `loop/` | round orchestration (`runner.py`), materialize, per-axis round wiring |
-| `services/` · `workers/` | subprocess and server management · one-shot GPU workers (`ACS_VLLM_VENV`) |
+| `services/` · `workers/` | subprocess and server management · one-shot GPU workers (`ACS_VLLM_VENV`; DINOv3 worker CPU threads and loaders via `ACS_EMBED_THREADS`, `ACS_EMBED_LOADERS`, default min(8, cores), min(4, cores)) |
 
 Guard tests `test_materialize_purity`, `test_split_roles`,
 `test_decision_channel` and `test_replay` must not be weakened.

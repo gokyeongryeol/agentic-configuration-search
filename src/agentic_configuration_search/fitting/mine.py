@@ -95,6 +95,13 @@ def gt_exemplars(train: Split, ontology: Ontology, cache: CropCache, params,
     img_by_id = {e.id: e for e in train.images}
     exemplars: dict[str, list[PromptBox]] = {}
     chosen_ann_ids: dict[int, set[int]] = {}
+    prefetch = getattr(encode_fn, "prefetch", None)
+    if prefetch is not None and params.exemplar_selection != "random":
+        # all classes before the per-class calls — the real implementation embeds
+        # c1..cN in one worker run, and encode_fn(cid, …) below reads the cache
+        # (same crops, same result)
+        prefetch({cid: cache.paths[cid]
+                  for cid, anns in sorted(cache.prompt_pool.items()) if anns})
     for cid, anns in sorted(cache.prompt_pool.items()):
         name = ontology.id_to_name[cid]
         k = min(params.exemplars_per_class, len(anns))

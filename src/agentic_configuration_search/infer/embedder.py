@@ -21,54 +21,113 @@ from ..services.paths import PACKAGE_PARENT, VLLM_VENV
 log = logging.getLogger(__name__)
 
 
-def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: str,
-                 log_path: Path, popen=subprocess.Popen) -> np.ndarray:
-    """Embed crop images with DINOv3. Returns an (N, D) L2-normalized array.
+# The orchestrator (cli) pins OMP/BLAS to 1 for numpy — only the worker env overrides them.
+THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                   "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def available_cores() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:               # OS without sched_getaffinity
+        return os.cpu_count() or 1
+
+
+def worker_threads() -> int:
+    """torch/OMP/BLAS threads of the worker process — env ACS_EMBED_THREADS,
+    default min(8, cores)."""
+    return max(1, int(os.environ.get("ACS_EMBED_THREADS") or min(8, available_cores())))
+
+
+def worker_loaders() -> int:
+    """DataLoader workers for crop decoding and preprocessing — env
+    ACS_EMBED_LOADERS, default min(4, cores). Each loader worker has one thread
+    (DataLoader pins it). 0 processes sequentially in the main process."""
+    return max(0, int(os.environ.get("ACS_EMBED_LOADERS") or min(4, available_cores())))
+
+
+def encode_crops_many(repo_root: Path, jobs: list[tuple[list[Path], Path]], model: str,
+                      device: str, popen=subprocess.Popen) -> list[np.ndarray]:
+    """Embed several crop groups with **one worker run** (one model load).
+
+    jobs: [(crop_paths, log_path)] — each job leaves a manifest and .npy named by
+    its log_path stem (for post-hoc analysis, the same names as before). The
+    worker log goes to the first job's log_path; the other jobs' logs point to
+    it. Returns (N_j, D) L2-normalized arrays in input order — an empty job is
+    not sent to the worker and is (0, 1).
 
     GPU memory is released when the worker exits — more reliable than an
     in-process load followed by `del`/`empty_cache`. `HF_TOKEN` is inherited from
     the environment (DINOv3 is gated).
     """
-    if not crop_paths:
-        return np.zeros((0, 1), dtype=np.float32)
+    results: list[np.ndarray | None] = [None] * len(jobs)
+    work = []
+    for i, (crop_paths, log_path) in enumerate(jobs):
+        if crop_paths:
+            work.append((i, [Path(p).resolve() for p in crop_paths], Path(log_path).resolve()))
+        else:
+            results[i] = np.zeros((0, 1), dtype=np.float32)
+    if not work:
+        return results
 
     python = repo_root / VLLM_VENV / "bin" / "python"
     if not python.exists():
         raise RuntimeError(f"vLLM venv python not found: {python} — check the ACS_VLLM_VENV env var")
 
-    # The worker's cwd is repo_root, not ours — every path crossing the boundary
-    # (argv and manifest contents) must be absolute.
-    log_path = Path(log_path).resolve()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    # Name outputs by the log_path stem — this runs once per class, and a shared
+    # Name outputs by the log_path stem — each class is its own job, and a shared
     # filename would let the second class overwrite the first, breaking post-hoc
-    # analysis.
-    stem = log_path.stem
-    manifest = log_path.parent / f"{stem}_manifest.json"
-    out_npy = log_path.parent / f"{stem}.npy"
-    manifest.write_text(json.dumps([str(Path(p).resolve()) for p in crop_paths]))
+    # analysis. The worker's cwd is repo_root, not ours — every path crossing the
+    # boundary (argv, jobs and manifest contents) is absolute (resolve).
+    specs, outs = [], []
+    for _, crop_paths, log_path in work:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = log_path.parent / f"{log_path.stem}_manifest.json"
+        out_npy = log_path.parent / f"{log_path.stem}.npy"
+        manifest.write_text(json.dumps([str(p) for p in crop_paths]))
+        specs.append({"manifest": str(manifest), "out": str(out_npy)})
+        outs.append(out_npy)
+    main_log = work[0][2]
+    jobs_file = main_log.parent / f"{main_log.stem}_jobs.json"
+    jobs_file.write_text(json.dumps(specs))
+    for _, _, log_path in work[1:]:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"shared DINOv3 worker run — log: {main_log}\n")
 
+    threads, loaders = worker_threads(), worker_loaders()
     cmd = [str(python), "-m", "agentic_configuration_search.workers.dinov3",
-           "--manifest", str(manifest), "--model", model,
-           "--device", device, "--out", str(out_npy)]
-    log.info("running DINOv3 worker: %d crops on %s (log: %s)", len(crop_paths), device, log_path)
+           "--jobs", str(jobs_file), "--model", model, "--device", device,
+           "--threads", str(threads), "--loaders", str(loaders)]
+    log.info("running DINOv3 worker: %d jobs / %d crops on %s (log: %s)", len(work),
+             sum(len(c) for _, c, _ in work), device, main_log)
     # The worker runs as `-m agentic_configuration_search.workers.dinov3`, so it needs
     # the package on the path (the package and workers __init__ get imported —
     # hence both stay lightweight).
-    env = {**os.environ, "PYTHONPATH": str(PACKAGE_PARENT)}
-    with open(log_path, "ab") as fh:
+    env = {**os.environ, "PYTHONPATH": str(PACKAGE_PARENT),
+           **{var: str(threads) for var in THREAD_ENV_VARS}}
+    with open(main_log, "ab") as fh:
         proc = popen(cmd, cwd=repo_root, env=env, stdout=fh, stderr=subprocess.STDOUT)
         rc = proc.wait()
     if rc != 0:
-        raise RuntimeError(f"DINOv3 worker failed (exit {rc}) — log: {log_path}")
+        raise RuntimeError(f"DINOv3 worker failed (exit {rc}) — log: {main_log}")
 
-    emb = np.load(out_npy)
-    if len(emb) != len(crop_paths):
-        raise RuntimeError(f"embedding count mismatch: crop {len(crop_paths)} vs emb {len(emb)}")
-    return emb
+    for (i, crop_paths, _), out_npy in zip(work, outs):
+        emb = np.load(out_npy)
+        if len(emb) != len(crop_paths):
+            raise RuntimeError(f"embedding count mismatch: crop {len(crop_paths)} vs emb "
+                               f"{len(emb)} ({out_npy.name})")
+        results[i] = emb
+    return results
 
 
-def cached_encoder(encode, cache_path: Path):
+def encode_crops(repo_root: Path, crop_paths: list[Path], model: str, device: str,
+                 log_path: Path, popen=subprocess.Popen) -> np.ndarray:
+    """Embed crop images with DINOv3. Returns an (N, D) L2-normalized array (a
+    one-job encode_crops_many)."""
+    return encode_crops_many(repo_root, [(crop_paths, log_path)], model, device,
+                             popen=popen)[0]
+
+
+def cached_encoder(encode, cache_path: Path, encode_many=None):
     """An encoder for encode(paths, *args) -> (N, D), cached by **crop content hash**.
 
     GT crops are rewritten into a different folder for every candidate, but the
@@ -78,31 +137,52 @@ def cached_encoder(encode, cache_path: Path):
     and the cache is rewritten atomically to cache_path (npz) so it is read back
     after resume. When the encoder model changes, the caller must pass another
     cache_path. Extra args (a log path, ...) are passed through with the misses.
+
+    The returned function's `.many([(paths, *args), ...])` handles several groups
+    at once — the misses go out in one `encode_many([(todo_paths, *args), ...])`
+    call (one worker run). The per-group miss lists equal those of sequential
+    calls (what an earlier group sends is left out of later groups) — the worker
+    gets the same manifests, so the embeddings are the same. Without
+    encode_many, encode is called per group.
     """
     cache_path = Path(cache_path)
     store: dict[str, np.ndarray] = {}
     if cache_path.exists():
         with np.load(cache_path) as z:
             store = dict(zip(z["keys"].tolist(), z["vecs"]))
+    if encode_many is None:
+        def encode_many(groups):
+            return [encode(paths, *args) for paths, *args in groups]
 
-    def encode_cached(paths, *args) -> np.ndarray:
-        paths = [Path(p) for p in paths]
-        if not paths:
-            return encode([], *args)
-        keys = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
-        first_path = dict(zip(reversed(keys), reversed(paths)))   # key → first path
-        todo = [k for k in dict.fromkeys(keys) if k not in store]
-        if todo:
-            for k, row in zip(todo, encode([first_path[k] for k in todo], *args)):
-                store[k] = np.asarray(row)
+    def many(groups) -> list[np.ndarray]:
+        groups = [([Path(p) for p in paths], *args) for paths, *args in groups]
+        keyed, sends, pending = [], [], set()
+        for paths, *args in groups:
+            keys = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
+            first_path = dict(zip(reversed(keys), reversed(paths)))   # key → first path
+            todo = [k for k in dict.fromkeys(keys) if k not in store and k not in pending]
+            pending.update(todo)
+            keyed.append(keys)
+            if todo:
+                sends.append((todo, ([first_path[k] for k in todo], *args)))
+        if sends:
+            for (todo, _), emb in zip(sends, encode_many([g for _, g in sends])):
+                for k, row in zip(todo, emb):
+                    store[k] = np.asarray(row)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = cache_path.with_suffix(".tmp.npz")
             np.savez(tmp, keys=np.array(list(store)), vecs=np.stack(list(store.values())))
             tmp.replace(cache_path)
-            log.info("embedding cache: %d computed, %d reused (%s)",
-                     len(todo), len(keys) - len(todo), cache_path.name)
-        return np.stack([store[k] for k in keys])
+            n_new = sum(len(t) for t, _ in sends)
+            log.info("embedding cache: %d computed, %d reused (%s)", n_new,
+                     sum(len(k) for k in keyed) - n_new, cache_path.name)
+        return [np.stack([store[k] for k in keys]) if keys
+                else np.zeros((0, 1), dtype=np.float32) for keys in keyed]
 
+    def encode_cached(paths, *args) -> np.ndarray:
+        return many([(paths, *args)])[0]
+
+    encode_cached.many = many
     return encode_cached
 
 
