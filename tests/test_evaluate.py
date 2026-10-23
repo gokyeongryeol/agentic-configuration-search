@@ -169,3 +169,40 @@ def test_gate_boundary_requires_positive_delta():
         assert gate([], [], cat_ids=[1], iou_thr=0.5, margin=0.0)["adopted"] is False
     finally:
         metrics.bootstrap_ci = real
+
+
+def test_gate_rejects_gain_under_min_delta():
+    """Even with the lower bound past margin (0), a Δ below min_delta is not
+    adopted — a noise-level adoption must not change the champion and reset the
+    ledger and fold records."""
+    champ = [_rec([HIT], [GT]) for _ in range(399)] + [_rec([MISS], [GT])]
+    cand = [_rec([HIT], [GT]) for _ in range(400)]
+    loose = gate(champ, cand, cat_ids=[1], iou_thr=0.5, margin=0.0,
+                 min_delta=0.0, n_boot=200, seed=1)
+    assert loose["adopted"] is True and 0 < loose["delta"] < 0.005
+    strict = gate(champ, cand, cat_ids=[1], iou_thr=0.5, margin=0.0,
+                  min_delta=0.005, n_boot=200, seed=1)
+    assert strict["adopted"] is False and "min_delta" in strict["reason"]
+
+
+def test_gate_min_delta_keeps_clear_improvement():
+    champ = [_rec([MISS], [GT]) for _ in range(20)]
+    cand = [_rec([HIT], [GT]) for _ in range(20)]
+    out = gate(champ, cand, cat_ids=[1], iou_thr=0.5, margin=0.0,
+               min_delta=0.005, n_boot=200, seed=1)
+    assert out["adopted"] is True
+
+
+def test_runner_gate_passes_min_delta():
+    import inspect
+    from agentic_configuration_search.loop import runner
+
+    assert "min_delta=self.cfg.gate.min_delta" in inspect.getsource(runner.Loop._gate)
+
+
+def test_gate_min_delta_config_default_and_validation():
+    from agentic_configuration_search.config import ConfigError, config_from_dict
+
+    assert config_from_dict({"dataset": "x"}).gate.min_delta == 0.005
+    with pytest.raises(ConfigError, match="min_delta"):
+        config_from_dict({"dataset": "x", "gate": {"min_delta": -0.001}})

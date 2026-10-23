@@ -82,10 +82,16 @@ def micro_f_beta_stat(cat_ids: list[int], iou_thr: float, beta: float = 1.0):
 
 def gate(champion_records: list[dict], candidate_records: list[dict], *,
          cat_ids: list[int], iou_thr: float, margin: float,
-         n_boot: int = 2000, seed: int = 0, alpha: float = 0.05,
+         min_delta: float = 0.0, n_boot: int = 2000, seed: int = 0, alpha: float = 0.05,
          beta: float = 1.0) -> dict:
     """Adoption gate — adopt only if the paired-bootstrap one-sided lower bound
-    of Δ micro F(β) is ≥ margin and Δ > 0. Otherwise the champion stays, unchanged.
+    of Δ micro F(β) is ≥ margin, Δ > 0 and Δ ≥ min_delta. Otherwise the champion
+    stays, unchanged.
+
+    min_delta bounds the point estimate Δ itself — a noise-level gain (Δ ≈
+    +0.001) with its lower bound stuck at 0 must not change the champion and
+    reset the ledger and fold records. saturation already counts such an
+    adoption as stagnant (lo ≤ ε).
 
     Both record lists must cover **the same holdout images in the same order**
     (paired) — metrics.bootstrap_ci raises on a length mismatch.
@@ -102,10 +108,13 @@ def gate(champion_records: list[dict], candidate_records: list[dict], *,
     # so the Δ distribution piles up at 0. A strict `>` alone would reject a
     # real gain (Δ>0) and no change (Δ=0) for the same reason, so delta breaks
     # the tie at the boundary.
-    adopted = out["lo"] >= margin and out["delta"] > 0
-    return {**out, "margin": margin, "adopted": adopted,
-            "reason": (f"Δ micro F(β) {out['delta']:+.4f} > 0 and lower bound "
-                       f"{out['lo']:+.4f} ≥ margin {margin}"
+    small = out["delta"] < min_delta
+    adopted = out["lo"] >= margin and out["delta"] > 0 and not small
+    return {**out, "margin": margin, "min_delta": min_delta, "adopted": adopted,
+            "reason": (f"Δ micro F(β) {out['delta']:+.4f} ≥ min_delta {min_delta} and "
+                       f"lower bound {out['lo']:+.4f} ≥ margin {margin}"
                        if adopted else
                        f"Δ micro F(β) {out['delta']:+.4f} / lower bound {out['lo']:+.4f} "
-                       f"— fails margin {margin}, keeping champion")}
+                       + (f"— Δ below min_delta {min_delta}, keeping champion"
+                          if small and out["lo"] >= margin and out["delta"] > 0 else
+                          f"— fails margin {margin}, keeping champion"))}

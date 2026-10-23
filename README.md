@@ -126,7 +126,7 @@ Every round, apart from the axes:
 |---|---|
 | diagnosis (planner input) | all of train inferred with the champion and split by cause (with samples); the holdout as aggregates only. Thresholds are the champion's holdout thresholds — planner input only, never fed into materials |
 | screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` to holdout |
-| adoption, saturation | holdout (`valid`, or `test` when there is no `valid`) — compared with the champion at holdout thresholds; adopted only if the paired-bootstrap lower bound exceeds `gate.margin` and Δ > 0 |
+| adoption, saturation | holdout (`valid`, or `test` when there is no `valid`) — compared with the champion at holdout thresholds; adopted only if the paired-bootstrap lower bound exceeds `gate.margin` and Δ ≥ `gate.min_delta` (0.005) |
 | final measurement | `test` (when `valid` was the holdout) — the settled champion, once, outside the loop (`scripts/predict.py --split test`) |
 
 ### Round loop
