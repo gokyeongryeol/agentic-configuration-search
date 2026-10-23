@@ -20,7 +20,7 @@ dataset_notes: ""
 run_seed: 0
 
 planner:
-  kind: deterministic                     # deterministic | llm
+  kind: llm                               # llm | deterministic (deterministic is the A/B control and for environments without an LLM)
   model: Qwen/Qwen3.8-27B-FP8             # vLLM model for kind=llm
   base_url: null                          # running vLLM endpoint. null = start via launch (attach if persist)
   crop_notes: true                        # show the VLM crops of every prompt sample and merge its descriptions into the diagnosis

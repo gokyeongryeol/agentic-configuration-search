@@ -82,14 +82,21 @@ def build_hooks(cfg: Config, repo_root: Path, out_dir: Path, *,
     # candidate (keyed by crop content hash, one file per model) — reused after
     # resume too
     model_slug = cfg.mine.embedder_model.replace("/", "--")
+    # missed groups go out in one encode_crops_many call (one worker run, one model load)
     cached = embedder.cached_encoder(
-        lambda paths, log_path: embedder.encode_crops(
-            repo_root, list(paths), cfg.mine.embedder_model, cfg.mine.device,
-            log_path),
-        out_dir / "_cache" / f"embed_{model_slug}.npz")
+        None, out_dir / "_cache" / f"embed_{model_slug}.npz",
+        encode_many=lambda groups: embedder.encode_crops_many(
+            repo_root, [(list(paths), log_path) for paths, log_path in groups],
+            cfg.mine.embedder_model, cfg.mine.device))
+
+    def _log(cid):
+        return out_dir / "_logs" / f"embed_c{cid}.log"
 
     def encode_fn(cid, paths):
-        return cached(paths, out_dir / "_logs" / f"embed_c{cid}.log")
+        return cached(paths, _log(cid))
+    # a round's c1..cN up front in one go — later encode_fn(cid) calls hit the cache
+    encode_fn.prefetch = lambda groups: cached.many(
+        [(paths, _log(cid)) for cid, paths in groups.items()])
     hooks["encode_fn"] = encode_fn
 
     # Caption mining (including all three text_negatives sources) goes through

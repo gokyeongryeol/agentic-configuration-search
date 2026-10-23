@@ -49,7 +49,7 @@ PLANNER_MAX_CANDIDATES = 3
 
 @dataclass(frozen=True)
 class PlannerCfg:
-    kind: str = "deterministic"          # one of PLANNER_KINDS
+    kind: str = "llm"                    # one of PLANNER_KINDS (deterministic is the A/B control and for environments without an LLM)
     model: str = "Qwen/Qwen3.8-27B-FP8"
     base_url: Optional[str] = None       # vLLM OpenAI-compatible endpoint; None -> services launches one
     # Show **all** prompt-sample crops to the VLM and merge its descriptions into

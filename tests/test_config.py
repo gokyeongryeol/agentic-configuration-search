@@ -9,7 +9,7 @@ BASE = {"dataset": "demo"}
 
 def test_defaults():
     cfg = config_from_dict(BASE)
-    assert cfg.planner.kind == "deterministic"
+    assert cfg.planner.kind == "llm"
     assert cfg.split.fit_train_ratio == 0.8
     assert cfg.gate.margin == 0.0
     assert cfg.saturation.rounds == 5

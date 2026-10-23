@@ -550,7 +550,7 @@ def test_diagnosis_uses_configured_small_object_cut(big_root, tmp_path, monkeypa
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
 
     def kinds(out, cut):
-        cfg = config_from_dict({"dataset": str(big_root),
+        cfg = config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(big_root),
                                 "diagnose": {"small_object_ratio": cut}})
         run_rounds(big_root, out_dir=out, planner="deterministic", rounds=1,
                    cfg=cfg, **_fakes())

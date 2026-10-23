@@ -199,6 +199,7 @@ def test_lora_arm_that_lost_on_fit_dev_skips_holdout(root, tmp_path,  # noqa: F8
                         lambda self, entry, *a, **k: (evaluated.append(entry["id"]),
                                                       real(self, entry, *a, **k))[1])
     cfg = config_from_dict({
+        "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4}})
     cand = tmp_path / "c.yaml"

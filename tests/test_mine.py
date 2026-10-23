@@ -81,6 +81,39 @@ def test_gt_exemplars_kcenter_and_chosen_ids(train, onto, tmp_path):
         assert len(rows) == 2
 
 
+def test_gt_exemplars_prefetches_all_classes_in_one_call(train, onto, tmp_path):
+    """If encode_fn offers prefetch, every class with crops is handed over at once
+    before the per-class calls — the real implementation embeds c1..cN in one
+    worker run (one model load). The selection equals the one without prefetch."""
+    cache = mine.CropCache(train, onto, tmp_path / "c")
+    params = _params(exemplars_per_class=2, kcenter_outlier_mad=0.0)
+    base = _spread_encode(cache)
+    prefetched = []
+
+    def encode_fn(cid, paths):
+        return base(cid, paths)
+    encode_fn.prefetch = lambda groups: prefetched.append(dict(groups))
+
+    ex, chosen = mine.gt_exemplars(train, onto, cache, params, encode_fn,
+                                   random.Random(0))
+    want = {cid: cache.paths[cid] for cid, anns in sorted(cache.prompt_pool.items())
+            if anns}
+    assert prefetched == [want] and list(prefetched[0]) == sorted(want)
+    ex0, chosen0 = mine.gt_exemplars(train, onto, cache, params, base, random.Random(0))
+    assert chosen == chosen0
+
+
+def test_gt_exemplars_random_skips_prefetch(train, onto, tmp_path):
+    cache = mine.CropCache(train, onto, tmp_path / "c")
+    params = _params(exemplar_selection="random", exemplars_per_class=2)
+
+    def encode_fn(cid, paths):
+        raise AssertionError("the random path does not call the embedder")
+    encode_fn.prefetch = encode_fn
+
+    mine.gt_exemplars(train, onto, cache, params, encode_fn, random.Random(0))
+
+
 def test_gt_exemplars_random_is_seeded(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
     params = _params(exemplar_selection="random", exemplars_per_class=2)
