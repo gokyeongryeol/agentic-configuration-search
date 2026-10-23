@@ -8,7 +8,12 @@ GPU entirely.
 
 Hyperparameters are fixed universal-best constants — not a search axis. The
 output checkpoint contract matches the loader in clients.yoloe._CropReclassifier:
-    {"state_dict", "num_classes", "classifier_model": "siglip"}
+    {"state_dict", "state_dict_format": "trainable", "num_classes",
+     "classifier_model": "siglip"}
+state_dict holds only the parameters training changes (LoRA adapter and the
+classification head, a few MB). The backbone is rebuilt by the loader from the
+same MODEL_NAME's pretrained weights (HF cache) — if those weights change, this
+checkpoint becomes a different model.
 label 0 = background, label i+1 = class_names[i] (ascending category id).
 
 Input manifest (jsonl): rows of {"crop_path": str, "label": int}.
@@ -37,6 +42,30 @@ VAL_FRACTION = 0.2
 MIN_RECORDS_FOR_VAL = 20
 
 
+def is_trainable_key(name: str) -> bool:
+    """Parameters training changes — the LoRA adapter and the classification
+    head. Must be the same rule as clients.yoloe._is_trainable_key so the
+    loader puts every one of them back."""
+    return "lora_" in name or "classifier" in name
+
+
+def freeze_to_trainable(model) -> None:
+    """Train only LoRA and the head (peft's default freezes the head)."""
+    for name, p in model.named_parameters():
+        p.requires_grad = is_trainable_key(name)
+
+
+def save_checkpoint(model, num_classes: int, out) -> None:
+    """Save only the trained parameters — the backbone is rebuilt from MODEL_NAME."""
+    import torch
+
+    state = {k: v for k, v in model.state_dict().items() if is_trainable_key(k)}
+    torch.save({"state_dict": state,
+                "state_dict_format": "trainable",
+                "num_classes": num_classes,
+                "classifier_model": "siglip"}, out)
+
+
 def build_model(num_classes: int):
     """SigLIP2 classifier + LoRA (qkvo). Must match the rebuild in clients.yoloe
     for state_dict keys to line up (LoRA r/alpha/target determine key structure)."""
@@ -49,8 +78,7 @@ def build_model(num_classes: int):
     lora_cfg = LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
                           target_modules=LORA_TARGET, bias="none")
     model = get_peft_model(model, lora_cfg)
-    for name, p in model.named_parameters():
-        p.requires_grad = ("lora_" in name or "classifier" in name)
+    freeze_to_trainable(model)
     return model, processor
 
 
@@ -163,9 +191,7 @@ def main(argv=None) -> int:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    torch.save({"state_dict": model.state_dict(),
-                "num_classes": args.num_classes,
-                "classifier_model": "siglip"}, args.out)
+    save_checkpoint(model, args.num_classes, args.out)
     print(f"saved: {args.out} (num_classes={args.num_classes}, "
           f"train={len(train_records)}, val={len(val_records)}, "
           f"best_val_acc={best_val_acc if best_val_acc >= 0 else 'n/a'})", flush=True)
