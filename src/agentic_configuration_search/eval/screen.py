@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 from ..core import metrics
 from ..core.metrics import per_image_records
 from ..diagnose import ensemble
@@ -83,17 +85,84 @@ def evaluate_grid(cfg, client, split, ontology, materials: Materials,
     return rows, dets_by_config
 
 
+def _best_tiling_ids(grid: list[dict], mean_f: dict[int, float]) -> tuple | None:
+    """(best tiled config id, best untiled config id) — None if either side is
+    missing from the grid."""
+    by_id = {c["config_id"]: c for c in grid}
+    tiled = [i for i in mean_f if by_id[i].get("tiling")]
+    untiled = [i for i in mean_f if not by_id[i].get("tiling")]
+    if not tiled or not untiled:
+        return None
+    return (max(tiled, key=lambda i: mean_f[i]), max(untiled, key=lambda i: mean_f[i]))
+
+
 def tiling_f(grid: list[dict], mean_f: dict[int, float]) -> dict | None:
     """Best per-class-mean F(β) of the tiled and of the untiled configs — the same
     yardstick as the shared-config pick (max sum of per-class F(β)). The planner
     reads how far tiling fell short when it went unused. None if either side is
     missing from the grid."""
-    by_id = {c["config_id"]: c for c in grid}
-    tiled = [f for i, f in mean_f.items() if by_id[i].get("tiling")]
-    untiled = [f for i, f in mean_f.items() if not by_id[i].get("tiling")]
-    if not tiled or not untiled:
+    best = _best_tiling_ids(grid, mean_f)
+    if best is None:
         return None
-    return {"tiled": round(max(tiled), 4), "untiled": round(max(untiled), 4)}
+    return {"tiled": round(mean_f[best[0]], 4), "untiled": round(mean_f[best[1]], 4)}
+
+
+def class_count_rows(recs: list[dict], thresholds: dict[int, float],
+                     cat_ids: list[int], iou_thr: float) -> list[np.ndarray]:
+    """Per image, per-class (tp, fp, fn) at fixed thresholds (screen's τ_c) —
+    counted once so the bootstrap does not re-match when it resamples images."""
+    out = []
+    for rec in recs:
+        row = []
+        for cid in cat_ids:
+            p = metrics.class_prf_at([rec], cid, thresholds[cid], iou_thr)
+            row.append((p["tp"], p["fp"], p["fn"]))
+        out.append(np.array(row, dtype=float).reshape(len(cat_ids), 3))
+    return out
+
+
+def class_mean_f(rows: list[np.ndarray], beta: float = 1.0) -> float:
+    """Mean of per-class F(β) — the same statistic as tiling_f (sum of per-class
+    F(β) over the number of classes)."""
+    tp, fp, fn = np.sum(np.stack(rows), axis=0).T
+    p = tp / np.maximum(tp + fp, 1)
+    r = tp / np.maximum(tp + fn, 1)
+    b2 = float(beta) ** 2
+    denom = b2 * p + r
+    f = np.where(denom > 0, (1 + b2) * p * r / np.where(denom > 0, denom, 1), 0.0)
+    return float(np.mean(f))
+
+
+def tiling_gap_ub(untiled_rows: list[np.ndarray], tiled_rows: list[np.ndarray], *,
+                  beta: float, n_boot: int, seed: int, alpha: float) -> float:
+    """Paired-bootstrap **one-sided upper bound** of (tiled − untiled) per-class
+    mean F(β).
+
+    Uses the adoption gate's resampler (metrics.bootstrap_ci — the same image
+    indices drawn on both sides) and settings (gate.bootstrap, confidence,
+    run_seed). An upper bound at or above 0 means "tiling is worse than untiled"
+    cannot be ruled out within noise — the near-miss condition of the tiling fold
+    gate (planner.gates). Smaller samples (a prescreen subset) give wider
+    bounds."""
+    out = metrics.bootstrap_ci(untiled_rows, tiled_rows,
+                               lambda rows: class_mean_f(rows, beta),
+                               n_boot=n_boot, seed=seed, alpha=alpha, tail="upper")
+    return float(out["hi"])
+
+
+def _with_gap_ub(cfg, tile_f: dict | None, grid: list[dict], mean_f: dict[int, float],
+                 recs_of, thresholds_of, cat_ids: list[int]) -> dict | None:
+    """Add gap_ub to tiling_f — from the per-image records of the best tiled and
+    untiled configs."""
+    best = _best_tiling_ids(grid, mean_f)
+    if tile_f is None or best is None:
+        return tile_f
+    iou = cfg.detector.iou_threshold
+    tiled, untiled = (class_count_rows(recs_of(i), thresholds_of(i), cat_ids, iou)
+                      for i in best)
+    ub = tiling_gap_ub(untiled, tiled, beta=cfg.beta, n_boot=cfg.gate.bootstrap,
+                       seed=cfg.run_seed, alpha=1.0 - cfg.gate.confidence)
+    return {**tile_f, "gap_ub": round(ub, 4)}
 
 
 def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
@@ -111,12 +180,17 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
     rows: list[dict] = []
     dets_by_config: dict[int, list] = {}
     n_classes = max(len(ontology.classes), 1)
+    cat_ids = [c.id for c in ontology.classes]
     tile_f = None
     if have_semantic:
         rows, dets_by_config = evaluate_grid(cfg, client, fit_dev, ontology,
                                              materials, grid)
         best = select_shared_config(rows, grid)
-        tile_f = tiling_f(grid, _mean_f(rows, n_classes))
+        mean_f = _mean_f(rows, n_classes)
+        tile_f = _with_gap_ub(
+            cfg, tiling_f(grid, mean_f), grid, mean_f,
+            lambda i: per_image_records(fit_dev, image_paths, dets_by_config[i]),
+            _thresholds(rows).__getitem__, cat_ids)
     else:
         best = {}
     per_class: dict[int, dict] = {
@@ -184,7 +258,11 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
                     rows_t.append({"config_id": config_id, "category_id": c.id,
                                    "threshold": thr, "f_beta": f1})
             best_t = select_shared_config(rows_t, grid)
-            tile_f = tiling_f(grid, _mean_f(rows_t, n_classes))
+            mean_f = _mean_f(rows_t, n_classes)
+            tile_f = _with_gap_ub(
+                cfg, tiling_f(grid, mean_f), grid, mean_f,
+                text_recs_by_config.__getitem__, _thresholds(rows_t).__getitem__,
+                cat_ids)
             shared_id = (next(iter(best_t.values()))["config_id"] if best_t
                          else 0)
         for c in ontology.classes:
@@ -228,3 +306,11 @@ def _mean_f(rows: list[dict], n_classes: int) -> dict[int, float]:
     for r in rows:
         sums[r["config_id"]] = sums.get(r["config_id"], 0.0) + r["f_beta"]
     return {i: v / n_classes for i, v in sums.items()}
+
+
+def _thresholds(rows: list[dict]) -> dict[int, dict[int, float]]:
+    """Per-config per-class thresholds from the scoring rows."""
+    out: dict[int, dict[int, float]] = {}
+    for r in rows:
+        out.setdefault(r["config_id"], {})[r["category_id"]] = r["threshold"]
+    return out

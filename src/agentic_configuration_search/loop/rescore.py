@@ -139,11 +139,16 @@ def rescored_split_score(cfg, ds, setting: dict, rescorer, preds: dict,
 
 
 def rescored_screen(cfg, ds, setting: dict, rescorer, dev_preds: dict) -> dict:
-    """The setting with the candidate's fit_dev scoring updated to rescored scores."""
+    """The setting with the candidate's fit_dev scoring updated to rescored scores.
+
+    tiling_f (the tiled/untiled comparison and gap_ub) stays the pre-rescoring
+    screen's — that screen is why the tile config was picked. Dropping it would
+    lose tiling_f from the history row of an adopted tiling+rescorer candidate."""
     out = rescored_split_score(cfg, ds, setting, rescorer, dev_preds, ds.fit_dev)
     return {"configs": setting["configs"], "per_class": out["per_class"],
             "fit_dev_micro_f_beta": out["micro_f_beta"],
-            "modality_diagnostic": setting.get("modality_diagnostic", {})}
+            "modality_diagnostic": setting.get("modality_diagnostic", {})} \
+        | ({"tiling_f": setting["tiling_f"]} if setting.get("tiling_f") else {})
 
 
 def rescored_evaluate(cfg, client, ds, setting: dict, materials: Materials,

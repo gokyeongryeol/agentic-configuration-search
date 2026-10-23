@@ -33,7 +33,7 @@ import yaml
 from ..config import Config, config_from_dict
 from ..core.data import Dataset, load_dataset, prescreen_subset
 from ..diagnose import describe, residual
-from ..diagnose.errors import diagnose
+from ..diagnose.errors import diagnose, size_profile
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
 from ..eval.screen import screen_candidate
@@ -41,7 +41,7 @@ from ..fitting.materials import Materials
 from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
-from ..planner.gates import tiling_gate
+from ..planner.gates import tiling_gate, tiling_shortfall
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from . import adapt_round, rescore, tail_round
@@ -377,6 +377,15 @@ class Loop:
         small = dict(small_ratio=self.cfg.diagnose.small_object_ratio)
         d_train = diagnose(recs, floor_recs, tau, self.ds.ontology,
                            iou_thr=self.iou, anonymize=False, **small)
+        # material for s* and m of the tiling near-miss — the floor is recounted at
+        # the champion's fit_dev screen thresholds, not tau_test (holdout-
+        # estimated). s* feeds the fold gate's exception (a screen decision), so
+        # nothing derived from holdout may enter it.
+        screen_thr = {int(cid): e["threshold"]
+                      for cid, e in champion["setting"]["per_class"].items()}
+        d_train["tiling_sizes"] = size_profile(floor_recs, screen_thr,
+                                               self.ds.ontology,
+                                               iou_thr=self.iou, **small)
         d_test = diagnose(champion["eval"]["records"],
                           champion["eval"]["floor_records"], tau,
                           self.ds.ontology, iou_thr=self.iou, anonymize=True,
@@ -463,7 +472,9 @@ class Loop:
                           disabled_axes=self.disabled_axes,
                           disabled_values=self.disabled_values,
                           facts=self._facts(),
-                          tiling_overlap=self.cfg.search.tiling_overlap)
+                          tiling_overlap=self.cfg.search.tiling_overlap,
+                          tiling_tp_quantile=self.cfg.search.tiling_tp_quantile,
+                          tiling_tp_min=self.cfg.search.tiling_tp_min)
 
     def _propose(self, history: list[dict], diagnosis: dict,
                  round_dir: Path) -> dict:
@@ -625,6 +636,24 @@ class Loop:
         return rescore.rescored_screen(self.cfg, self.ds, setting,
                                        rescorer, dev_preds)
 
+    def _shortfall(self, c: dict, entry: dict) -> None:
+        """Attach the magnification-shortfall verdict (tiling_shortfall) to a
+        candidate asking for a grid above the champion's — so the fold gate's
+        near-miss exception reads history only, it is computed at screen time
+        from this round's champion train size profile (`tiling_sizes` — TP and
+        missed_small counted at the fit_dev screen thresholds, holdout-free)."""
+        g = (c.get("requested_axes") or c["axes"]).get("tiling")
+        champ = (getattr(self, "_champion", None) or {}).get("axes") or {}
+        if not g or int(g) <= int(champ.get("tiling") or 0):
+            return
+        s = self.cfg.search
+        verdict = tiling_shortfall(getattr(self, "_diag_train", None), int(g),
+                                   overlap=s.tiling_overlap,
+                                   quantile=s.tiling_tp_quantile,
+                                   tp_min=s.tiling_tp_min)
+        if verdict is not None:
+            entry["tiling_shortfall"] = verdict
+
     def _prescreen(self, c: dict, axes: dict, materials: Materials, entry: dict,
                    skipped: list) -> bool:
         """Screen a large-grid tiling candidate on a fit_dev subset first — if no
@@ -647,7 +676,8 @@ class Loop:
         if {k for k, v in c["axes"].items() if champ.get(k) != v} != {"tiling"}:
             return False
         sub = prescreen_subset(self.ds.fit_dev, s.prescreen_fraction,
-                               s.prescreen_min_images)
+                               s.prescreen_min_images,
+                               max_share=s.prescreen_max_share)
         if sub is None:
             return False
         setting = self._screen(materials, axes, split=sub)
@@ -666,6 +696,8 @@ class Loop:
                        "screen is skipped"}
         if setting.get("tiling_f"):
             rec["tiling_f"] = setting["tiling_f"]
+        if entry.get("tiling_shortfall"):
+            rec["tiling_shortfall"] = entry["tiling_shortfall"]
         log.info("candidate %s: %s", c["id"], rec["note"])
         skipped.append(rec)
         return True
@@ -684,6 +716,7 @@ class Loop:
     def _screen_one(self, c: dict, mat_dir, entry: dict,
                     screened: list, skipped: list) -> None:
         """materialize + screen for one candidate — the caller records failures as rejections."""
+        self._shortfall(c, entry)
         if c["axes"].get("rescorer"):
             # the rescorer is a post-processing layer on the setting fixed by the
             # other axes — discriminator on fit_train, α grid on fit_dev (loop.rescore)
@@ -781,10 +814,15 @@ class Loop:
             rec["prescreen"] = entry["prescreen"]
         if unused:
             rec.setdefault("unused_axes", unused)
-            if "tiling" in unused:
-                rec["tiling_used"] = False
-                if setting.get("tiling_f"):
-                    rec["tiling_f"] = setting["tiling_f"]   # how far it fell short
+        # a candidate that asked for tiling records that it reached screen, used
+        # or not — the fold gate's near-miss exception counts "g+1 was already
+        # screened" from this
+        if (c.get("requested_axes") or c["axes"]).get("tiling"):
+            rec["tiling_used"] = "tiling" not in unused
+            if setting.get("tiling_f"):
+                rec["tiling_f"] = setting["tiling_f"]   # how far it fell short
+            if entry.get("tiling_shortfall"):
+                rec["tiling_shortfall"] = entry["tiling_shortfall"]
         log.info("candidate %s: %s", c["id"], rec["note"])
         skipped.append(rec)
         return True
@@ -852,6 +890,10 @@ class Loop:
         rd.mkdir(parents=True, exist_ok=True)
         diagnosis = self._diagnosis(champion, rd,
                                     prev=self._round_dir(r - 1) if r > 1 else None)
+        # material for the near-miss exception's shortfall verdict — reads only
+        # the train diagnosis's tiling_sizes (sizes counted at fit_dev screen
+        # thresholds)
+        self._diag_train = diagnosis.get("train")
         self._crop_notes(diagnosis, rd)      # merge VLM notes (diagnostic signal only)
         proposal = self._propose(history, diagnosis, rd)
         # served_* is what the detector has loaded right now — detector-state
@@ -1388,9 +1430,12 @@ def _tiling_record(c: dict) -> dict:
         return {}
     out = {"tiling_used": _uses_tiling(c["setting"])}
     if c["setting"].get("tiling_f"):
-        # per-class-mean fit_dev F(β) of the tiled and untiled configs — by how
-        # much it won or fell short
+        # per-class-mean fit_dev F(β) of the tiled and untiled configs and the
+        # bootstrap upper bound of their difference (gap_ub) — by how much it won
+        # or fell short, and whether within noise
         out["tiling_f"] = c["setting"]["tiling_f"]
+    if c.get("tiling_shortfall"):
+        out["tiling_shortfall"] = c["tiling_shortfall"]   # magnification shortfall verdict (gates)
     return out
 
 

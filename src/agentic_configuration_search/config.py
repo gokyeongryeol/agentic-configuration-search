@@ -83,10 +83,13 @@ class ScreenCfg:
     # scored on a deterministic fit_dev subset (max(min_images, ⌈fraction·N⌉)
     # images). If no class uses a tile there it is rejected without the full
     # screen; otherwise the full fit_dev is screened as before. fraction 0 turns
-    # it off.
+    # it off. If the subset would be max_share of fit_dev or more, the full
+    # screen runs directly — a passing candidate is re-screened in full, so a
+    # large subset saves nothing.
     prescreen_fraction: float = 0.25
     prescreen_min_images: int = 20
     prescreen_min_grid: int = 3
+    prescreen_max_share: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,15 @@ class SearchCfg:
     # still be picked from the floor up.
     tiling_merge: str = "sahi"
     tiling_merge_min_score: float = 0.3
+    # near-miss exception of the tiling fold gate (planner.gates) — from the train
+    # sizes counted at the champion's fit_dev screen thresholds
+    # (diagnose.errors.size_profile), s* ("objects this small are already
+    # detected") is this quantile of the TP sizes of the class with the most
+    # missed_small. With fewer TPs than tiling_tp_min in that class the exception
+    # is not judged. The first-grid hint (the prompt's missed-small block) shows
+    # the same s*.
+    tiling_tp_quantile: float = 0.1
+    tiling_tp_min: int = 20
     modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
@@ -332,6 +344,9 @@ def _validate(cfg: Config) -> None:
     if cfg.screen.prescreen_min_grid < 2:
         raise ConfigError("screen.prescreen_min_grid: must be >= 2 — the smallest "
                           f"grid is 2 ({cfg.screen.prescreen_min_grid})")
+    if not (0.0 < cfg.screen.prescreen_max_share <= 1.0):
+        raise ConfigError("screen.prescreen_max_share: outside (0,1] "
+                          f"({cfg.screen.prescreen_max_share})")
     if cfg.gate.bootstrap < 1:
         raise ConfigError(f"gate.bootstrap: must be >= 1 ({cfg.gate.bootstrap})")
     if not (0.0 < cfg.gate.confidence < 1.0):
@@ -366,6 +381,12 @@ def _validate(cfg: Config) -> None:
     s = cfg.search.tiling_merge_min_score
     if isinstance(s, bool) or not isinstance(s, (int, float)) or not (0.0 <= s < 1.0):
         raise ConfigError(f"search.tiling_merge_min_score: outside [0,1) ({s!r})")
+    q = cfg.search.tiling_tp_quantile
+    if not (0.0 < q < 1.0):
+        raise ConfigError(f"search.tiling_tp_quantile: outside (0,1) ({q!r})")
+    if cfg.search.tiling_tp_min < 1:
+        raise ConfigError("search.tiling_tp_min: must be >= 1 "
+                          f"({cfg.search.tiling_tp_min})")
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")

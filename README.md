@@ -76,7 +76,7 @@ line) that equals the baseline behavior exactly.
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
 | `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
 | `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility |
-| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes. If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
+| `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes and the TP sizes the champion already detects (s*). If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Exception: if g lost to no tiling on fit_dev only within noise (one-sided paired-bootstrap upper bound `tiling_f.gap_ub` ≥ 0) and fell short on zoom (for the median m of the class with the most missed_small, m·zoom(g) < s* ≤ m·zoom(g+1), s* = the `search.tiling_tp_quantile` quantile of that class's champion TP sizes — m and s* are both train sizes counted at the champion's fit_dev screen thresholds, so holdout plays no part; with fewer than `search.tiling_tp_min` TPs there is no verdict), g+1 is opened — once, until a g+1 reaches screen (several g+1 candidates in the same proposal all pass). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
 
 An axis that is on may still go unused by the setting — screen picks whichever
 is better on fit_dev (exemplar against text prompts per class, tiling against
@@ -140,7 +140,9 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
   screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
   `prescreen_min_images`); if no class uses tiles there, it is rejected without
   the full screen. If they are used, the full fit_dev is screened as before
-  (numbers unchanged).
+  (numbers unchanged). If the subset is `screen.prescreen_max_share` (0.5) of
+  fit_dev or more, the full screen runs directly without a prescreen — a pass
+  would be measured again, so nothing is saved.
 - **decide** adopts a candidate only if the paired-bootstrap lower bound of its
   holdout Δ clears the margin; otherwise the champion stays.
 - **re-ask**: if every candidate is rejected before holdout (by the filters or
@@ -233,8 +235,8 @@ propose → materialize → screen (fit_dev) → evaluate (holdout) → decide �
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 - The planner also sees time cost — candidate rows' wall clock (`wall_min`) and
-  the per-axis median of observed cost, the shortfall of unused tiling
-  (`tiling_f`), the served material of same_setting rows (`material`), and axes
+  the per-axis median of observed cost, tiling's tiled-vs-untiled comparison
+  (`tiling_f`, including the bootstrap upper bound `gap_ub` of the gap), the served material of same_setting rows (`material`), and axes
   repeatedly left unused under the current champion (folded axes).
 
 ### Outputs

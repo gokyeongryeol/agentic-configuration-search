@@ -22,7 +22,7 @@ from pathlib import Path
 from ..diagnose.sample import pick_detail
 from . import deterministic
 from .axes import DatasetFacts, axis_values, sanitize_candidates
-from .gates import tiling_gate, under_champion
+from .gates import INPUT_SIDE, tiling_gate, tp_floor, under_champion
 
 log = logging.getLogger(__name__)
 
@@ -210,18 +210,26 @@ def _kind_counts(diagnosis: dict) -> dict[str, int]:
     return counts
 
 
-# Detector input side — converts missed_small's size_ratio to input px. YOLOE
-# letterboxes the long side to its imgsz (640, clients.yoloe); size_ratio is
-# √(box/image area), so this is exact for square images and an approximation
-# otherwise (the same assumption as DiagnoseCfg's 0.04 ≈ 26 px).
-INPUT_SIDE = 640
-
-
-def _small_block(diagnosis: dict, overlap: float) -> str:
+def _small_block(diagnosis: dict, overlap: float, *, tp_quantile: float = 0.1,
+                 tp_min: int = 20) -> str:
     """Input-px quantiles of train missed_small and the median after each grid's
     magnification — evidence for picking the first tiling grid. Samples are a
     coverage selection, not a distribution, so this counts the full fn list.
-    Holdout shows only aggregates, so only train is used."""
+    Holdout shows only aggregates, so only train is used.
+
+    Also carries s*, the size of small objects the champion already detects
+    (the `tp_quantile` of TP sizes of the class with the most missed_small —
+    planner.gates.tp_floor). It only advises that the smallest grid whose
+    magnified median reaches s* is the first candidate. With fewer TPs than
+    `tp_min` in that class the line is left out (the same criterion as the fold
+    gate's exception). Its numbers come from the gate's material (the train
+    diagnosis's tiling_sizes — sizes counted at fit_dev screen thresholds), so
+    its counts can differ slightly from the quantiles above (the fn list
+    classified at tau_test).
+
+    INPUT_SIDE (planner.gates, from diagnose.residual) converts size_ratio to
+    input px: YOLOE letterboxes the long side to 640, exact for square images
+    (the same assumption as DiagnoseCfg's 0.04 ≈ 26 px)."""
     from .axes import TILING_GRIDS
 
     fn = (diagnosis.get("train") or {}).get("fn") or []
@@ -238,9 +246,18 @@ def _small_block(diagnosis: dict, overlap: float) -> str:
         f"- grid {g}: {(g - 1) * (1 - overlap) + 1:.2g}x -> median "
         f"{round(p50 * ((g - 1) * (1 - overlap) + 1))} px, cost {1 + g * g} passes"
         for g in TILING_GRIDS)
+    floor = tp_floor(diagnosis.get("train"), quantile=tp_quantile, tp_min=tp_min)
+    tp_line = ""
+    if floor and floor["available"]:
+        tp_line = (f"\nSmallest objects the champion already detects: champion TP "
+                   f"p{round(tp_quantile * 100)} ≈ {floor['tp_px']:.0f} px for "
+                   f"{floor['class']} (the class with the most small misses: "
+                   f"{floor['n_missed']}, their median {floor['missed_px']:.0f} px; "
+                   f"{floor['n_tp']} TPs). Advisory: the smallest grid whose "
+                   "magnified median reaches that size is a sensible first grid.")
     return SMALL_BLOCK.format(n=len(sizes), side=INPUT_SIDE, p25=q(0.25),
                               p50=round(p50), p75=q(0.75), overlap=overlap,
-                              grids=grids)
+                              grids=grids).rstrip("\n") + tp_line + "\n"
 
 
 def _leverage_lines(diagnosis: dict) -> list[str]:
@@ -591,6 +608,15 @@ Rules:
   unused one is dropped as skipped="tiling_blocked" without being screened. A
   note starting "prescreen" means the grid was first screened on a subset of
   fit_dev and not used there, so the full screen was skipped.
+  tiling_f.gap_ub is a paired-bootstrap upper bound on (tiled - untiled) over
+  the fit_dev images it was screened on; gap_ub >= 0 means the loss is within
+  noise. One exception to the fold: when the unused grid g was such a near
+  miss AND fell short on magnification (its magnified missed-small median
+  stayed below the smallest objects the champion already detects, while g+1
+  reaches them), grid g+1 is unblocked exactly once under the current
+  champion — the fold-status lines below say when. It is an option, not a
+  request; grids above g+1 stay blocked, and after g+1 is screened the fold at
+  g holds.
 - A row with unused_axes lists axes the candidate had on that the screened
   setting did not use (exemplar: the text pass beat the semantic pass for every
   class; visual_negatives: no semantic class kept a negative config). Other
@@ -762,9 +788,14 @@ class LLMPlanner:
     def __init__(self, chat, artifact_dir: Path, *, max_candidates: int = 3,
                  notes: str = "", token_budget: int = DEFAULT_TOKEN_BUDGET,
                  disabled_axes=(), disabled_values=None,
-                 facts: DatasetFacts | None = None, tiling_overlap: float = 0.5):
+                 facts: DatasetFacts | None = None, tiling_overlap: float = 0.5,
+                 tiling_tp_quantile: float = 0.1, tiling_tp_min: int = 20):
         self.chat = chat
         self.tiling_overlap = tiling_overlap   # search.tiling_overlap — magnification
+        # search.tiling_tp_quantile and tiling_tp_min — the s* line of the
+        # missed-small block
+        self.tiling_tp_quantile = tiling_tp_quantile
+        self.tiling_tp_min = tiling_tp_min
         self.artifact_dir = Path(artifact_dir)
         self.max_candidates = max_candidates
         self.notes = notes or ""
@@ -898,7 +929,9 @@ class LLMPlanner:
                     tried="\n".join(f"- {x}" for x in tried_lines) or "- (none)",
                     diagnosis=diag_json,
                     leverage="\n".join(leverage_lines) or "- (no errors observed)",
-                    small_block=_small_block(diagnosis, self.tiling_overlap),
+                    small_block=_small_block(diagnosis, self.tiling_overlap,
+                                             tp_quantile=self.tiling_tp_quantile,
+                                             tp_min=self.tiling_tp_min),
                     fold_block=(FOLD_BLOCK.format(folded="\n".join(fold_lines))
                                 if fold_lines else ""),
                     cost_block=(COST_BLOCK.format(costs="\n".join(cost_lines))
