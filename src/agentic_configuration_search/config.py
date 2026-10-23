@@ -90,6 +90,12 @@ class ScreenCfg:
     prescreen_min_images: int = 20
     prescreen_min_grid: int = 3
     prescreen_max_share: float = 0.5
+    # lost-value prescreen — a planner candidate containing a value that clearly
+    # lost on fit_dev under the current champion (planner.ledger) is first measured
+    # on the same subset (the full fit_dev without one); if the bootstrap upper
+    # bound of (candidate − champion) micro F(β) is below 0 it is rejected without
+    # the rescorer refit, full screen or holdout. false turns it off
+    lost_value_prescreen: bool = True
 
 
 @dataclass(frozen=True)

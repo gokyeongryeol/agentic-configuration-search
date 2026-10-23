@@ -16,9 +16,9 @@ from .gates import tiling_gate
 # steps up none → base → fn_arm.
 #
 # **This is a coverage relation, not a decision rule.** The deterministic
-# planner uses the order as its policy, but the LLM prompt inverts the same
-# relation into "error count this axis touches this round"
-# (planner.llm._leverage_lines). So each list must contain everything that
+# planner uses the order as its policy, but the LLM prompt carries the same
+# relation as "this round's count per cause and the axes that target it"
+# (planner.llm._digest_lines). So each list must contain everything that
 # *can* address the kind, not just what to try first.
 REMEDY: dict[str, tuple] = {
     # For misses, lora comes before alias — if alias eats the candidate budget

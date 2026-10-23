@@ -57,6 +57,13 @@ screen:
   prescreen_min_images: 20
   prescreen_min_grid: 3                   # from grid 3 (10 forwards) — grid 2 (5) is screened in full
   prescreen_max_share: 0.5                # skip the prescreen when the subset is this share of fit_dev or more (full screen directly)
+  # lost-value prescreen — a planner candidate containing a value that clearly
+  # lost on fit_dev under the current champion (a single increment's
+  # (candidate − champion) bootstrap upper bound < 0) is measured on the same
+  # subset first (the full fit_dev without one). Upper bound < 0 rejects it as
+  # lost_value_prescreen without the rescorer refit, full screen or holdout;
+  # otherwise it proceeds
+  lost_value_prescreen: true
 
 split:                                    # boundaries stay fixed across rounds
   fit_train_ratio: 0.8                    # fit_train share within train (image-level stratified)

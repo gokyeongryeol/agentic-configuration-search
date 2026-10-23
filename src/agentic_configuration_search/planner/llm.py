@@ -21,8 +21,10 @@ from pathlib import Path
 
 from ..diagnose.sample import pick_detail
 from . import deterministic
-from .axes import DatasetFacts, axis_values, sanitize_candidates
-from .gates import INPUT_SIDE, tiling_gate, tp_floor, under_champion
+from .axes import PLAN_DIFFERS_MAX, DatasetFacts, axis_values, sanitize_candidates
+from .gates import INPUT_SIDE, champion_round, tiling_gate, tp_floor, under_champion
+from .ledger import axis_ledger, tried_under_champion
+from .ledger import label as value_label
 
 log = logging.getLogger(__name__)
 
@@ -44,15 +46,26 @@ SCHEMA = {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    # property order is generation order — the expected gain,
+                    # cost and variant note are written before the rationale.
+                    # The parser keeps a candidate even if the three are missing
+                    # or malformed (planner.axes._plan_fields)
                     "properties": {
                         "id": {"type": "string", "maxLength": 64},
                         "axes": {"type": "object"},
+                        "expected_gain": {"type": "number"},
+                        "cost_min": {"type": "number"},
+                        "differs": {"type": "string", "maxLength": PLAN_DIFFERS_MAX},
                         # rationales run to about 1,700 characters at most
                         # (p99 about 1,050). Without a cap one rationale could
-                        # run on until the response hit the output cap
-                        "rationale": {"type": "string", "maxLength": 2000},
+                        # run on until the response hit the output cap. Since
+                        # the expected gain, cost and differs became structured
+                        # it is cut to 1,200 so the longest schema response
+                        # fits in OUTPUT_MAX_TOKENS
+                        "rationale": {"type": "string", "maxLength": 1200},
                     },
-                    "required": ["axes", "rationale"],
+                    "required": ["axes", "expected_gain", "cost_min", "differs",
+                                 "rationale"],
                 },
             },
             "stop": {"type": "boolean"},
@@ -64,7 +77,13 @@ SCHEMA = {
 # Caps on diagnosis detail and history in the prompt — the first defense against
 # overflowing the server context. The last is the budget guard that measures the
 # assembled prompt (DEFAULT_TOKEN_BUDGET).
-MAX_HISTORY = 8          # recent rounds in the prompt (the budget guard may cut further)
+# Recent rounds carried in detail (the budget guard may cut further). Older
+# rounds fold into one-line summaries (_older_lines), and results under the
+# current champion into the axis ledger (_ledger_block) — when 8 rounds were
+# carried as JSON, history was a quarter of the soccer R7 prompt
+MAX_HISTORY = 3
+MAX_OLDER_LINES = 24     # cap on old rounds carried as one-line summaries (most recent first)
+MAX_LEDGER_ROWS = 24     # cap on rows of the ledger table
 # Response cap — the schema bounds the response length (candidates ≤
 # max_candidates, rationale ≤ RATIONALE_MAX_CHARS characters, id ≤ 64) and this
 # is set above the longest English response (axes is a free object and is not
@@ -260,26 +279,34 @@ def _small_block(diagnosis: dict, overlap: float, *, tp_quantile: float = 0.1,
                               grids=grids).rstrip("\n") + tp_line + "\n"
 
 
-def _leverage_lines(diagnosis: dict) -> list[str]:
-    """One line per axis with **the error count it touches this round**, largest first.
+def _digest_lines(diagnosis: dict, disabled=()) -> list[str]:
+    """Diagnosis digest — counts per cause (train and holdout separately) and the
+    axes that target the cause, most first.
 
-    A static "kind → axis" table unions to every axis when several kinds are
-    observed and narrows nothing. The join happens here and the model gets only
-    the per-round counts, as evidence.
+    A static "cause → axis" table narrows nothing when there are several kinds
+    of cause, since the union of remedies becomes every axis. The join is done
+    here and the model only gets the counts that change each round as
+    evidence. One line per cause, so a count is not repeated per axis (the old
+    per-axis lines carried below_threshold 69 four times on four axes).
 
-    Axis names come from REMEDY (canonical), so no nonexistent axis can appear.
-    """
-    counts = _kind_counts(diagnosis)
-    per_axis: dict[str, dict[str, int]] = {}
-    for kind, n in counts.items():
-        for axis, _value in deterministic.REMEDY.get(kind, ()):
-            per_axis.setdefault(axis, {})[kind] = n
+    Axis names come from REMEDY (the canonical source), so a nonexistent axis
+    cannot appear. Axes turned off on this dataset (disabled) are left out —
+    they cannot be proposed."""
+    split_counts: dict[str, dict[str, int]] = {}
+    for split, name in (("train", "train"), ("test", "held-out")):
+        d = diagnosis.get(split) or {}
+        for side in ("fn", "fp"):
+            for kind, n in ((d.get("summary") or {}).get(side) or {}).items():
+                if n:
+                    split_counts.setdefault(kind, {})[name] = int(n)
     lines = []
-    for axis, kinds in sorted(per_axis.items(),
-                              key=lambda kv: (-sum(kv[1].values()), kv[0])):
-        detail = ", ".join(f"{k} {v}" for k, v in
-                           sorted(kinds.items(), key=lambda kv: -kv[1]))
-        lines.append(f"- {axis}: {detail} (total {sum(kinds.values())})")
+    for kind, by in sorted(split_counts.items(),
+                           key=lambda kv: (-sum(kv[1].values()), kv[0])):
+        axes = list(dict.fromkeys(a for a, _v in deterministic.REMEDY.get(kind, ())
+                                  if a not in disabled))
+        where = ", ".join(f"{k} {v}" for k, v in by.items())
+        lines.append(f"- {kind}: {sum(by.values())} ({where}) -> "
+                     + (", ".join(axes) or "no axis (not addressable by a setting)"))
     return lines
 
 
@@ -393,31 +420,6 @@ def _delta_axes(axes: dict, base: dict) -> dict:
 MAX_TRIED = 40           # cap on tried combos in the prompt (most recent first)
 
 
-def _tried_lines(history: list[dict], champion: dict) -> list[str]:
-    """Already-tried axes combinations, compressed to **deltas vs. the champion**.
-
-    A combination outside the window (MAX_HISTORY) that is re-proposed is dropped
-    by the runner's combo filter and wastes the candidate budget, so collect from
-    the full history. List only what differs from the champion to keep it short.
-    """
-    seen: dict[tuple, None] = {}
-    for e in history:
-        for c in e.get("candidates", []):
-            # a relabelled candidate's original request is a tried combination
-            # too — the runner's combo filter (tried_combos) blocks it, so the
-            # prompt must list it or the planner re-proposes the same request
-            for axes in (c.get("axes"), c.get("requested_axes")):
-                if isinstance(axes, dict):
-                    seen[tuple(sorted(axes.items()))] = None
-    lines = []
-    for key in list(seen)[-MAX_TRIED:]:
-        axes = dict(key)
-        delta = _delta_axes(axes, champion)
-        lines.append(", ".join(f"{k}={v}" for k, v in sorted(delta.items()))
-                     or "(baseline = current champion)")
-    return lines
-
-
 def _schema(max_candidates: int) -> dict:
     """The schema with the candidate cap. With rationale, id and the candidate
     count bounded, the longest English response fits within OUTPUT_MAX_TOKENS —
@@ -491,6 +493,10 @@ def _outcome_lines(rows: list[dict], champion: dict) -> list[str]:
                    or "no change") + f"): skipped={c.get('skipped')}")
         if c.get("unused_axes"):
             line += f", unused_axes={c['unused_axes']}"
+        cmp = c.get("fit_dev_cmp")
+        if cmp and cmp.get("ub") is not None:
+            # the note is cut at MAX_NOTE — the prescreen verdict's numbers go separately
+            line += f", fit_dev delta {cmp['delta']:+.4f} (ub {cmp['ub']:+.4f})"
         if c.get("note"):
             line += f" — {str(c['note'])[:MAX_NOTE]}"
         if c.get("material"):
@@ -530,10 +536,23 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
             # turned off
             row = {"id": c.get("id"),
                    "axes_delta": _delta_axes(c.get("requested_axes") or c.get("axes"),
-                                             champ_axes),
-                   "adopted": c.get("adopted"), "skipped": c.get("skipped")}
+                                             champ_axes)}
+            # empty values are left out — every row used to carry "adopted": null, "skipped": null
+            if c.get("adopted") is not None:
+                row["adopted"] = c["adopted"]
+            if c.get("skipped"):
+                row["skipped"] = c["skipped"]
             if c.get("fit_dev_micro_f_beta") is not None:
                 row["fit_dev_micro_f_beta"] = c["fit_dev_micro_f_beta"]
+            cmp = c.get("fit_dev_cmp") or (c.get("prescreen") or {}).get("fit_dev_cmp")
+            if cmp:
+                # (candidate − champion) fit_dev micro F and its bootstrap upper bound — how badly it lost
+                row["fit_dev_cmp"] = {k: cmp[k] for k in ("delta", "ub") if k in cmp}
+            if c.get("lost_values"):
+                row["lost_values"] = c["lost_values"]   # it was a variant of a clearly-lost value
+            if (c.get("plan") or {}).get("expected_gain") is not None:
+                # the planner's expected gain — lets it calibrate against the actual gate_delta
+                row["expected_gain"] = c["plan"]["expected_gain"]
             if "tiling_used" in c:
                 row["tiling_used"] = c["tiling_used"]
             if c.get("tiling_f"):
@@ -574,10 +593,196 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
     return _round_floats(out)
 
 
+# Cost of axes not observed yet — minutes differ per dataset, so only relative
+# size is given
+STATIC_COST = {
+    "tiling": "tiling=g: every detector pass costs 1+g^2 forwards per image "
+              "(champion: {forwards})",
+    "lora": "lora: fine-tunes the detector tail before screening (the slowest axis)",
+    "crop_classifier": "crop_classifier: trains a crop classifier before screening",
+    "rescorer": "rescorer: re-infers fit_train and fit_dev to refit the rescorer",
+}
+
+
+def _budget_lines(budget: dict | None, history: list[dict], disabled=()) -> list[str]:
+    """Budget card — rounds left, stop counters, per-axis cost (observed median,
+    otherwise a static note).
+
+    The counters are what the runner counted from the tail of history (the same
+    way as run_rounds' stop checks)."""
+    b = budget or {}
+    lines = []
+    r, total = b.get("round"), b.get("rounds")
+    if r is not None and total:
+        left = max(int(total) - int(r) + 1, 1)
+        lines.append(f"- Round {r} of {total}: {left} round"
+                     f"{'s' if left != 1 else ''} left including this one.")
+    if b.get("saturation_rounds"):
+        lines.append(f"- Rounds in a row without adoption: {b.get('stagnant', 0)}; "
+                     f"the run stops at {b['saturation_rounds']}.")
+    if b.get("empty_rounds"):
+        lines.append(f"- Rounds in a row that measured nothing on the held-out split: "
+                     f"{b.get('empty', 0)}; the run stops at {b['empty_rounds']}.")
+    cost = _cost_lines(history)
+    if cost:
+        lines.append("- Measured wall-clock per candidate in this run (materialize + "
+                     "fit_dev screen + held-out eval), by the axes it changed from the "
+                     "champion of its round:")
+        lines += ["  " + c for c in cost]
+    measured = {ln[2:].split(":")[0].split("=")[0] for ln in cost}
+    forwards = ((history[-1].get("champion") or {}).get("forwards_per_image")
+                if history else None) or 1
+    static = [text.format(forwards=forwards) for axis, text in STATIC_COST.items()
+              if axis not in measured and axis not in disabled]
+    if static:
+        lines.append("- Not measured yet: " + "; ".join(static) + ".")
+    return lines
+
+
+def _champion_block(history: list[dict]) -> str:
+    """The current champion in one line — axes on, holdout and fit_dev micro F,
+    adoption round, serving cost."""
+    ch = (history[-1].get("champion") or {}) if history else {}
+    parts = [json.dumps(_on_axes(ch.get("axes")), ensure_ascii=False)
+             + " (only axes that are ON; {} = the baseline, every axis at its safe point)"]
+    nums = []
+    if ch.get("micro_f_beta") is not None:
+        nums.append(f"held-out micro F {ch['micro_f_beta']:.4f}")
+    if ch.get("fit_dev_micro_f_beta") is not None:
+        nums.append(f"fit_dev micro F {ch['fit_dev_micro_f_beta']:.4f}")
+    if ch.get("round") is not None:
+        nums.append(f"adopted in round {ch['round']} ({ch.get('id')})")
+    if ch.get("forwards_per_image"):
+        nums.append(f"{ch['forwards_per_image']} detector passes per image")
+    if nums:
+        parts.append("; ".join(nums))
+    return "\n".join(parts)
+
+
+_STATUS_RANK = {"clearly-lost (prescreened)": 0, "clearly-lost": 1, "near-miss": 2,
+                "folded": 3}
+
+
+def _fmt_delta(d: dict | None, bound: str) -> str:
+    if not d or d.get("delta") is None:
+        return "-"
+    b = d.get(bound)
+    return f"{d['delta']:+.4f}" + (f" ({b:+.4f})" if b is not None else "")
+
+
+def _ledger_block(history: list[dict]) -> str:
+    """The axis ledger table (under the current champion, planner.ledger) and one
+    line of combinations tried under it."""
+    led = axis_ledger(history)
+    cr = champion_round(history)
+    champ = ((history[-1].get("champion") or {}).get("axes") or {}) if history else {}
+    head = (f"Rounds after round {cr} (when the current champion was adopted); "
+            "resets when the champion changes. fit_dev delta is (candidate - "
+            "champion) micro F with its bootstrap upper bound ub; held-out delta is "
+            "the gate delta with its lower bound lo (shown, never used to "
+            "prescreen). Minutes are summed over candidates containing the value."
+            if cr is not None else "")
+    lines = [head] if head else []
+    if not led:
+        lines.append("- (nothing tried under this champion yet)")
+    else:
+        lines.append("value | tries (alone) | best fit_dev delta (ub) | "
+                     "best held-out delta (lo) | status | minutes")
+
+        def status(rec):
+            if champ.get(rec.key[0]) == rec.key[1]:
+                return "champion value (k variants)"
+            return rec.status
+        rows = sorted(led.values(), key=lambda r: (_STATUS_RANK.get(status(r), 9),
+                                                   -r.tries, value_label(r.key)))
+        for rec in rows[:MAX_LEDGER_ROWS]:
+            lines.append(f"{value_label(rec.key)} | {rec.tries} ({rec.single}) | "
+                         f"{_fmt_delta(rec.best_fit_dev, 'ub')} | "
+                         f"{_fmt_delta(rec.best_holdout, 'lo')} | {status(rec)} | "
+                         f"{rec.minutes:.0f}")
+        if len(rows) > MAX_LEDGER_ROWS:
+            lines.append(f"... and {len(rows) - MAX_LEDGER_ROWS} more values")
+    tried = tried_under_champion(history)[-MAX_TRIED:]
+    lines.append("Combos already tried, as differences from the champion (an exact "
+                 "repeat is dropped as skipped=\"combo_tried\"): "
+                 + ("; ".join(f"{{{t}}}" for t in tried) if tried else "(none)"))
+    return "\n".join(lines)
+
+
+def _allowed_lines(history: list[dict], *, prescreen: dict | None, dead: list[str],
+                   folded: list[str], carried: list[str]) -> list[str]:
+    """What may be proposed this round — what is blocked (tiling fold, folded
+    axes, exhausted material, carried candidates) and which values are
+    prescreened. Disabled axes are already stated by the axis list (axes_doc)."""
+    lines = list(folded)
+    if dead:
+        lines.append(DEAD_BLOCK.strip("\n").format(dead="\n".join(dead)))
+    lost = [r for r in axis_ledger(history).values() if r.prescreened]
+    if lost:
+        ev = "; ".join(
+            f"{value_label(r.key)} (round {r.evidence['round']} {r.evidence['id']}: fit_dev "
+            f"delta {r.evidence['delta']:+.4f}, ub {r.evidence['ub']:+.4f})"
+            for r in lost if r.evidence)
+        p = prescreen or {}
+        if p.get("on", True):
+            where = (f"{p['n_images']} of {p['of']} fit_dev images" if p.get("of")
+                     else "a fixed subset of fit_dev")
+            lines.append(
+                f"- Prescreened values (clearly lost under this champion): {ev}. A "
+                f"candidate containing one is first screened on {where} and dropped as "
+                "skipped=\"lost_value_prescreen\" unless the upper bound of "
+                "(candidate - champion) fit_dev micro F is >= 0 there. Say in "
+                "\"differs\" what is different this time.")
+        else:
+            lines.append(f"- Clearly lost under this champion (not prescreened on "
+                         f"this run): {ev}.")
+    if carried:
+        lines.append(CARRY_BLOCK.strip("\n").format(
+            carried="\n".join(f"- {x}" for x in carried)))
+    return lines or ["- No blocked axes or prescreened values right now."]
+
+
+def _older_lines(history: list[dict], window: int) -> list[str]:
+    """Rounds outside the detailed window — one line per round (the adopted
+    increment and Δ, or no adoption and the number of candidates)."""
+    end = max(len(history) - window, 0) if window > 0 else len(history)
+    lines = []
+    for i in range(end):
+        e = history[i]
+        d = e.get("decision") or {}
+        ch = e.get("champion") or {}
+        cands = [c for c in e.get("candidates", [])]
+        if e.get("round", 0) == 0 or d.get("kind") == "baseline":
+            lines.append(f"R{e.get('round', 0)}: baseline, held-out micro F "
+                         f"{ch.get('micro_f_beta', 0.0):.4f}")
+            continue
+        evaluated = d.get("evaluated") or {}
+        start = ((history[i - 1].get("champion") or {}).get("axes") if i > 0
+                 else None) or ch.get("axes") or {}
+        if d.get("adopted"):
+            row = next((c for c in cands if c.get("id") == d.get("id")), {})
+            delta = _delta_axes(row.get("requested_axes") or row.get("axes"), start)
+            g = (evaluated.get(d.get("id")) or {}).get("gate") or {}
+            lines.append(
+                f"R{e['round']}: adopted {d.get('id')} ("
+                + (", ".join(f"{k}={v}" for k, v in sorted(delta.items())) or "-")
+                + f") -> held-out micro F {ch.get('micro_f_beta', 0.0):.4f}"
+                + (f", gate delta {g['delta']:+.4f}" if g.get("delta") is not None else "")
+                + f"; {len({c.get('id') for c in cands})} candidates")
+        else:
+            gates = [(v.get("gate") or {}).get("delta") for v in evaluated.values()]
+            gates = [x for x in gates if x is not None]
+            lines.append(f"R{e['round']}: no adoption; "
+                         f"{len({c.get('id') for c in cands})} candidates, "
+                         f"{len(evaluated)} evaluated"
+                         + (f" (best gate delta {max(gates):+.4f})" if gates else ""))
+    return lines[-MAX_OLDER_LINES:]
+
+
 PROMPT = """A zero-shot detector is being adapted to one dataset by searching
 inference settings. **Objective: maximize micro F(beta) on a held-out
-validation split (the holdout; fields and keys named "test" below refer to
-it).** Each candidate toggles axes from the current champion:
+validation split (the holdout; fields and keys named "test" refer to it).**
+Each candidate changes axes of the current champion:
 {axes_doc}
 
 Rules:
@@ -585,102 +790,104 @@ Rules:
   gains cleanly). List only the axes you change: omitted axes keep the
   champion's value; to turn an axis off, set it to false explicitly.
   "visual_negatives" requires exemplar != "none".
-- Materials are mined from the train split only; adoption is decided by a
-  held-out gate afterwards — propose boldly, the gate filters.
-- The gate adopts only if a paired-bootstrap LOWER BOUND on the holdout delta
-  clears a margin AND the delta is positive. A candidate can therefore score
-  higher on the holdout and still be rejected for being within noise: gate_delta > 0
-  with gate_ci_lo < 0 means "close, but unproven" — a variant of that direction
-  is often worth one more try, while a clearly negative gate_delta is not.
+- Materials are mined from the train split only. Each candidate is screened on
+  fit_dev (a slice of train) and only the best go to the held-out gate. The
+  gate adopts only if a paired-bootstrap LOWER BOUND on the holdout delta
+  clears a margin AND the delta is positive, so a candidate can score higher
+  on the holdout and still be rejected as noise: gate_delta > 0 with
+  gate_ci_lo < 0 means "close, but unproven"; a clearly negative gate_delta is
+  not worth repeating.
+- fit_dev_cmp compares a candidate with the champion on fit_dev: delta =
+  (candidate - champion) micro F, ub = its paired-bootstrap upper bound. ub < 0
+  means it clearly lost on fit_dev; ub >= 0 is a near miss (lost within noise,
+  or won). A value whose single-increment candidate clearly lost under this
+  champion is "clearly-lost": its variants (another k, or the value combined
+  with other axes) are not blocked but prescreened (see Allowed moves), so
+  propose one only with a concrete reason it should behave differently.
 - "tiling" is a grid g: every image is also cut into g x g tiles and each tile
   is detected at magnification (g-1)(1-overlap)+1 (1.5x at g=2, 2x at g=3 with
   overlap 0.5). Cost: 1 + g^2 detector passes per image (5 at g=2, 10 at g=3,
-  17 at g=4, 26 at g=5, 37 at g=6) — each step up costs much more than the
-  last. Pick the first grid from the missed-small sizes below: the grid whose
-  magnification brings the typical missed object to a detectable size, no
-  larger. Raising g further is worth it only when the previous grid was used
-  and helped (tiling_used=true and its fit_dev score beat the champion's)
-  while small-object misses remain. tiling_f compares the mean per-class
-  fit_dev F of the best tiled vs untiled config. A row with tiling_used=false
-  means the screen preferred no tiling at that grid (the setting fell back to
-  no tiling): fold the axis — a larger grid costs more and rarely helps. The
-  loop enforces the fold: under the current champion, a grid at or above an
-  unused one is dropped as skipped="tiling_blocked" without being screened. A
-  note starting "prescreen" means the grid was first screened on a subset of
-  fit_dev and not used there, so the full screen was skipped.
-  tiling_f.gap_ub is a paired-bootstrap upper bound on (tiled - untiled) over
-  the fit_dev images it was screened on; gap_ub >= 0 means the loss is within
-  noise. One exception to the fold: when the unused grid g was such a near
-  miss AND fell short on magnification (its magnified missed-small median
+  17 at g=4, 26 at g=5, 37 at g=6). Pick the first grid from the missed-small
+  sizes below: the grid whose magnification brings the typical missed object
+  to a detectable size, no larger. Raising g further is worth it only when the
+  previous grid was used and helped (tiling_used=true and its fit_dev score
+  beat the champion's) while small-object misses remain. tiling_f compares the
+  mean per-class fit_dev F of the best tiled vs untiled config;
+  tiling_f.gap_ub is a paired-bootstrap upper bound on (tiled - untiled),
+  gap_ub >= 0 meaning the loss is within noise. tiling_used=false means the
+  screen preferred no tiling at that grid: fold the axis. The loop enforces
+  the fold: under the current champion, a grid at or above an unused one is
+  dropped as skipped="tiling_blocked" without being screened. A note starting
+  "prescreen" means a candidate was first screened on a subset of fit_dev and
+  dropped there. One exception to the fold: when the unused grid g was such a
+  near miss AND fell short on magnification (its magnified missed-small median
   stayed below the smallest objects the champion already detects, while g+1
   reaches them), grid g+1 is unblocked exactly once under the current
-  champion — the fold-status lines below say when. It is an option, not a
-  request; grids above g+1 stay blocked, and after g+1 is screened the fold at
-  g holds.
-- A row with unused_axes lists axes the candidate had on that the screened
-  setting did not use (exemplar: the text pass beat the semantic pass for every
-  class; visual_negatives: no semantic class kept a negative config). Other
-  variants of such an axis (another k, fn_arm) rarely change the setting
-  while that stays true. A row's modality counts the classes where the text
-  pass beat the semantic (exemplar) pass on fit_dev F (text_won) and the
-  rest (semantic_won); closest_text_margin is the smallest F gap among the
-  classes text won. A small margin means another exemplar_k or fn_arm may
-  flip a class to semantic; a large one means exemplar variants are unlikely
-  to win.
+  champion — Allowed moves says when.
+- unused_axes lists axes a candidate had on that the screened setting did not
+  use (exemplar: the text pass beat the semantic pass for every class;
+  visual_negatives: no semantic class kept a negative config); other variants
+  of such an axis rarely change the setting while that stays true. A row's
+  modality counts the classes where the text pass beat the semantic (exemplar)
+  pass on fit_dev F (text_won) and the rest (semantic_won);
+  closest_text_margin is the smallest F gap among the classes text won — small
+  means another exemplar_k or fn_arm may flip a class, large means exemplar
+  variants are unlikely to win.
 - A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
-  the screen picked for semantic classes) and neg_eta_grid (the thresholds it
-  tried). Lower means stronger suppression. Picks at the low end of the grid
-  mean negatives are pulling hard, so more negatives (raise visual_negative_k)
-  may help; picks at the high end mean they barely help, so fold the axis
+  the screen picked; lower means stronger suppression) and neg_eta_grid (the
+  thresholds tried): picks at the low end of the grid mean more negatives
+  (raise visual_negative_k) may help; picks at the high end mean fold the axis
   rather than raising k.
 - Once "lora" or "crop_classifier" is on in the champion, keep it on: they are
-  detector state (weights / classifier artifact) that stays loaded while
-  other candidates are measured, so a candidate turning one off is rejected as
+  detector state, so a candidate turning one off is rejected as
   skipped="detector_state_off" without evaluation.
+- skipped="combo_tried": that exact combination was already tried — never
+  repeat it verbatim. skipped="carried_duplicate": it repeated a re-queued
+  candidate (handled by the carry_<id> row). skipped="same_setting": the
+  screened setting served exactly what the champion or an evaluated candidate
+  serves; its material field shows what (e.g. text negatives that a larger k
+  refined to the same phrases) — another value of that axis will likely
+  collapse the same way.
 - If nothing promising remains, return stop=true with no candidates.
-- History rows may carry test_micro_f_beta / gate_delta / gate_ci_lo (how close
-  a rejected candidate came) and a skip note. skipped="combo_tried" means that
-  exact axes combination was already tried — never repeat it verbatim; vary it
-  or move on. skipped="carried_duplicate" means it repeated a re-queued
-  candidate; that combination is handled by the carry_<id> row instead.
-  skipped="same_setting" means the screened setting served exactly the same
-  thing as the champion or an already-evaluated candidate; its material field
-  shows what was served (e.g. text negatives that a larger k refined down to
-  the same phrases) — another value of that axis will likely collapse the same
-  way.
 
-Current champion axes (only axes that are ON are listed; an empty object means
-the baseline — every axis at its safe point):
+## Budget
+{budget}
+
+## Current champion
 {champion}
 
-Round history (adopted/rejected candidates and the holdout micro F(beta) trajectory):
+## Axis ledger under the current champion
+{ledger}
+
+## Allowed moves this round
+{allowed}
+
+## Round history
+Recent rounds in detail (axes_delta is the change from the champion at the
+start of that round; test_micro_f_beta / gate_delta / gate_ci_lo are holdout
+results; expected_gain is what the planner predicted):
 {history}
-
-Already tried — these exact axes combinations are permanently blocked, listed
-as their difference from the current champion. Proposing one again wastes a
-candidate slot:
-{tried}
-
-Error diagnosis. "train" carries individual error samples; "test" (the
-holdout) is aggregate-only — read its stats as evidence that a problem also holds outside
-the split the materials come from. In a sample, "wh" is the box size in pixels
-and "note" is a vision model's one-line observation of that error's crop —
-diagnostic evidence, not ground truth.
-
-**Samples are a coverage selection, not a random draw**: they round-robin over
-error kinds and classes, most severe first, capped per kind. Their mix therefore
-does NOT reflect how frequent each kind is — read frequency from "summary" and
-"per_class" only, and read the samples for what the errors look like.
+{older}
+## Diagnosis digest
+Error kinds this round (train + holdout) and the axes that can address them.
+HEURISTIC hints, not rules: a count says how much is at stake if the axis
+works, not that it will — weigh it against per-class counts and the samples.
+{digest}
+{small_block}
+Error detail. "train" carries individual error samples; "test" (the holdout)
+is aggregate-only. In a sample, "wh" is the box size in pixels and "note" is a
+vision model's one-line observation of the crop — evidence, not ground truth.
+**Samples are a coverage selection, not a random draw** (round-robin over
+kinds and classes, most severe first): read frequency from the digest and
+"per_class" only, and the samples for what the errors look like.
 {diagnosis}
-
-Axis leverage this round — for each axis, the observed errors it could plausibly
-address and their counts (train + holdout combined). These are HEURISTIC search hints, not rules: the count
-says how much is at stake if the axis works, not that it will. Weigh them
-against the diagnosis above (aggregate counts, then per-class, then the
-individual samples and their notes) rather than picking the largest number.
-{leverage}
-{small_block}{dead_block}{fold_block}{cost_block}{carry_block}{notes_block}
-Propose up to {max_candidates} candidates."""
+{notes_block}
+## Response
+Propose up to {max_candidates} candidates. For each give "axes" (only the
+changes), "expected_gain" (your estimate of the holdout micro F delta over
+the champion, e.g. 0.01), "cost_min" (expected minutes, from the budget),
+"differs" (for a candidate containing a clearly-lost value: what is different
+this time; otherwise "") and a short "rationale"."""
 
 # Inserted only when train has missed_small — evidence for the first tiling grid.
 SMALL_BLOCK = """
@@ -690,7 +897,7 @@ median {p50} px, p75 {p75} px. After tiling magnification (overlap {overlap}):
 {grids}
 """
 
-# Inserted only when some axis had empty material — otherwise omitted.
+# Carried in the allowed moves only when some axis had empty material.
 DEAD_BLOCK = """
 Axes whose mined material came out empty, or too small to train on, on this
 dataset (the candidate was rejected without evaluation, so it cost a slot for
@@ -699,27 +906,7 @@ different source value, or after the champion has changed:
 {dead}
 """
 
-# Inserted only when an axis went unused repeatedly under the current champion
-# — otherwise omitted.
-FOLD_BLOCK = """
-Axes folded under the current champion — the screen had them on but the chosen
-setting did not use them, repeatedly (or, for tiling, at a grid the loop now
-blocks). Other values of these axes are unlikely to change the setting; spend
-slots elsewhere until the champion changes:
-{folded}
-"""
-
-# Inserted only once candidate wall clocks (wall_min) are recorded — otherwise
-# omitted.
-COST_BLOCK = """
-Observed wall-clock cost per candidate in this run (materialize + fit_dev
-screen + held-out eval, minutes), grouped by the axes a candidate changed from
-the champion of its round. The run's time budget is shared by every candidate
-— weigh the expected gain of an expensive axis value against what it has cost:
-{costs}
-"""
-
-# Inserted only when some candidate is carried over — otherwise omitted.
+# Carried in the allowed moves only when some candidate is carried over.
 CARRY_BLOCK = """
 Re-queued automatically this round — each passed the gate last round but lost
 to the adopted candidate, so it is retried on top of the new champion (listed
@@ -744,9 +931,10 @@ the current champion, then why it was dropped):
 Propose up to {k} new candidates that differ from all of the above and from the
 already-tried combinations, under the same rules, in the same JSON format. Avoid
 the same failure: a folded tiling grid is blocked, an axis the screen left unused
-stays unused for other values of it, and a quantity whose material collapsed to
-the same setting collapses again. If nothing promising remains, return stop=true
-with no candidates."""
+stays unused for other values of it, a quantity whose material collapsed to
+the same setting collapses again, and a variant of a clearly-lost value that the
+prescreen dropped (lost_value_prescreen) needs a real difference to pass. If
+nothing promising remains, return stop=true with no candidates."""
 
 MAX_REASK_LINES = 24     # cap on candidate lines in the re-ask message
 
@@ -789,7 +977,8 @@ class LLMPlanner:
                  notes: str = "", token_budget: int = DEFAULT_TOKEN_BUDGET,
                  disabled_axes=(), disabled_values=None,
                  facts: DatasetFacts | None = None, tiling_overlap: float = 0.5,
-                 tiling_tp_quantile: float = 0.1, tiling_tp_min: int = 20):
+                 tiling_tp_quantile: float = 0.1, tiling_tp_min: int = 20,
+                 budget: dict | None = None, prescreen: dict | None = None):
         self.chat = chat
         self.tiling_overlap = tiling_overlap   # search.tiling_overlap — magnification
         # search.tiling_tp_quantile and tiling_tp_min — the s* line of the
@@ -807,6 +996,11 @@ class LLMPlanner:
         # lora whose training would be skipped) are left out of the prompt and
         # filtered from the response — None means the full value space
         self.facts = facts
+        # The budget card (rounds left and stop counters — counted by the runner)
+        # and the lost-value prescreen settings (on, subset size). Without them
+        # only those lines are left out
+        self.budget = budget
+        self.prescreen = prescreen
 
     def _refill(self, build, raw, dups, candidates, champion, carried_keys,
                 dropped, carried_ids) -> dict:
@@ -902,48 +1096,51 @@ class LLMPlanner:
             f"{k}={x!r}" for k, xs in sorted(self.disabled_values.items())
             for x in xs]
         compact = _compact_diagnosis(diagnosis)
+        # Counts per cause are carried by the digest — dropped from the JSON so
+        # they are not carried twice
+        for d in compact.values():
+            if isinstance(d, dict):
+                d.pop("summary", None)
         diag_full = json.dumps(compact, ensure_ascii=False, default=str)
-        tried_lines = _tried_lines(history, champion)
-        leverage_lines = [
-            ln for ln in _leverage_lines(diagnosis)
-            if not any(ln.startswith(f"- {a}:") for a in self.disabled_axes)]
-        dead_lines = _dead_axis_lines(history)
-        cost_lines = _cost_lines(history)
-        fold_lines = _folded_axis_lines(history)
+        digest = _digest_lines(diagnosis, self.disabled_axes)
         carried = deterministic.carryover(history, self.disabled_axes,
                                           self.disabled_values, facts=self.facts)
         carry_lines = [", ".join(f"{k}={v}" for k, v in
                                  sorted(_delta_axes(c["axes"], champion).items()))
                        for c in carried]
+        allowed = _allowed_lines(history, prescreen=self.prescreen,
+                                 dead=_dead_axis_lines(history),
+                                 folded=_folded_axis_lines(history),
+                                 carried=carry_lines)
+        budget = _budget_lines(self.budget, history, self.disabled_axes)
+        champion_text = _champion_block(history)
+        ledger = _ledger_block(history)
+        small = _small_block(diagnosis, self.tiling_overlap,
+                             tp_quantile=self.tiling_tp_quantile,
+                             tp_min=self.tiling_tp_min)
+        if banned:
+            axes_doc += "\n" + DISABLED_BLOCK.strip("\n").format(
+                disabled=", ".join(banned))
 
         def build(window: int, strip: bool = False) -> list[dict]:
             diag_json = (json.dumps(_strip_samples(compact), ensure_ascii=False,
                                     default=str) if strip else diag_full)
+            older = _older_lines(history, window)
             return [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": PROMPT.format(
                     axes_doc=axes_doc,
-                    champion=json.dumps(_on_axes(champion), ensure_ascii=False),
+                    budget="\n".join(budget) or "- (no budget information)",
+                    champion=champion_text,
+                    ledger=ledger,
+                    allowed="\n".join(allowed),
                     history=json.dumps(_compact_history(history, window),
                                        ensure_ascii=False, default=str),
-                    tried="\n".join(f"- {x}" for x in tried_lines) or "- (none)",
+                    older=("Earlier rounds, one line each:\n" + "\n".join(older) + "\n"
+                           if older else ""),
+                    digest="\n".join(digest) or "- (no errors observed)",
+                    small_block=small,
                     diagnosis=diag_json,
-                    leverage="\n".join(leverage_lines) or "- (no errors observed)",
-                    small_block=_small_block(diagnosis, self.tiling_overlap,
-                                             tp_quantile=self.tiling_tp_quantile,
-                                             tp_min=self.tiling_tp_min),
-                    fold_block=(FOLD_BLOCK.format(folded="\n".join(fold_lines))
-                                if fold_lines else ""),
-                    cost_block=(COST_BLOCK.format(costs="\n".join(cost_lines))
-                                if cost_lines else ""),
-                    dead_block=(
-                        (DISABLED_BLOCK.format(disabled=", ".join(banned))
-                         if banned else "")
-                        + (DEAD_BLOCK.format(
-                            dead="\n".join(dead_lines)) if dead_lines else "")),
-                    carry_block=(CARRY_BLOCK.format(
-                        carried="\n".join(f"- {x}" for x in carry_lines))
-                        if carry_lines else ""),
                     notes_block=(NOTES_BLOCK.format(notes=self.notes)
                                  if self.notes else ""),
                     max_candidates=self.max_candidates)},

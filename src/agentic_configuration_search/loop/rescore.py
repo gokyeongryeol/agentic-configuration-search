@@ -20,6 +20,7 @@ from pathlib import Path
 from ..core import metrics
 from ..core.metrics import per_image_records
 from ..eval.runner import chosen_groups, infer_for_groups
+from ..eval.screen import count_rows
 from ..fitting.materials import Materials
 from ..fitting.rescorer import _apply_rescorer, fit_rescorer
 
@@ -145,9 +146,19 @@ def rescored_screen(cfg, ds, setting: dict, rescorer, dev_preds: dict) -> dict:
     screen's — that screen is why the tile config was picked. Dropping it would
     lose tiling_f from the history row of an adopted tiling+rescorer candidate."""
     out = rescored_split_score(cfg, ds, setting, rescorer, dev_preds, ds.fit_dev)
+    # fit_dev_counts is the rescored (served) channel, and the pre-rescorer channel
+    # is kept as _raw — the lost-value prescreen of a candidate inheriting the
+    # rescorer compares pre-rescorer channels **before** the refit
+    # (loop.runner._prescreen)
+    raw = setting.get("fit_dev_counts_raw") or setting.get("fit_dev_counts")
+    counts = ({"fit_dev_counts": count_rows(out["records"],
+                                            [c.id for c in ds.ontology.classes],
+                                            cfg.detector.iou_threshold)}
+              if out.get("records") is not None else {})
     return {"configs": setting["configs"], "per_class": out["per_class"],
             "fit_dev_micro_f_beta": out["micro_f_beta"],
             "modality_diagnostic": setting.get("modality_diagnostic", {})} \
+        | counts | ({"fit_dev_counts_raw": raw} if raw is not None else {}) \
         | ({"tiling_f": setting["tiling_f"]} if setting.get("tiling_f") else {})
 
 

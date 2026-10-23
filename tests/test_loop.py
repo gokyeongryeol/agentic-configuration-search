@@ -650,7 +650,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
     from agentic_configuration_search.loop.runner import _relabel_unused as _relabel_untiled, _tiling_record
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.deterministic import tried_combos
-    from agentic_configuration_search.planner.llm import _tried_lines
+    from agentic_configuration_search.planner.ledger import tried_under_champion
 
     setting = {"configs": [{"config_id": 0, "tiling": None},
                            {"config_id": 1, "tiling": {"grid": 2}}],
@@ -666,7 +666,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
              "candidates": [{"id": "x", "axes": entry["axes"],
                              "requested_axes": entry["requested_axes"]}]}]
     assert tuple(sorted(entry["requested_axes"].items())) in tried_combos(hist)
-    assert any("tiling=2" in l for l in _tried_lines(hist, validate_axes({})))
+    assert any("tiling=2" in l for l in tried_under_champion(hist))
 
 
 # --- forwards per image ---------------------------------------------------

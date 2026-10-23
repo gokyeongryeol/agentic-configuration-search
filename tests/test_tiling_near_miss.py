@@ -97,6 +97,21 @@ def test_blocked_g_plus_1_attempt_does_not_consume():
     assert _gate(hist).open_grid == 3
 
 
+def test_lost_value_prescreen_of_g_plus_1_consumes_the_exception():
+    """A g+1 rejected by the lost-value prescreen also reached the (subset)
+    screen — that screen's tiling_used stays on the row and the exception is
+    spent."""
+    lost = _row("t3n", 3, used=True, skipped="lost_value_prescreen",
+                alias="vlm")
+    lost["prescreen"] = {"n_images": 20, "of": 80, "lost_values": ["alias=vlm"]}
+    hist = [_entry(0, 0, []),
+            _entry(1, 0, [_unused("t2", 2)]),
+            _entry(2, 0, [lost])]
+    gate = _gate(hist)
+    assert gate.folded_at == 2 and gate.open_grid is None
+    assert _blocked(gate, 3)
+
+
 def test_exception_resets_when_champion_changes():
     hist = [_entry(0, 0, []),
             _entry(1, 0, [_unused("t2", 2)]),

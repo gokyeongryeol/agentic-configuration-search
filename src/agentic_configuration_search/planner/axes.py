@@ -193,6 +193,32 @@ def merge_onto(base: dict, delta: dict) -> dict:
     return out
 
 
+PLAN_DIFFERS_MAX = 300      # plan.differs length cap — the same as the response schema's maxLength
+
+
+def _plan_fields(c: dict) -> dict:
+    """The planner's expected gain, cost and variant note — trimmed and kept if
+    present; a missing or malformed field is just left out. The candidate is
+    not dropped nor sent to the deterministic fallback (this is extra
+    information on the proposal, not used for any decision).
+
+    expected_gain: expected holdout micro F(β) Δ — [-1, 1]. cost_min: expected
+    wall clock (minutes) — 0 or more. differs: if a variant of a clearly-lost
+    value, what is different this time."""
+    out = {}
+    for key, lo, hi in (("expected_gain", -1.0, 1.0), ("cost_min", 0.0, 1e5)):
+        try:
+            v = float(c.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v == v and lo <= v <= hi:          # excludes NaN
+            out[key] = round(v, 4)
+    differs = c.get("differs")
+    if isinstance(differs, str) and differs.strip():
+        out["differs"] = differs.strip()[:PLAN_DIFFERS_MAX]
+    return out
+
+
 def sanitize_candidates(raw, *, max_candidates: int,
                         dropped: list | None = None,
                         disabled_axes=(), disabled_values=None,
@@ -269,6 +295,8 @@ def sanitize_candidates(raw, *, max_candidates: int,
                   axes)
             continue
         seen.add(key)
+        plan = _plan_fields(c)
         out.append({"id": str(c.get("id") or f"cand_{i}"), "axes": axes,
-                    "rationale": str(c.get("rationale", ""))})
+                    "rationale": str(c.get("rationale", ""))}
+                   | ({"plan": plan} if plan else {}))
     return out

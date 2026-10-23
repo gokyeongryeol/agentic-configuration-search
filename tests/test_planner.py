@@ -174,7 +174,7 @@ def test_prompt_omits_image_identifiers_and_merges_crop_notes(tmp_path):
     assert '"image"' not in prompt                               # no identifier at all
 
     diag = json.loads(prompt.split("what the errors look like.\n", 1)[1]
-                      .split("\n\nAxis leverage this round", 1)[0])["train"]
+                      .split("\n\n## Response", 1)[0])["train"]
     assert all("image" not in r for r in diag["fp_sample"])
     # descriptions are folded into the same detection's sample, so no separate crop_notes remain
     bg = next(r for r in diag["fp_sample"] if r["kind"] == "background")
@@ -202,27 +202,41 @@ def test_samples_carry_class_name_not_id():
     assert c["summary"]["fp"] == {"background": 1}
 
 
-def test_leverage_block_is_computed_per_round():
-    """Replaces the static "cause -> axis" table: each axis gets the error count it addresses this
-    round, listed in descending order. Axis names come from the canonical REMEDY."""
+def test_digest_maps_error_kinds_to_axes_per_round():
+    """Replaces the static "cause -> axis" table: one line per cause with this
+    round's count (train and holdout separately) and the axes that target it,
+    most first. Axis names come from the canonical REMEDY, and counts are not
+    repeated per axis."""
     from agentic_configuration_search.planner.axes import AXES
-    from agentic_configuration_search.planner.llm import _leverage_lines
+    from agentic_configuration_search.planner.llm import _digest_lines
 
     diag = {"train": {"summary": {"fn": {"below_threshold": 80, "missed": 2},
                                   "fp": {"class_confusion": 40}}},
             "test": {"summary": {"fn": {"below_threshold": 20}, "fp": {}}}}
-    lines = _leverage_lines(diag)
-    axes = [l.split(":")[0][2:] for l in lines]
-    assert axes == sorted(set(axes), key=axes.index)          # no duplicates
-    assert all(a in AXES for a in axes)                       # no phantom axes
-    # sorted by count descending — axes covering several causes come first
-    totals = [int(l.rsplit("(total ", 1)[1].rstrip(")")) for l in lines]
-    assert totals == sorted(totals, reverse=True)
-    rescorer = next(l for l in lines if l.startswith("- rescorer:"))
-    assert "below_threshold 100" in rescorer      # train 80 + holdout ("test" key, legacy name) 20 summed
+    lines = _digest_lines(diag)
+    kinds = [l[2:].split(":")[0] for l in lines]
+    assert kinds == ["below_threshold", "class_confusion", "missed"]   # most first
+    bt = lines[0]
+    assert "below_threshold: 100 (train 80, held-out 20)" in bt    # sum and split
+    axes = [a.strip() for a in bt.split("->")[1].split(",")]
+    assert axes and all(a in AXES for a in axes)                  # no phantom axes
+    assert "rescorer" in axes
     # axes dedicated to unobserved causes are omitted (tiling <- missed_small)
-    assert "tiling" not in axes
-    assert _leverage_lines({}) == []
+    assert not any("tiling" in l for l in lines)
+    assert _digest_lines({}) == []
+    # disabled axes are left out — they cannot be proposed
+    assert "rescorer" not in _digest_lines(diag, disabled=("rescorer",))[0]
+
+
+def test_digest_counts_background_for_crop_classifier_and_unaddressable_kinds():
+    from agentic_configuration_search.planner.llm import _digest_lines
+
+    lines = _digest_lines({"train": {"summary": {"fp": {"background": 7,
+                                                        "duplicate": 3}}}})
+    bg = next(l for l in lines if l.startswith("- background:"))
+    assert "background: 7 (train 7)" in bg and "crop_classifier" in bg
+    dup = next(l for l in lines if l.startswith("- duplicate:"))
+    assert "no axis" in dup
 
 
 def test_dead_axes_survive_the_history_window(tmp_path):
@@ -318,14 +332,6 @@ def test_background_proposes_crop_classifier():
     assert any(c["axes"]["crop_classifier"] for c in out["candidates"])
 
 
-def test_leverage_counts_background_for_crop_classifier():
-    from agentic_configuration_search.planner.llm import _leverage_lines
-
-    lines = _leverage_lines({"train": {"summary": {"fp": {"background": 7}}}})
-    cc = next(l for l in lines if l.startswith("- crop_classifier:"))
-    assert "background 7" in cc
-
-
 # ------------------------------------------------------- llm dataset notes
 
 def test_llm_prompt_includes_dataset_notes(tmp_path):
@@ -354,9 +360,11 @@ def test_llm_prompt_without_notes_is_byte_identical(tmp_path):
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], {})
     assert "Dataset notes" not in seen["prompt"]
-    # junction between the hint block and the closing sentence — no empty block in between
-    assert "picking the largest number.\n- (no errors observed)\n\nPropose up to" \
+    # junction between the diagnosis digest and the response section — no empty
+    # block in between
+    assert "and the samples.\n- (no errors observed)\n\nError detail." \
         in seen["prompt"]
+    assert "\n{}\n\n## Response\nPropose up to" in seen["prompt"]
 
 
 def test_llm_notes_recorded_in_replay_artifact(tmp_path):
@@ -520,26 +528,31 @@ def test_alias_captioner_axis():
 
 
 def test_prompt_lists_tried_combinations(tmp_path):
-    """Already-tried combos are packed compactly into the prompt — if the planner forgets combos
-    outside the MAX_HISTORY window and re-proposes them, the runner filter silently drops them and
-    only burns candidate budget. They are written as increments over the champion to stay short."""
-    from agentic_configuration_search.planner.llm import LLMPlanner, _tried_lines
+    """Tried combos go into the prompt as increments over the champion — if the
+    planner forgets one and re-proposes it, the runner filter drops it and only
+    burns candidate budget. All combos under the current champion are carried;
+    earlier ones only if they do not turn off a champion axis (those are rarely
+    proposed again and are noise — the filter still blocks them all)."""
+    from agentic_configuration_search.planner.ledger import tried_under_champion
+    from agentic_configuration_search.planner.llm import LLMPlanner
 
     champ = validate_axes({**BASELINE, "rescorer": True})
     history = [
-        {"round": 1, "champion": {"axes": dict(BASELINE), "micro_f_beta": 0.5},
-         "candidates": [{"id": "a", "axes": validate_axes({"rescorer": True})},
-                        {"id": "b", "axes": validate_axes({"tiling": 2})}],
+        {"round": 0, "champion": {"axes": dict(BASELINE), "round": 0,
+                                  "micro_f_beta": 0.4}, "candidates": []},
+        {"round": 1, "champion": {"axes": champ, "round": 1, "micro_f_beta": 0.5},
+         "candidates": [{"id": "a", "axes": champ, "adopted": True},
+                        {"id": "b", "axes": validate_axes({"tiling": 2})},
+                        {"id": "t", "axes": validate_axes({"text_negatives":
+                                                           "fp_crop"})}],
          "decision": {"adopted": True, "id": "a"}},
-        {"round": 2, "champion": {"axes": champ, "micro_f_beta": 0.6},
+        {"round": 2, "champion": {"axes": champ, "round": 1, "micro_f_beta": 0.5},
          "candidates": [{"id": "c", "axes": validate_axes(
              {"rescorer": True, "alias": "vlm"})}],
          "decision": {"adopted": False}},
     ]
-    lines = _tried_lines(history, champ)
-    joined = " ".join(lines)
-    assert "tiling=2" in joined and "alias=vlm" in joined
-    assert "baseline" in joined or "rescorer" in joined
+    lines = tried_under_champion(history)
+    assert lines == ["alias=vlm"]           # the two old combos turn rescorer off
     assert all(len(l) < 200 for l in lines)
 
     seen = {}
@@ -549,7 +562,7 @@ def test_prompt_lists_tried_combinations(tmp_path):
         return {"candidates": [], "stop": True}
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history, {})
-    assert "Already tried" in seen["p"] and "alias=vlm" in seen["p"]
+    assert "Combos already tried" in seen["p"] and "{alias=vlm}" in seen["p"]
 
 
 def test_sanitize_records_invalid_axes_instead_of_dropping_silently():
@@ -1007,8 +1020,12 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
     assert props["id"]["maxLength"] <= 80
     # the longest response the schema allows fits under the cap — at 2.0
     # chars/token (more conservative than the measured minimum of 2.68), with
-    # 600 characters per candidate for axes (12 enumerated keys)
-    worst = 3 * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"] + 600)
+    # 600 characters per candidate for axes (12 enumerated keys) and 100 for
+    # the two number fields (expected_gain, cost_min) and key names. differs is
+    # the longest string field, so it is counted too
+    assert props["differs"]["maxLength"] <= 300
+    worst = 3 * (L.RATIONALE_MAX_CHARS + props["id"]["maxLength"]
+                 + props["differs"]["maxLength"] + 600 + 100)
     assert worst / 2.0 < L.OUTPUT_MAX_TOKENS
 
 

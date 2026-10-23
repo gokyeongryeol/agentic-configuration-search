@@ -36,7 +36,7 @@ from ..diagnose import describe, residual
 from ..diagnose.errors import diagnose, size_profile
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
-from ..eval.screen import screen_candidate
+from ..eval.screen import fit_dev_gap, screen_candidate
 from ..fitting.materials import Materials
 from ..infer import gateway
 from ..planner import deterministic
@@ -44,6 +44,7 @@ from ..planner.deterministic import tried_combos
 from ..planner.gates import tiling_gate, tiling_shortfall
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
+from ..planner.ledger import lost_values, variant_of
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
 
@@ -85,14 +86,22 @@ def _write(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
 
+# Per-image fit_dev (tp, fp, fn) saved with champion.json — the baseline for the
+# next round's fit_dev comparison (fit_dev_cmp) and the lost-value prescreen. They
+# must be saved with the champion for resume to reach the same verdict
+_COUNT_KEYS = ("fit_dev_counts", "fit_dev_counts_raw")
+
+
 def _setting_lite(setting: dict) -> dict:
     return {"configs": setting["configs"],
-            "per_class": {str(k): v for k, v in setting["per_class"].items()}}
+            "per_class": {str(k): v for k, v in setting["per_class"].items()}} \
+        | {k: setting[k] for k in _COUNT_KEYS if setting.get(k) is not None}
 
 
 def _setting_load(lite: dict) -> dict:
     return {"configs": lite["configs"],
-            "per_class": {int(k): v for k, v in lite["per_class"].items()}}
+            "per_class": {int(k): v for k, v in lite["per_class"].items()}} \
+        | {k: lite[k] for k in _COUNT_KEYS if lite.get(k) is not None}
 
 
 def _load_candidates_file(path, disabled_axes=(), disabled_values=None, *,
@@ -474,7 +483,21 @@ class Loop:
                           facts=self._facts(),
                           tiling_overlap=self.cfg.search.tiling_overlap,
                           tiling_tp_quantile=self.cfg.search.tiling_tp_quantile,
-                          tiling_tp_min=self.cfg.search.tiling_tp_min)
+                          tiling_tp_min=self.cfg.search.tiling_tp_min,
+                          budget=getattr(self, "_budget", None),
+                          prescreen=self._prescreen_info())
+
+    def _prescreen_info(self) -> dict:
+        """The lost-value prescreen settings the planner prompt's allowed moves
+        carry — the subset size (without one — small, or max_share or more — the
+        full fit_dev)."""
+        s = self.cfg.screen
+        n_all = len(self.ds.fit_dev.images)
+        sub = prescreen_subset(self.ds.fit_dev, s.prescreen_fraction,
+                               s.prescreen_min_images,
+                               max_share=s.prescreen_max_share)
+        return {"on": bool(s.lost_value_prescreen), "of": n_all,
+                "n_images": len(sub.images) if sub is not None else n_all}
 
     def _propose(self, history: list[dict], diagnosis: dict,
                  round_dir: Path) -> dict:
@@ -524,7 +547,7 @@ class Loop:
             return None
         rows = acc.skipped + [{k_: c[k_] for k_ in ("id", "axes")} | _requested(c)
                               | _unused_record(c) | _tiling_record(c)
-                              for c in acc.screened]
+                              | _ledger_record(c) for c in acc.screened]
         proposal = self._llm_planner(round_dir).reask(
             history, diagnosis, acc.skipped, k=k, taken={c["id"] for c in rows})
         if proposal is None:              # no conversation to continue (first call failed)
@@ -551,6 +574,12 @@ class Loop:
         # prompt window (MAX_HISTORY), so this filter is the only permanent barrier.
         tried = tried_combos(history)
         gate = tiling_gate(history)
+        # Values that clearly lost on fit_dev under the current champion
+        # (planner.ledger) — candidates containing one are not blocked, only marked
+        # (lost_values). Screen measures them on a subset first
+        lost = lost_values(history) if self.cfg.screen.lost_value_prescreen else {}
+        champ_axes = (history[-1].get("champion", {}).get("axes")
+                      if history else None) or BASELINE
         fresh, dropped = [], []
         for c in merged:
             # tiling fold gate (planner.gates) — screening a grid at or above an
@@ -571,6 +600,15 @@ class Loop:
                                         "blocks it permanently. Vary it or try another axis."})
                 continue
             tried.add(key)                # also collapses duplicates within one proposal
+            # Planner candidates only — human and carried candidates are left alone
+            # for the same reason as the tiling gate. A candidate newly turning on a
+            # detector-state axis trains before screening, so a subset screen has
+            # nothing to save
+            if (lost and c.get("source") not in ("human", "carryover")
+                    and _route_detector_state(c["axes"], champ_axes) == "wired"):
+                names = variant_of(c["axes"], champ_axes, lost)
+                if names:
+                    c = {**c, "lost_values": names}
             fresh.append(c)
         if dropped:
             log.info("filtered %d already-tried combinations: %s", len(dropped),
@@ -654,50 +692,120 @@ class Loop:
         if verdict is not None:
             entry["tiling_shortfall"] = verdict
 
+    def _fit_dev_cmp(self, setting: dict | None, *, raw: bool = False,
+                     split=None) -> dict | None:
+        """Delta and one-sided paired-bootstrap upper bound of (candidate −
+        champion) fit_dev micro F(β) (eval.screen.fit_dev_gap) — the history
+        row's `fit_dev_cmp`.
+
+        With raw, compare against the champion's pre-rescorer channel (the
+        prescreen of a candidate inheriting the rescorer runs before the refit).
+        If split is a subset of fit_dev, the champion rows are cut down to its
+        images. Reads fit_dev only — the champion's rows were also counted by
+        screen at fit_dev thresholds. None if there are no rows to compare."""
+        champ = (getattr(self, "_champion", None) or {}).get("setting") or {}
+        base = ((champ.get("fit_dev_counts_raw") or champ.get("fit_dev_counts"))
+                if raw else champ.get("fit_dev_counts"))
+        rows = (setting or {}).get("fit_dev_counts")
+        if not base or not rows:
+            return None
+        if split is not None:
+            index = {e.file_name: i for i, e in enumerate(self.ds.fit_dev.images)}
+            base = [base[index[e.file_name]] for e in split.images]
+        if len(base) != len(rows):
+            return None
+        g = self.cfg.gate
+        return fit_dev_gap(base, rows, beta=self.cfg.beta, n_boot=g.bootstrap,
+                           seed=self.cfg.run_seed, alpha=1.0 - g.confidence)
+
     def _prescreen(self, c: dict, axes: dict, materials: Materials, entry: dict,
                    skipped: list) -> bool:
-        """Screen a large-grid tiling candidate on a fit_dev subset first — if no
-        class uses a tile there, reject it without the full screen (True).
+        """Screen on a fit_dev subset first — True if rejected. Two cases share
+        the same subset screen.
 
-        A grid g screen costs 1+g² forwards, so from g ≥ screen.prescreen_min_grid
-        the full fit_dev is expensive. If tiles are used on the subset
-        (core.data.prescreen_subset — inside fit_dev, deterministic), the full
-        fit_dev is screened as before, so the final numbers equal those without
-        a prescreen (the pass cache reuses the subset's passes).
+        (1) Large-grid tiling: a grid g screen costs 1+g² forwards, so from g ≥
+        screen.prescreen_min_grid the full fit_dev is expensive. If no class uses
+        a tile, reject as axis_unused. Only for single increments that change
+        tiling alone — a candidate that also changes other axes is not the
+        champion even if tiles go unused. Not done without a subset (fit_dev is
+        small, or the subset is screen.prescreen_max_share of fit_dev or more).
 
-        Only for single increments that change tiling alone — a candidate that
-        also changes other axes is not the champion even if tiles go unused, so
-        it cannot be rejected."""
+        (2) Lost value: a candidate containing a value that clearly lost on
+        fit_dev under the current champion (lost_values, set by _filter). If the
+        bootstrap upper bound of (candidate − champion) micro F(β) is below 0,
+        reject as lost_value_prescreen — no point-estimate win is required (the
+        same bar as a near miss). Without a subset (fit_dev is small, or the
+        subset is screen.prescreen_max_share or more) it is measured on the full
+        fit_dev — that still saves the rescorer refit and holdout, and if it
+        passes that screen is used as is (_full_screen). A rescorer candidate is
+        compared **before** the refit, against the champion's pre-rescorer
+        channel.
+
+        If it passes on the subset, the full fit_dev is screened as before — the
+        final numbers and adoption verdict equal those without a prescreen (the
+        pass cache reuses the subset's passes)."""
         s = self.cfg.screen
         champ = (getattr(self, "_champion", None) or {}).get("axes") or {}
         g = axes.get("tiling")
-        if not g or g < s.prescreen_min_grid or g == champ.get("tiling"):
-            return False
-        if {k for k, v in c["axes"].items() if champ.get(k) != v} != {"tiling"}:
+        tiling = bool(g and g >= s.prescreen_min_grid and g != champ.get("tiling")
+                      and {k for k, v in c["axes"].items()
+                           if champ.get(k) != v} == {"tiling"})
+        lost = list(c.get("lost_values") or ()) if s.lost_value_prescreen else []
+        if not tiling and not lost:
             return False
         sub = prescreen_subset(self.ds.fit_dev, s.prescreen_fraction,
                                s.prescreen_min_images,
                                max_share=s.prescreen_max_share)
-        if sub is None:
+        if sub is None and not lost:
             return False
         setting = self._screen(materials, axes, split=sub)
-        info = {"n_images": len(sub.images), "of": len(self.ds.fit_dev.images),
-                "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
-                "passed": _uses_tiling(setting)}
-        if setting.get("tiling_f"):
-            info["tiling_f"] = setting["tiling_f"]
+        info = {"n_images": len(sub.images) if sub is not None
+                else len(self.ds.fit_dev.images),
+                "of": len(self.ds.fit_dev.images),
+                "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"]}
+        if tiling and sub is not None:
+            info["passed"] = _uses_tiling(setting)
+            if setting.get("tiling_f"):
+                info["tiling_f"] = setting["tiling_f"]
+        cmp = None
+        if lost:
+            cmp = self._fit_dev_cmp(setting, raw=True, split=sub)
+            info["lost_values"] = lost
+            if cmp is not None:
+                info["fit_dev_cmp"] = cmp
         entry["prescreen"] = info
-        if info["passed"]:
+        if tiling and sub is not None and not info["passed"]:
+            rec = {**c, "skipped": "axis_unused", "unused_axes": ["tiling"],
+                   "tiling_used": False, "prescreen": info,
+                   "note": f"prescreen: no class picked the grid {g} tile config on "
+                           f"fit_dev {info['n_images']}/{info['of']} images — the full "
+                           "screen is skipped"}
+            if setting.get("tiling_f"):
+                rec["tiling_f"] = setting["tiling_f"]
+            if entry.get("tiling_shortfall"):
+                rec["tiling_shortfall"] = entry["tiling_shortfall"]
+        elif cmp is not None and cmp["ub"] < 0:
+            rec = {**c, "skipped": "lost_value_prescreen", "prescreen": info,
+                   "fit_dev_cmp": cmp,
+                   "note": f"prescreen: {', '.join(lost)} clearly lost on fit_dev under "
+                           f"the current champion — on fit_dev {info['n_images']}/"
+                           f"{info['of']} images (candidate − champion) micro F(β) "
+                           f"{cmp['delta']:+.4f}, upper bound {cmp['ub']:+.4f} < 0, so "
+                           "the full screen is skipped"}
+            # If tiling was requested, that grid reached the (subset) screen — record
+            # whether tiles were picked there so the fold gate spends the near-miss
+            # exception (the same convention as the axis prescreen's axis_unused row)
+            rec |= _tiling_record({**c, "setting": setting,
+                                   "tiling_shortfall": entry.get("tiling_shortfall")})
+        else:
+            if lost:
+                info["passed"] = True
+            if sub is None:
+                # Without a subset (fit_dev is small, or the subset is max_share or
+                # more) the full fit_dev was already screened — hand it over so the
+                # caller does not run the same screen again
+                entry["_full_screen"] = setting
             return False
-        rec = {**c, "skipped": "axis_unused", "unused_axes": ["tiling"],
-               "tiling_used": False, "prescreen": info,
-               "note": f"prescreen: no class picked the grid {g} tile config on "
-                       f"fit_dev {info['n_images']}/{info['of']} images — the full "
-                       "screen is skipped"}
-        if setting.get("tiling_f"):
-            rec["tiling_f"] = setting["tiling_f"]
-        if entry.get("tiling_shortfall"):
-            rec["tiling_shortfall"] = entry["tiling_shortfall"]
         log.info("candidate %s: %s", c["id"], rec["note"])
         skipped.append(rec)
         return True
@@ -727,7 +835,8 @@ class Loop:
                 return
             if self._prescreen(c, base_axes, materials, entry, skipped):
                 return
-            setting0 = self._screen(materials, base_axes)
+            setting0 = (entry.pop("_full_screen", None)
+                        or self._screen(materials, base_axes))
             # judge sameness **before** the refit — if the served state equals the
             # champion's, a sibling's or an already-evaluated candidate's, skip
             # the discriminator refit (train re-inference) and holdout altogether
@@ -754,12 +863,16 @@ class Loop:
                 return
             if self._prescreen(c, c["axes"], materials, entry, skipped):
                 return
-            setting = self._screen(materials, c["axes"])
+            setting = (entry.pop("_full_screen", None)
+                       or self._screen(materials, c["axes"]))
             if self._skip_same(c, entry, setting, materials, skipped):
                 return
         entry.update({"setting": setting,
                       "fit_dev_micro_f_beta": setting["fit_dev_micro_f_beta"],
                       "_materials": materials})
+        cmp = self._fit_dev_cmp(setting)   # served channel — the ledger's near-miss/loss verdict
+        if cmp is not None:
+            entry["fit_dev_cmp"] = cmp
         _relabel_unused(entry)
         # only once screen has fully passed is this a served state "seen this
         # round" — a candidate that failed earlier (e.g. a transient error during
@@ -886,6 +999,14 @@ class Loop:
         self._champion.pop("_fp", None)
         self._seen_fps: set[str] = set()     # served states that passed screen this round
         self._tried_fps = _evaluated_fps(history)
+        sat = self.cfg.saturation
+        # The planner prompt's budget card — rounds left and stop counters (counted
+        # from the tail of history the same way run_rounds does)
+        self._budget = {"round": r, "rounds": getattr(self, "_rounds_total", None),
+                        "stagnant": _trailing_stagnant(history, sat.epsilon),
+                        "saturation_rounds": sat.rounds,
+                        "empty": _trailing_empty(history),
+                        "empty_rounds": sat.empty_rounds}
         rd = self._round_dir(r)
         rd.mkdir(parents=True, exist_ok=True)
         diagnosis = self._diagnosis(champion, rd,
@@ -1001,6 +1122,7 @@ class Loop:
                                "fit_dev_micro_f_beta": c["fit_dev_micro_f_beta"]}
                             | _tiling_record(c) | _neg_eta_record(c) | _requested(c)
                             | ({"prescreen": c["prescreen"]} if c.get("prescreen") else {})
+                            | _ledger_record(c)
                             | _unused_record(c) | _reask_record(c)
                             | ({"setting_fp": c["setting_fp"]} if c.get("setting_fp") else {})
                             | _modality_record(c["setting"], self.ds.ontology)
@@ -1149,11 +1271,12 @@ class Loop:
                                              default=0.0),
                      "lora": res["decision"]}
             _relabel_unused(entry)
-            screened.append({k: entry[k] for k in
-                             ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
-                            | _requested(entry) | _unused_record(entry)
-                            | _reask_record(entry) | {"_wall": wall})
+            row = ({k: entry[k] for k in
+                    ("id", "axes", "materials_dir", "setting",
+                     "fit_dev_micro_f_beta")} | {"lora": res["decision"]}
+                   | _requested(entry) | _unused_record(entry)
+                   | _reask_record(entry) | _ledger_record(entry) | {"_wall": wall})
+            screened.append(row)
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", ""),
@@ -1161,6 +1284,7 @@ class Loop:
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
+            row.update(_cmp_of(self._fit_dev_cmp(setting)))
             t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)  # winning arm's setting
             wall["holdout"] = time.monotonic() - t1
@@ -1209,12 +1333,13 @@ class Loop:
                          res["setting"]["fit_dev_micro_f_beta"],
                      "crop_classifier": res["decision"]}
             _relabel_unused(entry)
-            screened.append({k: entry[k] for k in
-                             ("id", "axes", "materials_dir", "setting",
-                              "fit_dev_micro_f_beta")}
-                            | {"crop_classifier": res["decision"]}
-                            | _requested(entry) | _unused_record(entry)
-                            | _reask_record(entry) | {"_wall": wall})
+            row = ({k: entry[k] for k in
+                    ("id", "axes", "materials_dir", "setting",
+                     "fit_dev_micro_f_beta")}
+                   | {"crop_classifier": res["decision"]}
+                   | _requested(entry) | _unused_record(entry)
+                   | _reask_record(entry) | _ledger_record(entry) | {"_wall": wall})
+            screened.append(row)
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
                 # until the champion changes — record the axis as empty so it reaches
@@ -1228,6 +1353,7 @@ class Loop:
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
+            row.update(_cmp_of(self._fit_dev_cmp(setting)))
             t1 = time.monotonic()
             ev = self._evaluate_candidate(entry, setting, materials)
             wall["holdout"] = time.monotonic() - t1
@@ -1261,6 +1387,7 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 refine_negatives_fn=refine_negatives_fn,
                 candidates_file=candidates_file, detector_hooks=detector_hooks)
     result = RunResult(out_dir=Path(out_dir))
+    loop._rounds_total = rounds             # rounds left for the planner budget card
 
     # inference for the same input under the same request conditions is reused
     # for the run (gateway.pass_cache)
@@ -1608,6 +1735,19 @@ def _relabel_unused(entry: dict) -> None:
 
 def _requested(c: dict) -> dict:
     return {"requested_axes": c["requested_axes"]} if c.get("requested_axes") else {}
+
+
+def _cmp_of(cmp: dict | None) -> dict:
+    return {"fit_dev_cmp": cmp} if cmp is not None else {}
+
+
+def _ledger_record(c: dict) -> dict:
+    """Row fields the ledger (planner.ledger) reads — the fit_dev comparison, the
+    clearly-lost variant mark (lost_values), and the planner's expected gain and
+    cost (plan)."""
+    return (_cmp_of(c.get("fit_dev_cmp"))
+            | ({"lost_values": c["lost_values"]} if c.get("lost_values") else {})
+            | ({"plan": c["plan"]} if c.get("plan") else {}))
 
 
 def _reask_record(c: dict) -> dict:

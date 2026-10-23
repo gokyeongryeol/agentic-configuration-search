@@ -16,7 +16,9 @@ whose settings fall back to no tiling. So that one case is blocked in code:
   the TP-size quantile s* counted at the champion's fit_dev screen thresholds,
   m·mag(g) < s* ≤ m·mag(g+1) (`tiling_shortfall.shortfall`, m = the median px
   of the class with the most missed_small). Once g+1 reaches screen (used or
-  not) the exception is spent and the fold at g holds. Spending is counted from
+  not) the exception is spent and the fold at g holds. A g+1 that the
+  lost-value prescreen rejected after its (subset) screen reached it too — that
+  screen's tiling_used stays on the row. Spending is counted from
   history rows, so "once" means one proposal batch — several g+1 candidates in
   the same proposal all pass. g+2 and up stay closed, and no candidate is
   created or injected.
@@ -171,7 +173,8 @@ class TilingGate:
 
 def _screened(c: dict) -> bool:
     """Is this a tiling row that reached screen (prescreen included) — tiling_used
-    is recorded."""
+    is recorded. Rows rejected by the axis prescreen (axis_unused) or the
+    lost-value prescreen also carry the subset screen's tiling_used."""
     return "tiling_used" in c or "tiling" in (c.get("unused_axes") or ())
 
 

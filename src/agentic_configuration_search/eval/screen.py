@@ -150,6 +150,47 @@ def tiling_gap_ub(untiled_rows: list[np.ndarray], tiled_rows: list[np.ndarray], 
     return float(out["hi"])
 
 
+def count_rows(recs: list[dict], cat_ids: list[int], iou_thr: float) -> list[list[list[int]]]:
+    """Per-image, per-class [tp, fp, fn] — from records with thresholds already
+    applied (threshold 0).
+
+    The same records as the setting's fit_dev scoring (`fit_dev_micro_f_beta`),
+    so the micro F(β) of these rows equals that value (`micro_f_rows`). Integer
+    lists so they fit in JSON — kept in champion.json for the next round's
+    fit_dev comparison of candidates (`fit_dev_gap`)."""
+    rows = class_count_rows(recs, {cid: 0.0 for cid in cat_ids}, cat_ids, iou_thr)
+    return [[[int(v) for v in cls] for cls in r.tolist()] for r in rows]
+
+
+def micro_f_rows(rows, beta: float = 1.0) -> float:
+    """micro F(β) of count_rows — (tp, fp, fn) summed over all images and classes
+    (the same statistic as metrics.micro_f_beta)."""
+    if not len(rows):
+        return 0.0
+    tp, fp, fn = np.sum(np.asarray(rows, dtype=float).reshape(len(rows), -1, 3),
+                        axis=(0, 1))
+    return float(metrics.prf(tp, fp, fn, beta)["f_beta"])
+
+
+def fit_dev_gap(champion_rows, candidate_rows, *, beta: float, n_boot: int, seed: int,
+                alpha: float) -> dict:
+    """Paired-bootstrap **one-sided upper bound** of (candidate − champion)
+    fit_dev micro F(β).
+
+    The same resampler and settings as tiling_gap_ub (gate.bootstrap,
+    confidence, run_seed). An upper bound at or above 0 means "the candidate is
+    worse than the champion" cannot be ruled out within noise (near miss); below
+    0 it clearly lost (clearly lost — planner.ledger). Rows must be the same
+    fit_dev images in the same order. The return value is the history row's
+    `fit_dev_cmp`."""
+    a = [np.asarray(r, dtype=float) for r in champion_rows]
+    b = [np.asarray(r, dtype=float) for r in candidate_rows]
+    out = metrics.bootstrap_ci(a, b, lambda rows: micro_f_rows(rows, beta),
+                               n_boot=n_boot, seed=seed, alpha=alpha, tail="upper")
+    return {"delta": round(out["delta"], 4), "ub": round(float(out["hi"]), 4),
+            "n": out["n_images"]}
+
+
 def _with_gap_ub(cfg, tile_f: dict | None, grid: list[dict], mean_f: dict[int, float],
                  recs_of, thresholds_of, cat_ids: list[int]) -> dict | None:
     """Add gap_ub to tiling_f — from the per-image records of the best tiled and
@@ -276,6 +317,7 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
     # --- fit_dev micro F(β) of the adopted setting (reuses cached passes — no
     # extra inference) ---
     micro = 0.0
+    recs = per_image_records(fit_dev, image_paths, [[] for _ in image_paths])
     if per_class:
         groups: dict[tuple[int, str], list[int]] = {}
         for cid, e in per_class.items():
@@ -294,6 +336,10 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
 
     out = {"configs": grid, "per_class": per_class,
            "fit_dev_micro_f_beta": micro,
+           # per-image class (tp, fp, fn) — once champion, the baseline for the next
+           # candidates' fit_dev comparison (fit_dev_gap). Reads fit_dev only
+           # (holdout is never touched)
+           "fit_dev_counts": count_rows(recs, cat_ids, cfg.detector.iou_threshold),
            "modality_diagnostic": modality_diagnostic}
     if tile_f:
         out["tiling_f"] = tile_f
