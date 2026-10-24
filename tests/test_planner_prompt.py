@@ -317,3 +317,92 @@ def test_runner_feeds_budget_card_into_the_prompt(big_root, tmp_path,  # noqa: F
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     row = {c["id"]: c for c in hist[1]["candidates"]}["r1_t1"]
     assert row["plan"] == {"expected_gain": 0.01, "cost_min": 3.0}
+
+
+# --- untried axes ----------------------------------------------------------------
+# Ported from zero-agent: with one candidate per round the planner proposed four
+# exemplar_k variants before reaching crop_classifier, an axis that had been
+# worth +0.06 in earlier runs. With few candidates the order is the budget.
+
+def _untried(p):
+    allowed = p.split("## Allowed moves", 1)[1].split("## Round history", 1)[0]
+    return next((ln for ln in allowed.splitlines()
+                 if ln.startswith("- Untried axes under the current champion")), None)
+
+
+def test_untried_axes_line_lists_enabled_axes_not_tried_under_the_champion():
+    line = _untried(_prompt(_history()))
+    assert line is not None
+    names = line.split(":", 1)[1].split(".", 1)[0]
+    # axes tried under the current champion (exemplar=base) are left out —
+    # tiling (t3), exemplar (fn_arm variant), alias (vlm). Other axes that can
+    # still be turned on are listed
+    for axis in ("text_negatives", "visual_negatives", "rescorer", "lora",
+                 "crop_classifier"):
+        assert axis in names, axis
+    for axis in ("tiling", "exemplar", "alias", "exemplar_k", "fn_k"):
+        assert axis not in names.replace("visual_negatives", "").replace(
+            "text_negatives", ""), axis
+    assert "prefer one of them over another variant of an already-tried value" in line
+    assert "unless the diagnosis gives a concrete reason" in line
+
+
+def test_untried_axes_skip_disabled_and_blocked_and_champion_on_axes():
+    from agentic_configuration_search.planner.axes import DatasetFacts
+
+    hist = _history()
+    for e in hist[1:]:                                   # the champion turned rescorer on
+        e["champion"]["axes"] = validate_axes({"exemplar": "base", "rescorer": True})
+    line = _untried(_prompt(hist, disabled_axes=("crop_classifier",),
+                            disabled_values={"text_negatives": ["fp_crop", "gt_crop",
+                                                                "background"]},
+                            facts=DatasetFacts(n_classes=2, n_fit_train=3,
+                                               lora_min_images=20)))
+    names = line.split(":", 1)[1].split(".", 1)[0]
+    assert "crop_classifier" not in names                # disabled by the operator
+    assert "text_negatives" not in names                 # every on-value disabled
+    assert "lora" not in names                           # blocked by the data
+    assert "rescorer" not in names                       # boolean the champion already turned on
+    assert "visual_negatives" in names
+
+
+def test_untried_axes_marks_axes_never_tried_in_the_run():
+    """An axis tried under an older champion is untried under the current one but
+    tried in the run — axes never proposed are marked separately."""
+    hist = _history()
+    hist[1]["candidates"].append(_row("tn", text_negatives="fp_crop", ub=-0.01))
+    line = _untried(_prompt(hist))
+    names, never = line.split("never tried in this run:", 1)
+    assert "text_negatives" in names.split(":", 1)[1]
+    never = never.split(")", 1)[0]
+    assert "text_negatives" not in never and "crop_classifier" in never
+
+
+def test_hygiene_drops_do_not_count_as_tried():
+    """A row dropped without measuring it (combo dedup and the like) did not try the axis."""
+    hist = _history()
+    hist[3]["candidates"].append(_row("cc", crop_classifier=True,
+                                      champ={"exemplar": "base"},
+                                      skipped="combo_tried"))
+    names = _untried(_prompt(hist)).split(":", 1)[1].split(".", 1)[0]
+    assert "crop_classifier" in names
+
+
+def test_no_untried_line_when_everything_was_tried():
+    hist = _history()
+    for i, axes in enumerate([{"text_negatives": "fp_crop"},
+                              {"visual_negatives": True}, {"rescorer": True},
+                              {"lora": True}, {"crop_classifier": True}]):
+        hist[3]["candidates"].append(_row(f"x{i}", champ={"exemplar": "base"}, **axes))
+    assert _untried(_prompt(hist)) is None
+
+
+def test_visual_negatives_is_not_untried_without_an_exemplar_champion():
+    """Visual negatives are a layer on exemplars, so with no exemplar in the
+    champion they cannot be turned on alone — not suggested as untried."""
+    from agentic_configuration_search.planner.axes import axis_values
+    from agentic_configuration_search.planner.llm import _untried_axis_lines
+
+    hist = [_round(0, 0, [], f=0.7), _round(1, 0, [], f=0.7)]
+    line = _untried_axis_lines(hist, axis_values())[0]
+    assert "visual_negatives" not in line and "exemplar" in line
