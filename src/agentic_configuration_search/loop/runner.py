@@ -1436,6 +1436,12 @@ class Loop:
         # served_* is what the detector has loaded right now (updated per candidate).
         served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
         for c in lora_cands:
+            # Mine the materials (FP-mining train pass) on the champion state — an
+            # earlier candidate's adopted arm may still be loaded from its holdout,
+            # and run_tail_candidate restores the baseline only after the materials are built
+            acc.served_w, acc.served_a, acc.served_l = served_w, served_a, served_l
+            self._serve_champion(champion, acc)
+            served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
             wall, t0, n_skip = {}, time.monotonic(), len(skipped)
@@ -1509,10 +1515,14 @@ class Loop:
         # loaded and the classifier then won, the champion would be served without
         # that arm while its τ and holdout F came from on top of it — they would
         # not match the serving state (adapt_round restores only the artifact).
-        if classifier_cands and not _same_state(served_w, champion.get("weights")):
-            self.detector_hooks["weights_ctl"](champion.get("weights"))
-            served_w = champion.get("weights")
+        # Each candidate starts on the champion state (weights, artifact, λ).
         for c in classifier_cands:
+            # Mine the materials (FP-mining train pass) on the champion state — an
+            # earlier candidate's adopted arm may still be loaded from its holdout,
+            # and run_classifier_candidate restores the baseline only after the materials are built
+            acc.served_w, acc.served_a, acc.served_l = served_w, served_a, served_l
+            self._serve_champion(champion, acc)
+            served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "crop_classifier": False}
             wall, t0, n_skip = {}, time.monotonic(), len(skipped)

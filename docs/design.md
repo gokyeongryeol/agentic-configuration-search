@@ -245,7 +245,10 @@ planner's input for the same round.
   so an arm that cleared its margin but was dropped before holdout does not
   stay loaded under the next candidates. The end-of-round restore goes through
   the same step, and it compares the artifact and λ against what is actually
-  loaded rather than the round record.
+  loaded rather than the round record. Each detector-state candidate also
+  starts with this restore: an earlier candidate's adopted arm may still be
+  loaded from its holdout, and the candidate's materials (the FP-mining train
+  pass) must be mined on the champion detector before its arms run.
 - **classifier blend λ**: the detector state is (weights, artifact, λ). λ is
   the loop-side blend (`infer.gateway.set_classifier_blend`), so changing only
   λ does not reload the artifact, and the pass cache keeps raw responses (with
