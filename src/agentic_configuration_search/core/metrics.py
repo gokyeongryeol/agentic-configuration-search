@@ -129,6 +129,37 @@ def _class_counts(per_image: list[dict], category_id: int, threshold: float, iou
     return tp, fp, fn
 
 
+def _class_match_table(per_image: list[dict], category_id: int,
+                       iou_thr: float) -> tuple[np.ndarray, np.ndarray, int]:
+    """Match every detection of the class once per image — (detection scores,
+    matched flags, GT count).
+
+    Matching at threshold τ (_class_counts) equals the score ≥ τ part of this
+    matching. match_greedy takes GTs one by one in descending score order (ties
+    by input order), so a detection's match depends only on the detections
+    before it (higher score, or equal score and earlier), and every detection τ
+    filters out comes after them. So the counts per τ are read from this table
+    instead of re-matching for each τ."""
+    scores, flags, n_gt = [], [], 0
+    for rec in per_image:
+        boxes, sc = [], []
+        for d in rec["detections"]:
+            if d["category_id"] == category_id:
+                boxes.append(d["box"])
+                sc.append(d["score"])
+        gts = [g["box"] for g in rec["gts"] if g["category_id"] == category_id]
+        m, _, _ = match_greedy(np.array(boxes, dtype=float).reshape(-1, 4),
+                               np.array(sc, dtype=float),
+                               np.array(gts, dtype=float).reshape(-1, 4), iou_thr)
+        flag = np.zeros(len(boxes), dtype=bool)
+        flag[[i for i, _ in m]] = True
+        scores.extend(sc)
+        flags.append(flag)
+        n_gt += len(gts)
+    return (np.array(scores, dtype=float),
+            np.concatenate(flags) if flags else np.zeros(0, dtype=bool), n_gt)
+
+
 def _threshold_candidates(scores: list[float], max_candidates: int) -> list[float]:
     """Candidate grid — **uniform in score**, not in rank.
 
@@ -201,10 +232,15 @@ def estimate_f_beta_threshold(per_image: list[dict], category_id: int, *,
         return float(floor), 0.0
     cand = _threshold_candidates(scores, max_candidates)
 
+    # Matching once per class — matching at τ is the score ≥ τ part of the full
+    # matching (_class_match_table), so this equals re-matching per candidate
+    det_scores, matched, n_gt = _class_match_table(per_image, category_id, iou_thr)
     evaluated = []
     for thr in cand:
-        tp, fp, fn = _class_counts(per_image, category_id, thr, iou_thr)
-        evaluated.append((float(thr), prf(tp, fp, fn, beta)["f_beta"]))
+        keep = det_scores >= thr
+        tp = int(np.count_nonzero(matched & keep))
+        fp = int(np.count_nonzero(keep)) - tp
+        evaluated.append((float(thr), prf(tp, fp, n_gt - tp, beta)["f_beta"]))
     best_f1 = max(f for _, f in evaluated)
     if tol <= 0.0:
         # tol=0 — first candidate reaching the max (lowest τ on ties).
@@ -308,6 +344,29 @@ def coco_map(per_image: list[dict], category_ids: list[int], id_to_name: dict[in
 
 # --------------------------------------------- paired bootstrap CI / rank AUC
 
+def image_counts(per_image: list[dict], category_ids: list[int],
+                 iou_thr: float) -> np.ndarray:
+    """(tp, fp, fn) per image, summed over every class — for records whose
+    thresholds are already applied (threshold 0).
+
+    micro F(β) is set by the sum of these rows (micro_f_counts) — counted once
+    so the bootstrap does not re-match on every resample (eval.evaluate.gate)."""
+    rows = np.zeros((len(per_image), 3), dtype=np.int64)
+    cids = list(dict.fromkeys(category_ids))   # duplicate ids once — like records_micro_f_beta
+    for i, rec in enumerate(per_image):
+        for cid in cids:
+            rows[i] += _class_counts([rec], cid, 0.0, iou_thr)
+    return rows
+
+
+def micro_f_counts(rows, beta: float = 1.0) -> float:
+    """micro F(β) of image_counts rows — the same value as records_micro_f_beta (integer sums)."""
+    if not len(rows):
+        return 0.0
+    tp, fp, fn = (int(v) for v in np.asarray(rows).sum(axis=0))
+    return prf(tp, fp, fn, beta)["f_beta"]
+
+
 def records_micro_f_beta(per_image: list[dict], category_ids: list[int],
                      iou_thr: float, beta: float = 1.0) -> float:
     """per_image records -> micro F(-beta). Used as a `bootstrap_ci` stat_fn."""
@@ -347,10 +406,14 @@ def bootstrap_ci(records_a: list[dict], records_b: list[dict], stat_fn, *,
     rng = np.random.default_rng(seed)
     point = stat_fn(records_b) - stat_fn(records_a)
     deltas = np.empty(n_boot)
+    paired_arrays = isinstance(records_a, np.ndarray) and isinstance(records_b, np.ndarray)
     for b in range(n_boot):
         idx = rng.integers(0, n, size=n)
-        sample_a = [records_a[i] for i in idx]
-        sample_b = [records_b[i] for i in idx]
+        if paired_arrays:          # count rows (image_counts) — indexing is cheaper than rebuilding lists
+            sample_a, sample_b = records_a[idx], records_b[idx]
+        else:
+            sample_a = [records_a[i] for i in idx]
+            sample_b = [records_b[i] for i in idx]
         deltas[b] = stat_fn(sample_b) - stat_fn(sample_a)
     if tail == "lower":
         lo, hi = float(np.quantile(deltas, alpha)), None

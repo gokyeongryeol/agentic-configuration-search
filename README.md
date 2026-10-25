@@ -107,6 +107,7 @@ runs/<dataset>/run/
   champion_eval.json  holdout evaluation, tau_test
   rounds/round_NNN/   proposal, settings/<cand>/, screen, eval, decision, diagnosis
   rounds/final/       final champion diagnosis + residual.json
+  lora_cache/         tail training output — lora candidates with the same training inputs reuse it
   report.md           trajectory, adoption path, time, FP/FN trends, residual misses, data collection suggestions
 ```
 
@@ -118,7 +119,9 @@ runs/<dataset>/run/
 - Before touching anything, check running experiments with `nvidia-smi` and
   `pgrep -af "run_parallel|agentic_configuration_search|vllm"`.
 - Do not take down the vLLM planner server (GPU 3, port 8104). Start it with
-  `scripts/start_vllm.sh`; check it with `curl 127.0.0.1:8104/health`.
+  `scripts/start_vllm.sh`; check it with `curl 127.0.0.1:8104/health`. When
+  sharing the GPU, lower its preallocation with e.g. `--gpu-mem 0.5` (default
+  0.9; 27B-FP8 weights are ~29 GB, so 0.5 ≈ 40 GB is near the floor).
 - `scripts/run_parallel.sh` runs with `--resume` inside, so it is safe to
   restart. Logs go to `runs/_log_<ds>.txt`.
 - Deleting `runs/`: on NFS an open fd blocks it. Stop monitors, mv, then rm.

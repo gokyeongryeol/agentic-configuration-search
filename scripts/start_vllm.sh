@@ -15,6 +15,7 @@
 #     each sees a free port and launches its own vLLM.
 #
 # Usage: scripts/start_vllm.sh [--gpu 3] [--port 8104] [--max-len 16384] [--model NAME]
+#                              [--gpu-mem 0.9]
 #        scripts/start_vllm.sh --stop     # shut down (only when no run is using it)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -23,6 +24,11 @@ GPU=3
 PORT=8104
 MAXLEN=16384                       # the value actually served (the old inline copies had 8192)
 MODEL=Qwen/Qwen3.8-27B-FP8
+# Share of GPU memory vLLM preallocates (weights + KV cache pool). The default
+# 0.9 equals planner.launch.gpu_memory_utilization when a run launches it. On a
+# shared GPU the floor is the weights — 27B-FP8 weights alone are ~29 GB, so 0.5
+# (~40 GB) on an 80 GB A100 leaves ~10 GB of KV cache.
+GPU_MEM=0.9
 # Planner server venv. This is a **different variable** from the GPU worker venv
 # (ACS_VLLM_VENV, services/paths.py) — the two may diverge on this box. While the
 # resident server is up, the worker side needs no vllm at all (VllmServer only attaches).
@@ -41,10 +47,16 @@ while [ $# -gt 0 ]; do
         --port)     PORT=$2; shift 2 ;;
         --max-len)  MAXLEN=$2; shift 2 ;;
         --model)    MODEL=$2; shift 2 ;;
+        --gpu-mem)  GPU_MEM=$2; shift 2 ;;
         --stop)     STOP=1; shift ;;
         *) echo "unknown argument: $1"; exit 2 ;;
     esac
 done
+
+# 0 < GPU_MEM <= 1 — vLLM may reject an out-of-range value only after the ~9 min load
+if ! awk -v m="$GPU_MEM" 'BEGIN { exit !(m + 0 > 0 && m + 0 <= 1 && m ~ /^[0-9]*\.?[0-9]+$/) }'; then
+    echo "[vllm] --gpu-mem must be a share greater than 0 and at most 1 (got: $GPU_MEM)"; exit 2
+fi
 
 URL="http://127.0.0.1:$PORT"
 LOG="runs/_vllm.log"
@@ -85,12 +97,12 @@ if [ "${HF_HUB_OFFLINE:-1}" = 1 ] && [ ! -d "$snap" ]; then
     exit 1
 fi
 
-echo "[vllm] launching: GPU $GPU, $MODEL, port $PORT, max-model-len $MAXLEN (HF_HOME=$HF_HOME)"
+echo "[vllm] launching: GPU $GPU, $MODEL, port $PORT, max-model-len $MAXLEN, gpu-mem $GPU_MEM (HF_HOME=$HF_HOME)"
 CUDA_VISIBLE_DEVICES="$GPU" VLLM_USE_FLASHINFER_SAMPLER=0 \
     HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" \
     setsid nohup "$VENV" serve "$MODEL" \
     --host 127.0.0.1 --port "$PORT" \
-    --gpu-memory-utilization 0.9 --max-model-len "$MAXLEN" \
+    --gpu-memory-utilization "$GPU_MEM" --max-model-len "$MAXLEN" \
     > "$LOG" 2>&1 &
 
 echo "[vllm] waiting for load (~9 min; the port opens after loading) — log: $LOG"

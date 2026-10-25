@@ -44,7 +44,7 @@ from ..planner.deterministic import tried_combos
 from ..planner.gates import tiling_gate, tiling_shortfall
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
-from ..planner.ledger import lost_values, variant_of
+from ..planner.ledger import champion_requests, lost_values, variant_of
 from . import adapt_round, rescore, tail_round
 from .materialize import materialize
 
@@ -56,6 +56,8 @@ DIAG_FILES = ("diagnosis_train.json", "diagnosis_test.json")
 DIAG_KEY = "diagnosis_key.json"       # fingerprint of the diagnosis inputs — the next round reuses it if equal
 FINAL_DIR = "final"                   # the final champion's diagnosis at the end of the run — rounds/final/
 RESIDUAL = "residual.json"            # structure of residual misses (report only, diagnose.residual)
+# run-level lora training cache (loop.tail_round._train_or_reuse) — never deleted while the run is alive
+LORA_CACHE = "lora_cache"
 
 @dataclass
 class RunResult:
@@ -572,7 +574,7 @@ class Loop:
     def _filter(self, merged: list[dict],
                 history: list[dict]) -> tuple[list[dict], list[dict]]:
         """(kept, dropped) — the source-independent shared filter
-        (tiling_blocked, combo_tried)."""
+        (tiling_blocked, champion_combo, combo_tried)."""
         # Common combo filter: regardless of source (LLM, deterministic, human),
         # block retrying **an already-tried full axes combination**. It works per
         # combination, not per (axis, value), so retrying the same axis after the
@@ -580,12 +582,16 @@ class Loop:
         # prompt window (MAX_HISTORY), so this filter is the only permanent barrier.
         tried = tried_combos(history)
         gate = tiling_gate(history)
+        champ_axes = (history[-1].get("champion", {}).get("axes")
+                      if history else None) or BASELINE
+        # the current champion itself — its label (axes) and the request that
+        # adopted it (requested_axes)
+        itself = {tuple(sorted(a.items()))
+                  for a in [champ_axes, *champion_requests(history)] if a}
         # Values that clearly lost on fit_dev under the current champion
         # (planner.ledger) — candidates containing one are not blocked, only marked
         # (lost_values). Screen measures them on a subset first
         lost = lost_values(history) if self.cfg.screen.lost_value_prescreen else {}
-        champ_axes = (history[-1].get("champion", {}).get("axes")
-                      if history else None) or BASELINE
         fresh, dropped = [], []
         for c in merged:
             # tiling fold gate (planner.gates) — screening a grid at or above an
@@ -598,6 +604,15 @@ class Loop:
                 dropped.append({**c, "skipped": "tiling_blocked", "note": why})
                 continue
             key = tuple(sorted(c["axes"].items()))
+            if key in itself:
+                # re-proposes the champion — changes nothing. Kept apart from the
+                # plain combo dedup so the round gets one more re-ask without
+                # counting it (run_round)
+                dropped.append({**c, "skipped": "champion_combo",
+                                "note": "the current champion itself (its axes or the "
+                                        "request that adopted it) — changes nothing"})
+                tried.add(key)
+                continue
             if key in tried:
                 # no silent drops — record as combo_tried in skipped so it flows via
                 # history into the next round's prompt (learning about out-of-window re-proposals).
@@ -1012,6 +1027,7 @@ class Loop:
         same round."""
         self._round_t0 = time.monotonic()
         self._pass_t0 = gateway.pass_cache_stats()
+        self._round_no = r
         self._champion = champion          # parent for material inheritance
         self._champion.pop("_fp", None)
         self._seen_fps: set[str] = set()     # served states that passed screen this round
@@ -1039,18 +1055,32 @@ class Loop:
         acc = _RoundAcc(served_w=champion.get("weights"),
                         served_a=champion.get("adapt_root"))
         self._attempt(rd, champion, proposal, acc)
-        reasks = 0
-        while (not acc.evaluated and not proposal["stop"]
-               and reasks < self.cfg.planner.max_reasks):
+        # re-asks — k (the artifact number) runs in order whether or not the
+        # re-ask is free. If a proposal only re-proposed the champion
+        # (_noop_only), FREE_REASKS per round do not count toward
+        # planner.max_reasks. The verdict reads only the proposal (a replayed
+        # artifact) and history, so resume decides the same. max_reasks=0 means
+        # no free re-ask either (re-asks off)
+        reasks = free = 0
+        max_reasks = self.cfg.planner.max_reasks
+        while not acc.evaluated and not proposal["stop"] and max_reasks > 0:
+            bonus = free < FREE_REASKS and _noop_only(proposal)
+            if not bonus and reasks - free >= max_reasks:
+                break
             nxt = self._reask(reasks + 1, r, history, diagnosis, rd, champion, acc)
             if nxt is None:
                 break
             reasks += 1
+            free += bonus
+            if bonus:
+                log.info("round %d: the proposal was only the champion itself — "
+                         "re-ask %d does not count toward planner.max_reasks", r, reasks)
             proposal = nxt
             self._attempt(rd, champion, proposal, acc)
         skipped, screened, evaluated = acc.skipped, acc.screened, acc.evaluated
         served_w, served_a = acc.served_w, acc.served_a
-        reask_mark = {"reasks": reasks} if reasks else {}
+        reask_mark = ({"reasks": reasks} if reasks else {}) \
+            | ({"free_reasks": free} if free else {})
 
         if not acc.n_runnable:
             decision = {"round": r, "adopted": False,
@@ -1156,7 +1186,7 @@ class Loop:
                             | ({"wall_min": _wall_min(c["_wall"])}
                                if c.get("_wall") else {})
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
-                            | _source_record(c)
+                            | _source_record(c) | _reuse_record(c)
                             | _skip_record(c)
                             for c in screened] + skipped),
             "decision": decision})
@@ -1298,7 +1328,10 @@ class Loop:
                     weights_ctl=self.detector_hooks["weights_ctl"],
                     base_weights=self.detector_hooks["base_weights"],
                     restore_weights=champion.get("weights"),
-                    seed=self.cfg.run_seed)
+                    seed=self.cfg.run_seed,
+                    # training reuse — an equal key reuses the subset (per run, survives resume)
+                    cache_dir=self.out_dir / LORA_CACHE,
+                    origin={"round": self._round_no, "id": c["id"]})
                 # adopted: the winning arm stays loaded; otherwise restore_weights (current)
                 served_w = res["weights"] or champion.get("weights")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
@@ -1326,7 +1359,7 @@ class Loop:
             if not res["decision"].get("adopted"):
                 skipped.append({**c, "skipped": "lora_gate",
                                 "note": res["decision"].get("reason", ""),
-                                "wall_min": _wall_min(wall)})
+                                "wall_min": _wall_min(wall)} | _reuse_record(row))
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
@@ -1798,6 +1831,21 @@ def _as_rows(rows) -> list:
     return json.loads(json.dumps(rows, default=lambda x: x.tolist()))
 
 
+# drops that change nothing — the champion itself (runner._filter), no increment (planner hygiene)
+NOOP_SKIPS = ("champion_combo", "no_change")
+# re-asks per round that do not count toward planner.max_reasks when a proposal
+# is only such drops (keeps a planner repeating the same proposal from never
+# ending the round)
+FREE_REASKS = 1
+
+
+def _noop_only(proposal: dict) -> bool:
+    """Whether no candidate of the proposal is left and every drop changes nothing (NOOP_SKIPS)."""
+    dropped = proposal.get("dropped") or []
+    return (not proposal.get("candidates") and bool(dropped)
+            and all(d.get("skipped") in NOOP_SKIPS for d in dropped))
+
+
 # rejection reasons of the pre-holdout fit_dev verdict (_fit_dev_skip)
 FIT_DEV_SKIPS = ("fit_dev_lost", "fit_dev_identical")
 
@@ -1875,6 +1923,14 @@ def _source_record(c: dict) -> dict:
     """The source of carried and human candidates — shared by plain candidates and
     the lora and classifier arms (the report's carry verdict reads only this)."""
     return {"source": c["source"]} if c.get("source") else {}
+
+
+def _reuse_record(c: dict) -> dict:
+    """The origin of a cached tuned subset a lora arm used instead of training —
+    {"tail": {round, id}} (loop.tail_round._train_or_reuse). It explains why
+    wall_min is short."""
+    reused = (c.get("lora") or {}).get("delta_reused")
+    return {"delta_reused": reused} if reused else {}
 
 
 def _unused_record(c: dict) -> dict:
