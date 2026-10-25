@@ -107,6 +107,7 @@ runs/<dataset>/run/
   champion_eval.json  holdout evaluation, tau_test
   rounds/round_NNN/   proposal, settings/<cand>/, screen, eval, decision, diagnosis
   rounds/final/       final champion diagnosis + residual.json
+  lora_cache/         tail training output — lora candidates with the same training inputs reuse it
   report.md           trajectory, adoption path, time, FP/FN trends, residual misses, data collection suggestions
 ```
 

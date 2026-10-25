@@ -63,7 +63,8 @@ K_PARENT = {"exemplar_k": "exemplar", "fn_k": "exemplar",
 PRESCREEN_AXES = ("alias", "exemplar", "text_negatives", "visual_negatives", "tiling")
 
 # history skipped reason → ledger outcome group
-_BLOCKED = {"tiling_blocked", "combo_tried", "axis_disabled", "carried_duplicate",
+_BLOCKED = {"tiling_blocked", "combo_tried", "champion_combo", "axis_disabled",
+            "carried_duplicate",
             "duplicate_axes", "max_candidates", "no_change", "invalid_axes",
             "detector_state_off", "compound_server_state", "missing_hook",
             "lora_deps", "adapt_ctl"}
@@ -260,6 +261,28 @@ def variant_of(axes: dict, champion: dict, lost: dict) -> list[str]:
     """Names of the clearly-lost values a candidate contains — empty means not a
     variant."""
     return [label(k) for k in value_keys(axes, champion) if k in lost]
+
+
+def champion_requests(history: list[dict]) -> list[dict]:
+    """axes and requested_axes of the candidate row that adopted the current
+    champion — the champion's label can differ from the request (unused-axis
+    correction, rescorer identity refit). Re-proposing that request is the
+    champion itself (the runner's champion_combo). Empty for the baseline."""
+    if not history:
+        return []
+    ch = history[-1].get("champion") or {}
+    r, cid = ch.get("round"), ch.get("id")
+    out: list[dict] = []
+    for e in history:
+        if e.get("round") != r:
+            continue
+        for c in e.get("candidates", []):
+            if c.get("id") != cid:
+                continue
+            for axes in (c.get("axes"), c.get("requested_axes")):
+                if isinstance(axes, dict) and axes not in out:
+                    out.append(axes)
+    return out
 
 
 def tried_under_champion(history: list[dict]) -> list[str]:

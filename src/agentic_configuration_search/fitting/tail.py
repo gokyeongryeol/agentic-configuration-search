@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,43 @@ def export_yolo_dataset(split, ontology, out_dir: Path) -> Path:
         "val: images/train\n"
         f"names:\n{names}\n")
     return data_yaml
+
+
+# cfg.lora fields that change the training output — part of the reuse key
+# (train_key). The λ grid, margin and min_images (post-training verdict) and
+# device (placement) are left out
+TRAIN_FIELDS = ("epochs", "batch_size", "lr")
+
+
+def split_identity(split) -> str:
+    """Content fingerprint of a split — image names and sizes plus GT boxes (in a
+    sorted, deterministic order)."""
+    rows = [[e.file_name, e.width, e.height,
+             sorted([a.category_id, [round(float(x), 3) for x in a.bbox_xyxy]]
+                    for a in e.annotations)]
+            for e in split.images]
+    return hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+
+
+def train_key(cfg, *, fit_train, ontology, base_weights: Path, seed: int) -> dict:
+    """Every input of one train_tail call — equal keys reuse the tuned subset.
+
+    Training always starts from the base weights on fit_train GT, regardless of
+    the champion, so within a run an equal key is the same training. Training
+    itself is not deterministic (GPU), but reuse only means "use what was
+    trained once again", so the decision discipline is unchanged. base_weights
+    is identified by path (realpath) — hashing the file would read the whole
+    checkpoint."""
+    lo = cfg.lora
+    return {"seed": int(seed),
+            "lora": {k: getattr(lo, k) for k in TRAIN_FIELDS},
+            "base_weights": os.path.realpath(str(base_weights)),
+            "fit_train": split_identity(fit_train),
+            "ontology": ontology.to_dict() if ontology is not None else None}
+
+
+def key_digest(key: dict) -> str:
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
 
 
 def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
