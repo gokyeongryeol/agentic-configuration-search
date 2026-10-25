@@ -229,7 +229,10 @@ def _detector_state_round(root, tmp_path, monkeypatch, candidates: str, fixed_by
         "planner": {"kind": "deterministic"},
         "dataset": str(root),
         "lora": {"lambdas": [0.0, 1.0], "margin": 0.01, "min_images": 4},
-        "crop_classifier": {"min_samples": 4, "min_background": 0, "margin": 0.01},
+        # reuse off — candidates are told apart by their own artifact paths
+        # (run-level reuse would give every candidate the same artifact)
+        "crop_classifier": {"min_samples": 4, "min_background": 0, "margin": 0.01,
+                            "reuse": False},
     })
     cand_file = tmp_path / "candidates.yaml"
     cand_file.write_text(candidates)
@@ -249,6 +252,9 @@ def _assert_state_is_champion(state, champion):
         f"detector weights {state.weights} != champion {champion.get('weights')}")
     assert norm(state.adapt) == norm(champion.get("adapt_root")), (
         f"detector artifact {state.adapt} != champion {champion.get('adapt_root')}")
+    from agentic_configuration_search.infer import gateway
+    assert gateway.classifier_blend() == champion.get("adapt_lambda"), (
+        f"blend λ {gateway.classifier_blend()} != champion {champion.get('adapt_lambda')}")
 
 
 _LORA_AND_CLS = ("- id: adapt\n  axes: {lora: true}\n  rationale: adapt\n"

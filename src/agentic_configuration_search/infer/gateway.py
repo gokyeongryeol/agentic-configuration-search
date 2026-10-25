@@ -6,6 +6,10 @@ consumers must call it module-qualified as `gateway.infer_config(...)`.
 
 chosen_groups/infer_for_groups (group inference orchestration) live in
 eval/runner.py; this module holds only the seam.
+
+The crop classifier blend (set_classifier_blend) also lives here — while a
+classifier is loaded, every detector response is blended with λ here before it
+becomes detections (blend_classifier).
 """
 
 from __future__ import annotations
@@ -109,6 +113,93 @@ def dedup_class_duplicates(dets: list[dict], iou_thr: float) -> list[dict]:
             continue
         kept.append(d)
     return kept
+
+
+# ---------------------------------------------------------------- pass cache
+# ---------------------------------------------------------- classifier blend
+# The blend λ while a crop classifier is loaded in the client — None means no
+# blending (no classifier). It is the loop-side half of the detector state, so
+# it lives as long as that state: the runner changes it only where it swaps the
+# artifact (Loop._adapt_ctl). λ does not change the detector response (the
+# probabilities), so it is not part of the pass cache key.
+_classifier_blend: float | None = None
+
+
+def set_classifier_blend(lam: float | None) -> None:
+    """Blend responses of the classifier-loaded client with λ. None is no
+    classifier (blend off), 0.0 is relabel-only — the two differ (0.0 still
+    requests probabilities)."""
+    global _classifier_blend
+    if lam is not None:
+        _check_blend(lam)
+    _classifier_blend = None if lam is None else float(lam)
+
+
+def classifier_blend() -> float | None:
+    return _classifier_blend
+
+
+def _check_blend(lam) -> None:
+    # λ=0 is relabel-only (scores unchanged). "No classifier" is not a λ but None
+    # (no artifact loaded). λ>1 would trust the classifier probability more than
+    # the detection score — an extrapolation, so it is refused.
+    if isinstance(lam, (str, bool)) or not isinstance(lam, (int, float)) \
+            or not 0.0 <= float(lam) <= 1.0:
+        raise ValueError(f"classifier blend λ must be a number in [0, 1] (got {lam!r})")
+
+
+def blend_classifier(pred: dict, lam: float) -> dict:
+    """Unreclassified response (+ classifier probabilities) → the response
+    blended with λ (same wire shape).
+
+    A box with probabilities takes the foreground argmax c* as its class and
+    s^(1-λ)·p(c*)^λ as its score (λ=0: p^0 = 1, so the score is unchanged —
+    relabel-only). A box whose argmax is background is not dropped — p(c*) is
+    small, so its score goes down, and whether to drop it is decided by the
+    per-class thresholds screen re-estimates on fit_dev. A box without
+    probabilities (could not be cropped) stays as it is. Like the client's
+    reclassification path (clients.yoloe._reclassify) there is no NMS after the
+    relabel, and boxes keep their order and embeddings."""
+    _check_blend(lam)
+    if "classifier_probs" not in pred:
+        raise RuntimeError(
+            "blending a classifier but the response has no classifier_probs — no "
+            "classifier is loaded in the client")
+    probs, names = pred["classifier_probs"], pred["classifier_class_names"]
+    boxes, scores_in = pred.get("boxes", []), pred.get("scores", [])
+    texts = list(pred.get("text") or [])
+    # do not silently lose boxes to the shorter list — one entry per box is the contract
+    if not (len(probs) == len(boxes) == len(scores_in) == len(texts)) or len(names) < 2:
+        raise RuntimeError(
+            f"classifier probability response violates the contract — {len(boxes)} boxes, "
+            f"{len(scores_in)} scores, {len(texts)} texts, {len(probs)} probabilities, "
+            f"{len(names)} classes (2 or more including background)")
+    scores = []
+    for i, (s, p) in enumerate(zip(scores_in, probs)):
+        if p is None:
+            scores.append(float(s))
+            continue
+        c = 1 + max(range(len(p) - 1), key=lambda k: p[1 + k])   # foreground argmax
+        texts[i] = names[c]
+        scores.append(float(s) ** (1.0 - lam) * float(p[c]) ** lam)
+    out = {"boxes": list(boxes), "scores": scores, "text": texts}
+    if pred.get("embeddings") is not None:
+        out["embeddings"] = pred["embeddings"]
+    return out
+
+
+def _probs_kwargs() -> dict:
+    """While blending, ask the client for probabilities instead of reclassification
+    (this enters the cache key too)."""
+    return {"return_classifier_probs": True} if _classifier_blend is not None else {}
+
+
+def _blended(preds: list) -> list:
+    """Apply the current λ to a batch of raw responses — unchanged when blending is off."""
+    lam = _classifier_blend
+    if lam is None:
+        return preds
+    return [blend_classifier(p, lam) for p in preds]
 
 
 # ---------------------------------------------------------------- pass cache
@@ -235,7 +326,8 @@ def make_predictor(ctx, client, config: dict, queries, ontology,
 
     # the argument bundle sent to the detector — the cache key is built from it
     # too (so a new argument cannot be left out of the key)
-    kw = dict(apply_topk=z.apply_topk, iou_threshold=z.iou_threshold, **neg_kwargs)
+    kw = dict(apply_topk=z.apply_topk, iou_threshold=z.iou_threshold, **neg_kwargs,
+              **_probs_kwargs())
     sig = (_request_signature(queries, kw)
            if _pass_cache is not None and not return_embeddings else None)
 
@@ -246,6 +338,9 @@ def make_predictor(ctx, client, config: dict, queries, ontology,
                 preds = _cached_predict_images(client, batch, queries, sig, **kw)
             else:
                 preds = client.predict_images(batch, queries, **kw)
+            # the cache holds raw responses — λ is blended here, so re-inference
+            # that only changes λ hits the cache
+            preds = _blended(preds)
             # Class resolution uses text (name) only — labels (flat prompt
             # indices) are unused (see clients.wire.parse_prediction)
             parsed = [parse_prediction(p, ontology.name_to_id,

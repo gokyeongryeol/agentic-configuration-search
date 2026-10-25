@@ -34,9 +34,10 @@ REMEDY: dict[str, tuple] = {
     "below_threshold": (("rescorer", True), ("exemplar", "base"),
                         ("exemplar", "fn_arm"), ("lora", True),
                         ("crop_classifier", True)),
-    # The crop classifier drops detections it reclassifies as background (0) — it
-    # is a background-FP filter too. It costs the most (classifier fit + detector
-    # state swap), so it goes last.
+    # The crop classifier lowers the scores of detections with a high background
+    # probability — it suppresses background FPs too (λ blend; whether to drop is
+    # left to the per-class thresholds). It costs the most (classifier fit +
+    # detector state swap), so it goes last.
     "background": (("visual_negatives", True),
                    ("text_negatives", "background"), ("rescorer", True),
                    ("crop_classifier", True)),

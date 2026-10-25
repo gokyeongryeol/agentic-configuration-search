@@ -77,7 +77,7 @@ details in the [axis reference](docs/design.md#axis-reference).
 | `text_negatives` | `false` · `fp_crop` · `gt_crop` · `background` | suppression phrases from false-positive or other-class crops. Count `text_negative_k` |
 | `visual_negatives` | `false` · `true` | false-positive crops as negative image prompts (needs `exemplar`). Count `visual_negative_k` |
 | `rescorer` | `false` · `true` | discriminator score calibration (per-class α, `rescorer.alphas`) |
-| `crop_classifier` | `false` · `true` | SigLIP2+LoRA re-classifies boxes and drops background |
+| `crop_classifier` | `false` · `true` | SigLIP2+LoRA class probabilities blended into each box's class and score over a λ grid |
 | `lora` | `false` · `true` | YOLOE tail fine-tune interpolated with the base (`lora.lambdas`, λ=0 is the base) |
 | `tiling` | `false` · 2–6 | g×g tile inference, then merge. 1+g² forwards per image |
 
@@ -103,11 +103,12 @@ weights, classifier artifact) through controls the CLI wires in.
 runs/<dataset>/run/
   history.jsonl       round ledger (per-candidate axes, outcome, gate, wall_min)
   run_summary.json    stop reason, final champion, holdout_split
-  champion.json       champion setting (axes, materials, weight paths)
+  champion.json       champion setting (axes, materials, weight paths, classifier blend λ)
   champion_eval.json  holdout evaluation, tau_test
   rounds/round_NNN/   proposal, settings/<cand>/, screen, eval, decision, diagnosis
   rounds/final/       final champion diagnosis + residual.json
   lora_cache/         tail training output — lora candidates with the same training inputs reuse it
+  classifier_cache/   crop classifier artifact — trained once per run, later proposals reuse it
   report.md           trajectory, adoption path, time, FP/FN trends, residual misses, data collection suggestions
 ```
 

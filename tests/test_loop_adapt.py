@@ -243,9 +243,17 @@ def test_resume_restores_server_state(root, tmp_path, monkeypatch):
                            "repo_root": tmp_path, "base_weights": tmp_path / "b"})
 
     loop._restore_detector_state({"weights": "/w/merged.safetensors",
-                                "adapt_root": "/a/artifact"})
+                                "adapt_root": "/a/artifact", "adapt_lambda": 0.25})
     assert [str(x) for x in seen["w"]] == ["/w/merged.safetensors"]
     assert [str(x) for x in seen["a"]] == ["/a/artifact"]
+    assert gateway.classifier_blend() == 0.25          # the blend λ comes back too
+
+    # a champion from before the blend (artifact without λ) cannot be continued
+    with pytest.raises(RuntimeError, match="adapt_lambda"):
+        Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "r3",
+             detector_hooks={"weights_ctl": lambda w: None, "adapt_ctl": lambda p: None,
+                             "repo_root": tmp_path, "base_weights": tmp_path / "b"}
+             )._restore_detector_state({"weights": None, "adapt_root": "/a/artifact"})
 
     # champion without server state -> reapply nothing (avoid needless restarts)
     seen["w"].clear(); seen["a"].clear()

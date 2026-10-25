@@ -32,7 +32,7 @@ AXES: dict[str, tuple] = {
     "tiling": (False, *TILING_GRIDS),         # grid g (see TILING_GRIDS above)
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
-    "crop_classifier": (False, True),         # re-classify detections (fixes class_confusion, drops background FPs)
+    "crop_classifier": (False, True),         # re-classify / blend detections (fixes class_confusion, suppresses background FPs)
     # --- count axes (grid 1·2·4; exemplar up to 8 to see whether it hits the cap) ---
     # None = the config's default quota (MineCfg's *_per_class) and the safe
     # point. Meaningful only when the matching feature axis is on (enforced by

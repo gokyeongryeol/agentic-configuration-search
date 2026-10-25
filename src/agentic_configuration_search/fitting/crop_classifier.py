@@ -1,12 +1,13 @@
 """Crop-classifier axis material — mining, training call, artifact assembly (from the split the caller passes).
 
 Serving: the detector client (clients.yoloe) loads the artifact directory
-(classifier.pt / classifier_config.json) and **reclassifies predicted boxes**
-client-side — replacing the category or judging background (0), which the
-client drops. It cannot create new detections, so it has two levers:
-correcting class_confusion and removing background FPs. On a single-class
-dataset only the latter remains, and it acts as a binary verifier (object vs
-background).
+(classifier.pt / classifier_config.json) and gives **class probabilities per
+predicted box** (background (0) included) — the loop blends them with λ
+instead of reclassifying (infer.gateway.blend_classifier: class = foreground
+argmax, score = s^(1-λ)·p^λ). It cannot create new detections, so it has two
+levers: correcting class_confusion and suppressing background FPs. On a
+single-class dataset only the latter remains, and it acts as a binary verifier
+(object vs background).
 
 Training data (from the split the caller passes — the loop uses fit_train, see
 loop.adapt_round):
@@ -158,6 +159,26 @@ def assemble_artifacts(adapt_out: Path, ontology: Ontology) -> None:
         "classifier_image_size": IMAGE_SIZE,
         "class_names": class_names,
     }, indent=2, ensure_ascii=False))
+
+
+def train_key(*, fit_train: Split, ontology: Ontology) -> dict:
+    """Key deciding whether a classifier trained in the run is reused — the
+    training split, the ontology and the client's rebuild contract (worker
+    constants).
+
+    **The champion is not in the key.** The background crops are FPs mined on
+    the champion setting at the time of the first training, so after the
+    champion changes, re-mining would give different material. Training still
+    happens once per run — instead of retraining (tens of minutes) for every
+    proposal, each proposal re-scores the blend λ grid on the new champion to
+    absorb the drift (loop.adapt_round). fit_train and the ontology do not
+    change within a run, so the key is effectively one per run — it guards
+    against reusing a run directory with another dataset."""
+    from .tail import split_identity
+    return {"fit_train": split_identity(fit_train),
+            "ontology": ontology.to_dict(),
+            "worker": {"model": MODEL_NAME, "lora_r": LORA_R, "lora_alpha": LORA_ALPHA,
+                       "lora_target": LORA_TARGET_NAME, "image_size": IMAGE_SIZE}}
 
 
 def train_crop_classifier(repo_root: Path, *, manifest: Path, ontology: Ontology,

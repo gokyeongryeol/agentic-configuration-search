@@ -38,7 +38,7 @@ line) that equals the baseline behavior exactly.
 | `text_negatives` — Negative text | `false`: no suppression phrases<br>`fp_crop`: phrases from false-positive crops of the mining pass — the mining pass infers train with the candidate's exemplars only (a GT k-center selection if it has none), without tiling or negatives<br>`gt_crop`: phrases from other classes' GT crops (suppress confusion — not valid on single-class datasets)<br>`background`: phrases from the same mining pass's false positives that overlap no GT of any class (suppress background)<br>count `text_negative_k` ∈ {1, 2, 4} (default 1) |
 | `visual_negatives` — Negative visual | `false`: no suppression crops<br>`true`: false-positive crops of the mining pass (the same as `fp_crop`) as negative image prompts (needs `exemplar`), emulated as IoU suppression. The suppression IoU threshold is chosen on fit_dev by screen, one config shared across classes, among a config without negatives and `search.neg_eta_grid` (0.25, 0.35, 0.5, 0.65, 0.75 — lower suppresses more)<br>count `visual_negative_k` ∈ {1, 2, 4} (default 1) |
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
-| `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
+| `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier gives class probabilities per detection box, blended with λ ∈ `crop_classifier.lambdas` (0, 0.25, 0.5, 0.75, 1): class = foreground argmax c*, score = s^(1−λ)·p(c*)^λ. λ = 0 is relabel-only (scores unchanged); a box whose argmax is background is not dropped — its score goes down and the per-class thresholds decide. Trained once per run (`<run>/classifier_cache/`, `crop_classifier.reuse`); each proposal re-scores only the λ grid on the current champion |
 | `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility. On disk a candidate keeps only one small descriptor JSON per λ > 0 arm; the tuned tail subset (`tuned_tail.pt`) lives in the run's training cache `lora_cache/<digest>/` — arms are interpolated in memory, λ = 0 is the base itself, and the trainer's full-model checkpoints are deleted after training. Training runs once per run: its inputs (fit_train and ontology content, base weights path, `run_seed`, `lora.epochs`·`batch_size`·`lr`) do not depend on the champion, so later lora candidates (same round, carried, later rounds, after resume) rebuild the arms from the cached subset and re-score them, recording `delta_reused` ({tail: {round, id}}). An entry counts only once its `key.json` is written after training; one without it is retrained. The crop classifier is not reused — its training crops are mined from the current setting's FPs |
 | `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes and the TP sizes the champion already detects (s*). If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Exception: if g lost to no tiling on fit_dev only within noise (one-sided paired-bootstrap upper bound `tiling_f.gap_ub` ≥ 0) and fell short on zoom (for the median m of the class with the most missed_small, m·zoom(g) < s* ≤ m·zoom(g+1), s* = the `search.tiling_tp_quantile` quantile of that class's champion TP sizes — m and s* are both train sizes counted at the champion's fit_dev screen thresholds, so holdout plays no part; with fewer than `search.tiling_tp_min` TPs there is no verdict), g+1 is opened — once, until a g+1 reaches screen (several g+1 candidates in the same proposal all pass). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
 
@@ -82,7 +82,7 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 | `tiling` | none — an inference setting | tiled and untiled configs are chosen from the same grid, shared by all classes (a text-only candidate runs the text pass per tiling variant). If untiled wins, `axis_unused`. Grids ≥ `screen.prescreen_min_grid` are first screened on a `fit_dev` subset | 〃 |
 | `rescorer` | `fit_train`: discriminator training (area statistics over all of train) | per-class α grid — identity unless the gain exceeds `rescorer.margin` | 〃 |
 | `lora` | `fit_train`: YOLOE tail fine-tune (no validation split during training) | λ grid — the arm's ΔF must exceed `lora.margin` | 〃 |
-| `crop_classifier` | `fit_train`: GT crops (positive) and false positives from a fit_train pass (background), mined at the `fit_dev` thresholds | ΔF must exceed `crop_classifier.margin` | 〃 |
+| `crop_classifier` | `fit_train`: GT crops (positive) and false positives from a fit_train pass (background), mined at the `fit_dev` thresholds | the λ grid is scored on `fit_dev`; the best ΔF must exceed `crop_classifier.margin` | 〃 |
 
 ## Round loop
 
@@ -240,7 +240,24 @@ planner's input for the same round.
   they are not adopted. Once adopted they are not turned off: the state stays
   loaded while other candidates are measured, so a candidate turning one off
   would be measured with it still on. Such candidates are rejected as
-  `detector_state_off` without evaluation.
+  `detector_state_off` without evaluation. Every attempt (the first proposal
+  and each re-ask) starts by bringing the detector back to the champion state,
+  so an arm that cleared its margin but was dropped before holdout does not
+  stay loaded under the next candidates.
+- **classifier blend λ**: the detector state is (weights, artifact, λ). λ is
+  the loop-side blend (`infer.gateway.set_classifier_blend`), so changing only
+  λ does not reload the artifact, and the pass cache keeps raw responses (with
+  probabilities) so re-inference is served from it. The classifier arm keeps
+  the baseline (no classifier, `lam: null`) apart from λ = 0 (relabel-only); a
+  champion's `adapt_lambda` is `null` without a classifier and `0.0` for
+  relabel-only. While the champion has a classifier, ordinary candidates
+  re-choose λ on their own setting before the rescorer refit
+  (`crop_classifier.retune_lambda`), switching only when another λ beats the
+  champion's by more than `crop_classifier.margin`. The training cache key
+  leaves the champion out — background crops come from the first training's
+  champion, and the λ grid absorbs the drift. A tripwire is not cached.
+  Resume and `scripts/predict.py` restore λ with the artifact; a champion with
+  an artifact but no λ (from before the blend) is refused.
 
 ## Diagnosis and planner
 
@@ -298,25 +315,30 @@ planner's input for the same round.
 ```
 runs/<dataset>/run/
   history.jsonl        # round ledger (per-candidate wall_min, reask, fit_dev_cmp, lost_values, plan,
-                       # delta_reused;
+                       # delta_reused, classifier_reused, classifier_lambda(_grid);
                        # per-round pass_cache counts)
   run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
                        # holdout_split, final_diagnosis (reused or not, duration)
-  champion.json        # champion setting (axes, materials, weights, adapt_root, forwards_per_image,
+  champion.json        # champion setting (axes, materials, weights, adapt_root, adapt_lambda,
+                       # forwards_per_image,
                        # per-image fit_dev (tp, fp, fn) — the baseline of the next fit_dev_cmp)
   champion_eval.json   # champion holdout evaluation, incl. tau_test
   rounds/round_NNN/    # proposal (+ proposal_reask<k>), settings/<cand>/ materials, screen, eval,
                        # decision, diagnosis (+ diagnosis_key), crop_notes
   rounds/final/        # final champion diagnosis (diagnosis, diagnosis_key, crop_notes) + residual.json
   lora_cache/          # tail training output (tuned_tail.pt) per training key — reused within the run
+  classifier_cache/    # crop classifier artifact per training key — reused within the run
   report.md            # output of acs report
 ```
 
 - **Candidate ids** get an `r<round>_` prefix before recording; only carried
   candidates keep `carry_<original id>` (see the round loop).
 - **History fields**: candidate rows carry `wall_min`, `reask`, `fit_dev_cmp`,
-  `lost_values`, `plan` and `delta_reused` (origin of a reused tail training);
-  round rows carry `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
+  `lost_values`, `plan`, `delta_reused` / `classifier_reused` (origin of a
+  reused tail or classifier training) and `classifier_lambda` (the arm's best λ,
+  or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`); the
+  round's champion summary carries `classifier_lambda`; round rows carry
+  `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
   response's `expected_gain`, `cost_min` and `differs`; only a malformed field
   is dropped.
 - **Final diagnosis** (`rounds/final/`): a failure still ends the run, and the

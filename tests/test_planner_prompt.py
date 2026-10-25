@@ -109,7 +109,8 @@ def test_budget_card_states_unmeasured_costs_without_judging_them():
     card = _prompt(hist).split("## Budget", 1)[1].split("## Current champion", 1)[0]
     assert "slowest" not in card and " min" not in card.split("Not measured yet", 1)[1]
     assert ("lora: fine-tunes the detector tail before screening; crop_classifier: "
-            "trains a crop classifier before screening") in card
+            "trains a crop classifier once per run, then screens a grid of blend "
+            "weights per proposal") in card
 
 
 def test_budget_card_skips_unknown_fields_and_disabled_axes():
