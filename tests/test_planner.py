@@ -1251,3 +1251,20 @@ def test_refill_respects_disabled_axes(tmp_path):
     assert len(calls) == 2
     assert [c["id"] for c in out["candidates"]] == ["v"]
     assert {d["id"]: d["skipped"] for d in out["dropped"]}["t"] == "disabled_axes"
+
+
+def test_a_transient_error_gets_one_retry():
+    """skipped=error (OOM, worker failure) is not a measurement — the same
+    combination is allowed once more and blocked after the second failure (so a
+    deterministic failure does not repeat every round)."""
+    from agentic_configuration_search.planner.axes import validate_axes
+    from agentic_configuration_search.planner.deterministic import tried_combos
+    axes = validate_axes({"lora": True})
+    key = tuple(sorted(axes.items()))
+    once = [{"candidates": [{"id": "a", "axes": axes, "requested_axes": axes,
+                             "skipped": "error"}]}]
+    assert key not in tried_combos(once)
+    twice = once + [{"candidates": [{"id": "b", "axes": axes, "skipped": "error"}]}]
+    assert key in tried_combos(twice)
+    measured = [{"candidates": [{"id": "a", "axes": axes}]}]
+    assert key in tried_combos(measured)

@@ -95,13 +95,16 @@ The diagnosis comes first: it is of the champion at the start of the round
 planner's input for the same round.
 
 - **screen** passes only the top-K candidates to holdout. A candidate that
-  changes only tiling and turns on grid ≥ `screen.prescreen_min_grid` is first
+  changes only tiling and raises the grid above the champion's to ≥
+  `screen.prescreen_min_grid` is first
   screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
   `prescreen_min_images`); if no class uses tiles there, it is rejected without
   the full screen. If they are used, the full fit_dev is screened as before
   (numbers unchanged). If the subset is `screen.prescreen_max_share` (0.5) of
   fit_dev or more, the full screen runs directly without a prescreen — a pass
-  would be measured again, so nothing is saved.
+  would be measured again, so nothing is saved. A grid below the champion's
+  is not prescreened: it is cheaper, and unused tiles there do not make it
+  the champion (the champion uses tiles), so it gets the full screen.
 - **lost-value prescreen**: a planner candidate containing a value that clearly
   lost on fit_dev under the current champion (a candidate changing only that
   value had a (candidate − champion) fit_dev micro F(β) paired-bootstrap upper
@@ -147,6 +150,11 @@ planner's input for the same round.
   champion are reused. Re-asked candidates go through the same filters, screen
   and holdout and stay in the same round's history as `reask: k`. LLM planner
   only (the deterministic planner is not re-asked).
+- **combination dedup**: an axes combination already tried in the run is
+  dropped as `combo_tried`, except one that failed with `skipped: error` (OOM,
+  worker failure — not a measurement): it is allowed once more
+  (`planner.deterministic.ERROR_RETRIES` = 1) and blocked from its second
+  failure on, so a deterministic failure does not repeat every round.
 - **re-proposing the champion does not use up the re-ask**: a combination equal
   to the current champion's axes, or to the request that adopted it (the
   history row's `axes`/`requested_axes` — it can differ from the label after an

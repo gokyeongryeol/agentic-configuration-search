@@ -754,8 +754,9 @@ class Loop:
         (1) Large-grid tiling: a grid g screen costs 1+g² forwards, so from g ≥
         screen.prescreen_min_grid the full fit_dev is expensive. If no class uses
         a tile, reject as axis_unused. Only for single increments that change
-        tiling alone — a candidate that also changes other axes is not the
-        champion even if tiles go unused. Not done without a subset (fit_dev is
+        tiling alone and raise the grid — a candidate that also changes other
+        axes, or lowers the champion's grid, is not the champion even if tiles
+        go unused. Not done without a subset (fit_dev is
         small, or the subset is screen.prescreen_max_share of fit_dev or more).
 
         (2) Lost value: a candidate containing a value that clearly lost on
@@ -775,7 +776,10 @@ class Loop:
         s = self.cfg.screen
         champ = (getattr(self, "_champion", None) or {}).get("axes") or {}
         g = axes.get("tiling")
-        tiling = bool(g and g >= s.prescreen_min_grid and g != champ.get("tiling")
+        # only increments that **raise** the grid — a grid below the champion's
+        # is cheaper, and unused tiles there do not make it the champion (the
+        # champion uses tiles)
+        tiling = bool(g and g >= s.prescreen_min_grid and g > int(champ.get("tiling") or 0)
                       and {k for k, v in c["axes"].items()
                            if champ.get(k) != v} == {"tiling"})
         lost = list(c.get("lost_values") or ()) if s.lost_value_prescreen else []
