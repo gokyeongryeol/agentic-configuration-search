@@ -312,6 +312,7 @@ def _state_fake(path, lam):
     from types import SimpleNamespace
     calls = []
     fake = SimpleNamespace(detector_hooks={"weights_ctl": lambda w: calls.append(("w", w))},
+                           _weights_ctl=lambda w: calls.append(("w", w)),
                            _adapt_path=path, _adapt_lambda=lam)
 
     def adapt_ctl(p, lam):
