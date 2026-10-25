@@ -133,7 +133,12 @@ planner's input for the same round.
   (0.005 — a noise-level gain with its lower bound at 0 does not change the
   champion and reset the ledger and fold records); otherwise the champion
   stays. Raising `gate.margin` instead would also reject real gains on small
-  holdouts, where the interval is wide.
+  holdouts, where the interval is wide. Resampling runs on rows of per-image
+  (tp, fp, fn) counted once (`metrics.image_counts`) — micro F(β) is set by
+  their integer sums, so it equals re-matching the boxes on every resample.
+  The per-class threshold search likewise matches once per class (in
+  score-ordered greedy matching, the matching at τ is the score ≥ τ part of
+  the full matching).
 - **re-ask**: if every candidate is rejected before holdout (by the filters or
   screen: `tiling_blocked`, `axis_unused`, `same_setting`, `no_material`, …),
   the round is not closed — the planner is asked again within the same round
