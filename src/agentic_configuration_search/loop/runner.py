@@ -1353,13 +1353,19 @@ class Loop:
         champion state) differently from how it was measured. A lora arm
         restores only the weights (tail_round), so this is needed before lora
         candidates too, so they are not measured on a leftover classifier arm —
-        hence it runs at the start of every attempt. Nothing happens when the
-        detector is already in the champion state. Also used for the
-        end-of-round restore.
+        hence it runs at the start of every attempt. It also runs at the start
+        of every lora and classifier candidate, so the next candidate's
+        materials are not mined with an earlier candidate's adopted arm still
+        loaded. Nothing happens when the detector is already in the champion
+        state. Also used for the end-of-round restore.
 
         The artifact and λ are compared against what is actually loaded
         (self._adapt_path / self._adapt_lambda, which only _adapt_ctl changes),
-        not the round record — so a swap the record missed is still undone."""
+        not the round record — so a swap the record missed is still undone.
+        The weights are compared against the round record (acc.served_w): only
+        detector-state candidates change them and the record follows each
+        change. Same-path requests and the retry after a failed swap are
+        _weights_ctl's job."""
         if not self.detector_hooks:
             return                        # run without state controls — the state never changed
         if not _same_state(acc.served_w, champion.get("weights")):

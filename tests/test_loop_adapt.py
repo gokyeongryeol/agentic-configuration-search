@@ -495,3 +495,57 @@ def test_lora_candidate_baseline_keeps_the_pass_cache(root, tmp_path, monkeypatc
                   {"candidates": [{"id": "l1", "axes": {"lora": True}}], "stop": False},
                   _RoundAcc(served_w=None, served_a=None, served_l=None))
     assert flushed == []
+
+
+# ------------------------------------- round-end and resume restores, pinned at the round level
+
+def _state_loop(root, tmp_path, calls):
+    from agentic_configuration_search.loop.runner import Loop
+    return Loop(config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root)}),
+                root, tmp_path / "run",
+                detector_hooks={"weights_ctl": lambda w: calls.append(("w", w)),
+                                "adapt_ctl": lambda p: calls.append(("a", p)),
+                                "repo_root": tmp_path, "base_weights": tmp_path / "b"})
+
+
+def test_round_end_restores_the_loaded_artifact_not_the_round_record(root, tmp_path,
+                                                                     monkeypatch):
+    """The round record (acc.served_a) still says champion, but another artifact
+    is loaded when the round ends — run_round puts the champion artifact back, so
+    nothing but the champion state is left on the detector after the last round."""
+    from agentic_configuration_search.loop.runner import Loop
+    calls = []
+    loop = _state_loop(root, tmp_path, calls)
+    champ_art, other = tmp_path / "champ", tmp_path / "other"
+    champion = {"round": 0, "id": "baseline", "axes": {"crop_classifier": True},
+                "weights": None, "adapt_root": str(champ_art), "adapt_lambda": 0.5,
+                "setting": {"fit_dev_micro_f_beta": 0.5, "configs": [], "per_class": {}},
+                "materials_dir": str(tmp_path / "m"), "eval": {"micro_f_beta": 0.5}}
+    loop._adapt_ctl(champ_art, 0.5)
+
+    def attempt(self, rd, champion, proposal, acc):
+        acc.n_runnable += 1                               # a candidate ran and was rejected
+        self._adapt_ctl(other, 0.25)                      # a swap the round record missed
+    monkeypatch.setattr(Loop, "_attempt", attempt)
+    monkeypatch.setattr(Loop, "_diagnosis", lambda self, *a, **k: {})
+    monkeypatch.setattr(Loop, "_crop_notes", lambda self, *a, **k: None)
+    monkeypatch.setattr(Loop, "_propose",
+                        lambda self, *a, **k: {"candidates": [], "stop": False})
+    monkeypatch.setattr(Loop, "_reask", lambda self, *a, **k: None)
+    calls.clear()
+    loop.run_round(1, champion, [])
+    assert (Path(loop._adapt_path), loop._adapt_lambda) == (champ_art, 0.5)
+    assert calls[-1] == ("a", str(champ_art))
+    assert gateway.classifier_blend() == 0.5
+
+
+def test_resume_restore_marks_the_champion_weights_as_loaded(root, tmp_path):
+    """The resume weight restore also goes through _weights_ctl — a following
+    request for the same weights (the lora baseline) does not swap again or empty
+    the pass cache."""
+    calls = []
+    loop = _state_loop(root, tmp_path, calls)
+    arm = tmp_path / "arm.json"
+    loop._restore_detector_state({"weights": str(arm), "adapt_root": None})
+    loop._weights_ctl(arm)
+    assert calls == [("w", arm)]
