@@ -118,7 +118,9 @@ runs/<dataset>/run/
 - Before touching anything, check running experiments with `nvidia-smi` and
   `pgrep -af "run_parallel|agentic_configuration_search|vllm"`.
 - Do not take down the vLLM planner server (GPU 3, port 8104). Start it with
-  `scripts/start_vllm.sh`; check it with `curl 127.0.0.1:8104/health`.
+  `scripts/start_vllm.sh`; check it with `curl 127.0.0.1:8104/health`. When
+  sharing the GPU, lower its preallocation with e.g. `--gpu-mem 0.5` (default
+  0.9; 27B-FP8 weights are ~29 GB, so 0.5 ≈ 40 GB is near the floor).
 - `scripts/run_parallel.sh` runs with `--resume` inside, so it is safe to
   restart. Logs go to `runs/_log_<ds>.txt`.
 - Deleting `runs/`: on NFS an open fd blocks it. Stop monitors, mv, then rm.
