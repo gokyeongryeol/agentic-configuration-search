@@ -320,7 +320,7 @@ def test_runner_feeds_budget_card_into_the_prompt(big_root, tmp_path,  # noqa: F
 
 
 # --- untried axes ----------------------------------------------------------------
-# Ported from zero-agent: with one candidate per round the planner proposed four
+# Why: in a validation run with one candidate per round the planner proposed four
 # exemplar_k variants before reaching crop_classifier, an axis that had been
 # worth +0.06 in earlier runs. With few candidates the order is the budget.
 

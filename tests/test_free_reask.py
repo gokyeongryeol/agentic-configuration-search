@@ -1,6 +1,6 @@
 """A proposal that is the champion itself does not use up the round's re-ask.
 
-Ported from zero-agent: a validation run's only candidate in a round was the
+Why: a validation run's only candidate in a round was the
 request that had adopted the current champion ({lora, rescorer}; the rescorer
 refit came out identity, so the champion label was {lora}). Combo dedup dropped
 it as combo_tried, and the round's one re-ask was spent on it.

@@ -1,6 +1,6 @@
 """lora (tail) training reuse — within a run, equal training inputs reuse the tuned subset.
 
-Ported from zero-agent: retraining for every lora candidate cost one validation
+Why: retraining for every lora candidate cost one validation
 run 8 trainings (~232 min). The training inputs (fit_train GT, base weights,
 seed, training hyperparameters) do not depend on the champion within a run —
 training always starts from the base weights. So the tuned subset is cached per
