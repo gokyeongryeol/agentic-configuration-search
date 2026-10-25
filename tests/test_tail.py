@@ -303,6 +303,44 @@ def test_train_tail_drops_trainer_checkpoints(dataset_root, tmp_path):
     assert (out / "ultralytics" / "train" / "args.yaml").exists()
 
 
+def test_train_tail_uses_expandable_segments(dataset_root, tmp_path, monkeypatch):
+    """Tail training shares the GPU with the in-process detector — the training
+    process gets the fragmentation-reducing allocator setting by default."""
+    from agentic_configuration_search.fitting.tail import train_tail
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
+    cfg = config_from_dict({"dataset": str(dataset_root)})
+    seen = {}
+    fake = _fake_training()
+
+    def popen(cmd, env=None, **kw):
+        seen["env"] = env
+        return fake(cmd, env=env, **kw)
+
+    train_tail(cfg, fit_train=ds.fit_train, ontology=ds.ontology,
+               base_weights=tmp_path / "base.pt", out_dir=tmp_path / "tail", seed=0,
+               log_path=tmp_path / "tail" / "train.log", popen=popen)
+    assert seen["env"]["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+
+
+def test_train_tail_keeps_operator_alloc_conf(dataset_root, tmp_path, monkeypatch):
+    from agentic_configuration_search.fitting.tail import train_tail
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "max_split_size_mb:128")
+    ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
+    cfg = config_from_dict({"dataset": str(dataset_root)})
+    seen = {}
+    fake = _fake_training()
+
+    def popen(cmd, env=None, **kw):
+        seen["env"] = env
+        return fake(cmd, env=env, **kw)
+
+    train_tail(cfg, fit_train=ds.fit_train, ontology=ds.ontology,
+               base_weights=tmp_path / "base.pt", out_dir=tmp_path / "tail", seed=0,
+               log_path=tmp_path / "tail" / "train.log", popen=popen)
+    assert seen["env"]["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:128"
+
+
 def test_train_tail_keeps_checkpoints_when_training_fails(dataset_root, tmp_path):
     """A failed run keeps whatever the trainer left, for diagnosis."""
     from agentic_configuration_search.fitting.tail import train_tail

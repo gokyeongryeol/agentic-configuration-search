@@ -71,6 +71,14 @@ def export_yolo_dataset(split, ontology, out_dir: Path) -> Path:
     return data_yaml
 
 
+# Tail training shares its GPU with the in-process detector — once fragmentation
+# piles up reserved-but-unallocated memory, a large allocation fails with OOM
+# even though memory is left. The allocator setting only changes allocation, so
+# results are the same. A value the operator set in the env wins.
+ALLOC_CONF = "PYTORCH_ALLOC_CONF"
+EXPANDABLE = "expandable_segments:True"
+
+
 def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
                seed: int, log_path: Path,
                popen=subprocess.Popen) -> Path:
@@ -104,6 +112,7 @@ def train_tail(cfg, *, fit_train, ontology, base_weights: Path, out_dir: Path,
              len(fit_train.images), cfg.lora.epochs, cfg.lora.device, log_path)
     env = {**os.environ}
     env.pop("CUDA_VISIBLE_DEVICES", None)   # defensively clear any inherited GPU masking
+    env.setdefault(ALLOC_CONF, EXPANDABLE)
     with open(log_path, "ab") as fh:
         proc = popen(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT)
         rc = proc.wait()

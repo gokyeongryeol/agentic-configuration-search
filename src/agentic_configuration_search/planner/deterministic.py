@@ -62,17 +62,23 @@ def _error_ranking(diagnosis: dict) -> list[str]:
     return [k for k, n in sorted(counts.items(), key=lambda kv: -kv[1]) if n > 0]
 
 
+ERROR_RETRIES = 1                         # times a skipped=error combination is allowed again
+
+
 def tried_combos(history: list[dict]) -> set[tuple]:
     """Set of **full axes combinations** tried in previous rounds.
 
     Keyed by combination because it carries the champion context — an axis
     rejected under an old champion must be retryable once the champion changes.
     Only exact retries of the same combination are blocked for good. The
-    runner's shared filter uses this set too.
+    runner's shared filter uses this set too. A combination that failed with
+    skipped=error is not blocked until it fails ERROR_RETRIES + 1 times.
     """
     out: set[tuple] = set()
+    errors: dict[tuple, int] = {}
     for entry in history:
         for c in entry.get("candidates", []):
+            keys = set()
             # requested_axes: the original request of a candidate relabelled
             # after measurement — the requested combination was tried too
             # (blocking only the corrected axes lets the same request return)
@@ -83,7 +89,16 @@ def tried_combos(history: list[dict]) -> set[tuple]:
                     axes = validate_axes(axes)
                 except ValueError:
                     pass                  # old-format record — key it as-is
-                out.add(tuple(sorted(axes.items())))
+                keys.add(tuple(sorted(axes.items())))
+            for key in keys:
+                if c.get("skipped") == "error":
+                    # a transient error (OOM, worker failure) is not a
+                    # measurement — allow it once more and block from the second
+                    # failure on (so a deterministic failure does not repeat)
+                    errors[key] = errors.get(key, 0) + 1
+                    if errors[key] < ERROR_RETRIES + 1:
+                        continue
+                out.add(key)
     return out
 
 

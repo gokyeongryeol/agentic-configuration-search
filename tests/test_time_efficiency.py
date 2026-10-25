@@ -495,3 +495,35 @@ def test_folded_axis_lines_under_current_champion():
     # a champion change starts over
     moved = hist + [_entry(3, 3, [], champ_axes={"alias": "vlm"})]
     assert _folded_axis_lines(moved) == []
+
+
+def test_prescreen_is_only_for_grid_increases(monkeypatch):
+    """A grid below the champion's is not prescreened — it is cheaper, and unused
+    tiles on the subset do not make it the same setting as the champion (which
+    uses tiles). The full path measures it."""
+    from types import SimpleNamespace
+
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop import runner
+    from agentic_configuration_search.loop.runner import Loop
+
+    monkeypatch.setattr(runner, "prescreen_subset",
+                        lambda *a, **kw: SimpleNamespace(images=[0] * 40))
+
+    class Screened(Exception):
+        pass
+
+    def screen(*a, **kw):
+        raise Screened
+
+    champ = validate_axes({"tiling": 4})
+    fake = SimpleNamespace(
+        cfg=config_from_dict({"dataset": "x", "screen": {"prescreen_min_grid": 2,
+                                                         "lost_value_prescreen": False}}),
+        _champion={"axes": champ}, _screen=screen,
+        ds=SimpleNamespace(fit_dev=SimpleNamespace(images=[0] * 400)))
+    lower = validate_axes({"tiling": 3})
+    assert Loop._prescreen(fake, {"axes": lower}, lower, None, {}, []) is False
+    higher = validate_axes({"tiling": 5})
+    with pytest.raises(Screened):
+        Loop._prescreen(fake, {"axes": higher}, higher, None, {}, [])
