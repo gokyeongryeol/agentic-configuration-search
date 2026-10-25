@@ -295,12 +295,8 @@ def test_no_rechoice_without_a_champion_classifier_or_with_retune_off():
 def test_serve_champion_restores_a_leftover_arm_state():
     """An arm that cleared its margin but was dropped before holdout leaves the
     detector in its own state — the next attempt starts from the champion state."""
-    from types import SimpleNamespace
-
     from agentic_configuration_search.loop.runner import Loop, _RoundAcc
-    calls = []
-    fake = SimpleNamespace(detector_hooks={"weights_ctl": lambda w: calls.append(("w", w))},
-                           _adapt_ctl=lambda p, lam: calls.append(("a", p, lam)))
+    fake, calls = _state_fake("/champ", 1.0)
     champ = {"weights": None, "adapt_root": "/champ", "adapt_lambda": 0.5}
     acc = _RoundAcc(served_w="/arm.json", served_a="/champ", served_l=1.0)
     Loop._serve_champion(fake, champ, acc)
@@ -309,3 +305,29 @@ def test_serve_champion_restores_a_leftover_arm_state():
     calls.clear()
     Loop._serve_champion(fake, champ, acc)                 # already champion — nothing to do
     assert calls == []
+
+
+def _state_fake(path, lam):
+    """A Loop stand-in whose _adapt_ctl records the call and the loaded state."""
+    from types import SimpleNamespace
+    calls = []
+    fake = SimpleNamespace(detector_hooks={"weights_ctl": lambda w: calls.append(("w", w))},
+                           _adapt_path=path, _adapt_lambda=lam)
+
+    def adapt_ctl(p, lam):
+        calls.append(("a", p, lam))
+        fake._adapt_path, fake._adapt_lambda = p, lam
+    fake._adapt_ctl = adapt_ctl
+    return fake, calls
+
+
+def test_serve_champion_checks_the_loaded_state_not_the_round_record():
+    """The round record says champion, but another artifact is actually loaded —
+    it is still put back to the champion's."""
+    from agentic_configuration_search.loop.runner import Loop, _RoundAcc
+    fake, calls = _state_fake("/other", 0.25)
+    champ = {"weights": None, "adapt_root": "/champ", "adapt_lambda": 0.5}
+    acc = _RoundAcc(served_w=None, served_a="/champ", served_l=0.5)
+    Loop._serve_champion(fake, champ, acc)
+    assert calls == [("a", "/champ", 0.5)]
+    assert (fake._adapt_path, fake._adapt_lambda) == ("/champ", 0.5)
