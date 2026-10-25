@@ -166,6 +166,10 @@ class Loop:
         self._adapt_path = None
         self._adapt_lambda = None
         gateway.set_classifier_blend(None)
+        # loaded tail weights (None = base) — unknown until the first swap; only
+        # _weights_ctl changes them
+        self._weights_path = None
+        self._weights_synced = False
         # validated here because config is a leaf — no silent absorption of typos (see config.py)
         bad = sorted(set(cfg.search.disabled_axes) - set(AXES))
         if bad:
@@ -335,6 +339,25 @@ class Loop:
         self._adapt_lambda = lam if path is not None else None
         gateway.set_classifier_blend(self._adapt_lambda)
 
+    def _weights_ctl(self, weights) -> None:
+        """Swap the detector weights (None = base) — skipped when that path is
+        already loaded.
+
+        The hook empties the pass cache on every call (_invalidating_hooks). A
+        lora candidate starts on the champion state (_serve_champion) and then
+        run_tail_candidate asks for the same weights again as its baseline —
+        that would throw away the cache filled on the champion state before the
+        baseline screen. Arm descriptors are written fresh per candidate
+        directory, so one path never holds different contents. At first and
+        after a failed swap the loaded state is unknown, so the same path is
+        swapped in again."""
+        if self._weights_synced and _same_state(weights, self._weights_path):
+            return
+        self._weights_synced = False
+        self.detector_hooks["weights_ctl"](weights)
+        self._weights_path = weights
+        self._weights_synced = True
+
     def _restore_detector_state(self, champion: dict) -> None:
         """On resume, re-apply the champion's detector state (weights and
         reclassification artifact) to the in-process client.
@@ -350,7 +373,7 @@ class Loop:
         adapt_root = champion.get("adapt_root")
         if weights and self.detector_hooks.get("weights_ctl"):
             log.info("resume: restored champion weights %s", weights)
-            self.detector_hooks["weights_ctl"](Path(weights))
+            self._weights_ctl(Path(weights))
         if adapt_root and self.detector_hooks.get("adapt_ctl"):
             if champion.get("adapt_lambda") is None:
                 raise RuntimeError(
@@ -1340,7 +1363,7 @@ class Loop:
         if not self.detector_hooks:
             return                        # run without state controls — the state never changed
         if not _same_state(acc.served_w, champion.get("weights")):
-            self.detector_hooks["weights_ctl"](champion.get("weights"))
+            self._weights_ctl(champion.get("weights"))
             acc.served_w = champion.get("weights")
         if not (_same_state(self._adapt_path, champion.get("adapt_root"))
                 and self._adapt_lambda == champion.get("adapt_lambda")):
@@ -1462,7 +1485,7 @@ class Loop:
                 res = tail_round.run_tail_candidate(
                     self.cfg, self.ds, base_axes, materials, mat_dir,
                     screen_fn=self._screen,
-                    weights_ctl=self.detector_hooks["weights_ctl"],
+                    weights_ctl=self._weights_ctl,
                     base_weights=self.detector_hooks["base_weights"],
                     restore_weights=champion.get("weights"),
                     seed=self.cfg.run_seed,
@@ -1473,7 +1496,7 @@ class Loop:
                 served_w = res["weights"] or champion.get("weights")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("lora candidate %s failed — restored current weights and rejected", c["id"])
-                self.detector_hooks["weights_ctl"](champion.get("weights"))
+                self._weights_ctl(champion.get("weights"))
                 served_w = champion.get("weights")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})

@@ -442,3 +442,56 @@ def test_second_classifier_candidate_mines_without_previous_arm(root, tmp_path,
     _two_candidates(loop, tmp_path, "crop_classifier", "k")
     assert [m[1:] for m in mined] == [(None, None), (None, None)], \
         "mined on the previous arm's artifact"
+
+
+# ------------------------------------------------- same weights are not swapped in again
+
+def test_same_weights_are_not_reloaded(root, tmp_path):
+    """Like the artifact, weights already loaded are not swapped in again — the
+    pass cache flush goes with it. At first (state unknown) and after a failed
+    swap they are swapped in again."""
+    from agentic_configuration_search.loop.runner import Loop
+    calls = []
+
+    def ctl(w):
+        calls.append(w)
+        if w == "boom":
+            raise RuntimeError("swap failed")
+    loop = Loop(config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root)}),
+                root, tmp_path / "run",
+                detector_hooks={"weights_ctl": ctl, "adapt_ctl": lambda p: None,
+                                "repo_root": tmp_path, "base_weights": tmp_path / "b"})
+    loop._weights_ctl(None)
+    loop._weights_ctl(None)
+    assert calls == [None], "only the first — the same state is not swapped in again"
+    loop._weights_ctl(tmp_path / "arm")
+    loop._weights_ctl(str(tmp_path / "arm"))              # str and Path mixed are the same
+    assert calls == [None, tmp_path / "arm"]
+    with pytest.raises(RuntimeError):
+        loop._weights_ctl("boom")
+    loop._weights_ctl(tmp_path / "arm")                   # after a failure the state is unknown
+    assert calls[-1] == tmp_path / "arm" and len(calls) == 4
+
+
+def test_lora_candidate_baseline_keeps_the_pass_cache(root, tmp_path, monkeypatch):
+    """Once _serve_champion has the champion weights loaded, run_tail_candidate's
+    baseline restore (weights_ctl(restore_weights)) does not touch the detector
+    or empty the pass cache."""
+    from agentic_configuration_search.loop import tail_round
+    from agentic_configuration_search.loop.runner import _RoundAcc
+    state = {"w": None, "a": None}
+    loop, _ = _two_arm_loop(root, tmp_path, monkeypatch, state)
+    loop._weights_ctl(None)                               # knows the champion state (base)
+    flushed = []
+    monkeypatch.setattr(gateway, "invalidate_pass_cache", lambda: flushed.append(1))
+
+    def fake_tail(cfg, ds, axes, materials, out_dir, *, weights_ctl, restore_weights, **kw):
+        weights_ctl(restore_weights)
+        return {"weights": None, "setting": {"fit_dev_micro_f_beta": 0.5},
+                "grid": [], "decision": {"adopted": False, "reason": "x"}}
+    monkeypatch.setattr(tail_round, "run_tail_candidate", fake_tail)
+    champion = {"weights": None, "adapt_root": None, "adapt_lambda": None, "axes": {}}
+    loop._attempt(tmp_path / "rd", champion,
+                  {"candidates": [{"id": "l1", "axes": {"lora": True}}], "stop": False},
+                  _RoundAcc(served_w=None, served_a=None, served_l=None))
+    assert flushed == []

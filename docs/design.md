@@ -248,7 +248,9 @@ planner's input for the same round.
   loaded rather than the round record. Each detector-state candidate also
   starts with this restore: an earlier candidate's adopted arm may still be
   loaded from its holdout, and the candidate's materials (the FP-mining train
-  pass) must be mined on the champion detector before its arms run.
+  pass) must be mined on the champion detector before its arms run. A swap to
+  the state already loaded is not sent (weights `Loop._weights_ctl`, artifact
+  `Loop._adapt_ctl`), because every swap also empties the pass cache.
 - **classifier blend λ**: the detector state is (weights, artifact, λ). λ is
   the loop-side blend (`infer.gateway.set_classifier_blend`), so changing only
   λ does not reload the artifact, and the pass cache keeps raw responses (with
