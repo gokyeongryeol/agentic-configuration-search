@@ -306,10 +306,11 @@ def test_merge_is_fast_on_topk_sized_inputs():
     import time
     rng = random.Random(0)
     results, tiles = _random_pieces(rng, 640, 640, 2, n_per_piece=300, n_labels=1)
-    t0 = time.perf_counter()
+    # this process's CPU time, not wall clock — shared-machine load does not fail it
+    t0 = time.process_time()
     tiling.merge_from_results(results, tiles, False, 640, 640,
                               {"grid": 2, "overlap": 0.5, "merge": "nmm"})
-    assert time.perf_counter() - t0 < 1.0
+    assert time.process_time() - t0 < 1.0
 
 
 
@@ -373,10 +374,11 @@ def test_sahi_is_fast_on_topk_sized_inputs():
     import time
     rng = random.Random(0)
     results, tiles = _random_pieces(rng, 640, 640, 3, n_per_piece=300, n_labels=1)
-    t0 = time.perf_counter()
+    # this process's CPU time, not wall clock — shared-machine load does not fail it
+    t0 = time.process_time()
     tiling.merge_from_results(results, tiles, False, 640, 640,
                               {"grid": 3, "overlap": 0.5, "merge": "sahi"})
-    assert time.perf_counter() - t0 < 1.0
+    assert time.process_time() - t0 < 1.0
 
 
 def test_merge_min_score_only_gates_who_merges_and_keeps_low_scores():
