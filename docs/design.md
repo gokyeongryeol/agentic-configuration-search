@@ -243,7 +243,9 @@ planner's input for the same round.
   `detector_state_off` without evaluation. Every attempt (the first proposal
   and each re-ask) starts by bringing the detector back to the champion state,
   so an arm that cleared its margin but was dropped before holdout does not
-  stay loaded under the next candidates.
+  stay loaded under the next candidates. The end-of-round restore goes through
+  the same step, and it compares the artifact and λ against what is actually
+  loaded rather than the round record.
 - **classifier blend λ**: the detector state is (weights, artifact, λ). λ is
   the loop-side blend (`infer.gateway.set_classifier_blend`), so changing only
   λ does not reload the artifact, and the pass cache keeps raw responses (with

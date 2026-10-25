@@ -1178,7 +1178,6 @@ class Loop:
             proposal = nxt
             self._attempt(rd, champion, proposal, acc)
         skipped, screened, evaluated = acc.skipped, acc.screened, acc.evaluated
-        served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
         reask_mark = ({"reasks": reasks} if reasks else {}) \
             | ({"free_reasks": free} if free else {})
 
@@ -1270,11 +1269,7 @@ class Loop:
         # candidates swap it in turn, so the last candidate's state is not
         # necessarily the winner's — a lora winner may have been unloaded before
         # the classifier candidates.
-        if not _same_state(served_w, champion.get("weights")):
-            self.detector_hooks["weights_ctl"](champion.get("weights"))
-        if not (_same_state(served_a, champion.get("adapt_root"))
-                and served_l == champion.get("adapt_lambda")):
-            self._adapt_ctl(champion.get("adapt_root"), champion.get("adapt_lambda"))
+        self._serve_champion(champion, acc)
         _write(rd / "decision.json", decision)
         self._append_history({
             "round": r,
@@ -1336,17 +1331,22 @@ class Loop:
         restores only the weights (tail_round), so this is needed before lora
         candidates too, so they are not measured on a leftover classifier arm —
         hence it runs at the start of every attempt. Nothing happens when the
-        detector is already in the champion state."""
+        detector is already in the champion state. Also used for the
+        end-of-round restore.
+
+        The artifact and λ are compared against what is actually loaded
+        (self._adapt_path / self._adapt_lambda, which only _adapt_ctl changes),
+        not the round record — so a swap the record missed is still undone."""
         if not self.detector_hooks:
             return                        # run without state controls — the state never changed
         if not _same_state(acc.served_w, champion.get("weights")):
             self.detector_hooks["weights_ctl"](champion.get("weights"))
             acc.served_w = champion.get("weights")
-        if not (_same_state(acc.served_a, champion.get("adapt_root"))
-                and acc.served_l == champion.get("adapt_lambda")):
+        if not (_same_state(self._adapt_path, champion.get("adapt_root"))
+                and self._adapt_lambda == champion.get("adapt_lambda")):
             self._adapt_ctl(champion.get("adapt_root"), champion.get("adapt_lambda"))
-            acc.served_a = champion.get("adapt_root")
-            acc.served_l = champion.get("adapt_lambda")
+        acc.served_a = champion.get("adapt_root")
+        acc.served_l = champion.get("adapt_lambda")
 
     def _attempt(self, rd: Path, champion: dict, proposal: dict,
                  acc: "_RoundAcc") -> None:
