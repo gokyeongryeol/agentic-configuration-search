@@ -98,8 +98,16 @@ def gate(champion_records: list[dict], candidate_records: list[dict], *,
     """
     # One-sided — the gate only asks "Δ > margin". A two-sided bound (alpha/2)
     # halves the effective significance level and rejects real gains.
-    out = metrics.bootstrap_ci(champion_records, candidate_records,
-                               micro_f_beta_stat(cat_ids, iou_thr, beta),
+    # Count (tp, fp, fn) per image once — re-matching on every resample makes
+    # one gate n_boot times the matching. micro F(β) is set by the sum of these
+    # counts, so it equals re-matching the records (metrics.micro_f_counts)
+    if len(champion_records) != len(candidate_records):
+        raise ValueError(f"records length mismatch: {len(champion_records)} vs "
+                         f"{len(candidate_records)} — a paired comparison requires "
+                         "the same image set")
+    out = metrics.bootstrap_ci(metrics.image_counts(champion_records, cat_ids, iou_thr),
+                               metrics.image_counts(candidate_records, cat_ids, iou_thr),
+                               lambda rows: metrics.micro_f_counts(rows, beta),
                                n_boot=n_boot, seed=seed, alpha=alpha,
                                tail="lower")
     # Adopt when the lower bound is **≥** margin and the point estimate is a
