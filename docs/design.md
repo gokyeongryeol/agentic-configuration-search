@@ -39,7 +39,7 @@ line) that equals the baseline behavior exactly.
 | `visual_negatives` — Negative visual | `false`: no suppression crops<br>`true`: false-positive crops of the mining pass (the same as `fp_crop`) as negative image prompts (needs `exemplar`), emulated as IoU suppression. The suppression IoU threshold is chosen on fit_dev by screen, one config shared across classes, among a config without negatives and `search.neg_eta_grid` (0.25, 0.35, 0.5, 0.65, 0.75 — lower suppresses more)<br>count `visual_negative_k` ∈ {1, 2, 4} (default 1) |
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
 | `crop_classifier` — Re-classification | `false`: detected classes as-is<br>`true`: a SigLIP2+LoRA classifier re-classifies detection boxes or drops them as background |
-| `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility. On disk a candidate keeps only the tuned tail subset (`tuned_tail.pt`) and one small descriptor JSON per λ > 0 arm — arms are interpolated in memory, λ = 0 is the base itself, and the trainer's full-model checkpoints are deleted after training |
+| `lora` — Tail fine-tune | `false`: base weights<br>`true`: fine-tunes the YOLOE tail on fit_train and interpolates with the base over `lora.lambdas` (0, 0.25, 0.5, 0.75, 1) — λ = 0 is the base. Not searched when fit_train has fewer than `lora.min_images` (20) images. The key keeps the name `lora` for history compatibility. On disk a candidate keeps only one small descriptor JSON per λ > 0 arm; the tuned tail subset (`tuned_tail.pt`) lives in the run's training cache `lora_cache/<digest>/` — arms are interpolated in memory, λ = 0 is the base itself, and the trainer's full-model checkpoints are deleted after training. Training runs once per run: its inputs (fit_train and ontology content, base weights path, `run_seed`, `lora.epochs`·`batch_size`·`lr`) do not depend on the champion, so later lora candidates (same round, carried, later rounds, after resume) rebuild the arms from the cached subset and re-score them, recording `delta_reused` ({tail: {round, id}}). An entry counts only once its `key.json` is written after training; one without it is retrained. The crop classifier is not reused — its training crops are mined from the current setting's FPs |
 | `tiling` — Tiling | `false`: full image only<br>g ∈ {2, 3, 4, 5, 6}: a config that also infers the image as g×g tiles and merges (by default with SAHI GreedyNMM: only detections scoring ≥ `search.tiling_merge_min_score` (0.3) are merged, and those below it are kept minus the ones overlapping a merged result — `search.tiling_merge` also offers `nmm` and `nms`). Zoom (g−1)(1−overlap)+1 (at overlap 0.5, g=2 is 1.5×, g=3 is 2×), 1+g² forwards per image per pass. The planner picks the first grid from the missed_small sizes and the TP sizes the champion already detects (s*). If grid g went unused under the current champion, grids ≥ g are rejected as `tiling_blocked` until the champion changes (raising is only recommended, not enforced). Exception: if g lost to no tiling on fit_dev only within noise (one-sided paired-bootstrap upper bound `tiling_f.gap_ub` ≥ 0) and fell short on zoom (for the median m of the class with the most missed_small, m·zoom(g) < s* ≤ m·zoom(g+1), s* = the `search.tiling_tp_quantile` quantile of that class's champion TP sizes — m and s* are both train sizes counted at the champion's fit_dev screen thresholds, so holdout plays no part; with fewer than `search.tiling_tp_min` TPs there is no verdict), g+1 is opened — once, until a g+1 reaches screen (several g+1 candidates in the same proposal all pass). Grids ≥ `screen.prescreen_min_grid` (3) are first screened on a fit_dev subset |
 
 An axis that is on may still go unused by the setting — screen picks whichever
@@ -142,6 +142,18 @@ planner's input for the same round.
   champion are reused. Re-asked candidates go through the same filters, screen
   and holdout and stay in the same round's history as `reask: k`. LLM planner
   only (the deterministic planner is not re-asked).
+- **re-proposing the champion does not use up the re-ask**: a combination equal
+  to the current champion's axes, or to the request that adopted it (the
+  history row's `axes`/`requested_axes` — it can differ from the label after an
+  unused-axis correction or an identity rescorer refit), is dropped as
+  `champion_combo` (apart from the plain `combo_tried`). If a proposal is only
+  such no-op drops (`champion_combo`, `no_change`), the planner is re-asked once
+  per round (`FREE_REASKS`) without counting toward `planner.max_reasks`,
+  recorded as `free_reasks` on the decision. The cap keeps a planner that
+  repeats itself from never ending the round; `max_reasks: 0` turns this off
+  too. The re-ask number k runs in order either way, and the verdict reads only
+  the replayed proposal and history, so resume decides the same. The prompt's
+  tried-combination list also names that request as the champion itself.
 - **candidate ids**: the loop adds an `r<round>_` prefix before recording
   (`r2_cand_0`, re-ask `r2_reask1_0`, human candidate `r2_human_x`) — ids stay
   unique within the run even when the planner reuses them every round. Carried
@@ -247,10 +259,21 @@ planner's input for the same round.
   | Budget | rounds left, stop counters (rounds without adoption vs `saturation.rounds`, empty rounds in a row vs `saturation.empty_rounds`), per-axis median of observed wall clock per candidate (axes not yet observed get a static note — tiling 1+g² passes, tail and classifier training, rescorer refit) |
   | Current champion | axes on, holdout and fit_dev micro F, adoption round, passes per image |
   | Axis ledger | per (axis=value) under the current champion: tries (alone), best fit_dev Δ (upper bound), best holdout Δ (lower bound — shown only), status (clearly-lost (prescreened), near-miss, folded, unused, no_material, …), minutes spent. Below it, one line of combinations already tried |
-  | Allowed moves | tiling fold and a grid opened once by the near-miss exception, folded axes, axes with empty material, prescreened values with their evidence, carried candidates |
+  | Allowed moves | tiling fold and a grid opened once by the near-miss exception, folded axes, axes with empty material, prescreened values with their evidence, carried candidates, untried axes (below) |
   | Round history | the last 3 rounds in per-candidate detail (JSON), earlier rounds one line each (adopted increment and Δ, or no adoption and the number of candidates) |
   | Diagnosis digest | counts per cause (train, holdout) and the axes that target it, missed-small sizes, per-class aggregates and samples |
   | Response | per candidate `axes`, `expected_gain` (expected holdout Δ), `cost_min` (expected minutes), `differs` (for a variant of a clearly-lost value, what is different) and `rationale` |
+
+  **Untried axes are suggested first (guidance only, nothing is blocked).**
+  Allowed moves carries an "Untried axes under the current champion" line —
+  function axes that are not disabled, still have a value to turn on besides
+  the champion's, and were never measured under the current champion (a
+  quantity-axis variant counts for its function axis; rows dropped without
+  being measured do not count) — and, among them, axes never proposed in the
+  whole run. One rule sentence: while untried axes remain, prefer one over
+  another variant of an already-tried value unless the diagnosis gives a
+  concrete reason. With few candidates per round the order is the budget. The
+  deterministic planner is unchanged.
 
   If the response's `expected_gain`, `cost_min` or `differs` is missing or
   malformed only that field is dropped — the candidate is neither discarded
@@ -261,7 +284,8 @@ planner's input for the same round.
 
 ```
 runs/<dataset>/run/
-  history.jsonl        # round ledger (per-candidate wall_min, reask, fit_dev_cmp, lost_values, plan;
+  history.jsonl        # round ledger (per-candidate wall_min, reask, fit_dev_cmp, lost_values, plan,
+                       # delta_reused;
                        # per-round pass_cache counts)
   run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
                        # holdout_split, final_diagnosis (reused or not, duration)
@@ -271,13 +295,15 @@ runs/<dataset>/run/
   rounds/round_NNN/    # proposal (+ proposal_reask<k>), settings/<cand>/ materials, screen, eval,
                        # decision, diagnosis (+ diagnosis_key), crop_notes
   rounds/final/        # final champion diagnosis (diagnosis, diagnosis_key, crop_notes) + residual.json
+  lora_cache/          # tail training output (tuned_tail.pt) per training key — reused within the run
   report.md            # output of acs report
 ```
 
 - **Candidate ids** get an `r<round>_` prefix before recording; only carried
   candidates keep `carry_<original id>` (see the round loop).
 - **History fields**: candidate rows carry `wall_min`, `reask`, `fit_dev_cmp`,
-  `lost_values` and `plan`; round rows carry `pass_cache`. `plan` is the LLM
+  `lost_values`, `plan` and `delta_reused` (origin of a reused tail training);
+  round rows carry `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
   response's `expected_gain`, `cost_min` and `differs`; only a malformed field
   is dropped.
 - **Final diagnosis** (`rounds/final/`): a failure still ends the run, and the

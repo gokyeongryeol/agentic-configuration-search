@@ -21,9 +21,10 @@ from pathlib import Path
 
 from ..diagnose.sample import pick_detail
 from . import deterministic
-from .axes import PLAN_DIFFERS_MAX, DatasetFacts, axis_values, sanitize_candidates
+from .axes import (BASELINE, PLAN_DIFFERS_MAX, DatasetFacts, axis_values,
+                   sanitize_candidates)
 from .gates import INPUT_SIDE, champion_round, tiling_gate, tp_floor, under_champion
-from .ledger import axis_ledger, tried_under_champion
+from .ledger import K_PARENT, axis_ledger, champion_requests, tried_under_champion
 from .ledger import label as value_label
 
 log = logging.getLogger(__name__)
@@ -406,6 +407,70 @@ def _folded_axis_lines(history: list[dict]) -> list[str]:
     return lines + gate.describe()
 
 
+# rows dropped without being measured — they do not count as trying the axis
+# (hygiene, combo dedup, not wirable)
+_UNMEASURED = {"combo_tried", "no_change", "champion_combo", "axis_disabled",
+               "max_candidates", "invalid_axes", "duplicate_axes",
+               "carried_duplicate", "missing_hook", "lora_deps", "adapt_ctl",
+               "detector_state_off", "compound_server_state"}
+
+UNTRIED_RULE = ("While untried axes remain, prefer one of them over another variant "
+                "of an already-tried value, unless the diagnosis gives a concrete "
+                "reason for the variant.")
+
+
+def _axes_touched(axes: dict, base: dict) -> set[str]:
+    """Function axes changed from base — quantity axes (exemplar_k etc.) fold into their function axis."""
+    return {K_PARENT.get(k, k) for k in _delta_axes(axes, base)}
+
+
+def _untried_axis_lines(history: list[dict], values: dict, disabled=()) -> list[str]:
+    """Axes never measured under the current champion — with few candidates per
+    round the order is the budget, so this keeps the planner from repeating
+    variants and reaching other axes late (guidance only, nothing is blocked).
+
+    Targets are function axes that are not disabled (search.disabled_axes) and
+    still have a value to turn on besides the champion's — axes the data blocks
+    (values axis_values left out), boolean axes the champion already turned on,
+    and visual_negatives while the champion has no exemplar (a layer on top of
+    exemplars) are left out. A try is a candidate row that changed the axis (by
+    request; quantity axes count for their function axis); rows dropped without
+    being measured (_UNMEASURED) do not count. Axes never proposed in the whole
+    run are marked separately (each round against the champion it started
+    with)."""
+    if not history:
+        return []
+    champ = (history[-1].get("champion") or {}).get("axes") or {}
+    open_axes = [k for k, vals in values.items()
+                 if k in BASELINE and k not in K_PARENT and k not in disabled
+                 and any(v != BASELINE[k] and v != champ.get(k) for v in vals)
+                 # visual negatives are a layer on exemplars — cannot be turned on alone
+                 and not (k == "visual_negatives"
+                          and champ.get("exemplar", "none") == "none")]
+    if not open_axes:
+        return []
+    recent: set[str] = set()
+    for e in under_champion(history):
+        for c in e.get("candidates", []):
+            if c.get("skipped") not in _UNMEASURED:
+                recent |= _axes_touched(c.get("requested_axes") or c.get("axes"), champ)
+    ever = {k for k, v in champ.items() if v != BASELINE.get(k, v)}
+    for i, e in enumerate(history):
+        start = ((history[i - 1].get("champion") or {}).get("axes") if i > 0
+                 else None) or (e.get("champion") or {}).get("axes") or {}
+        ever |= {k for k, v in start.items() if v != BASELINE.get(k, v)}
+        for c in e.get("candidates", []):
+            if c.get("skipped") not in _UNMEASURED:
+                ever |= _axes_touched(c.get("requested_axes") or c.get("axes"), start)
+    untried = [k for k in open_axes if k not in recent]
+    if not untried:
+        return []
+    never = [k for k in untried if k not in ever]
+    return [f"- Untried axes under the current champion: {', '.join(untried)}"
+            + (f" (never tried in this run: {', '.join(never)})" if never else "")
+            + f". {UNTRIED_RULE}"]
+
+
 def _on_axes(axes: dict) -> dict:
     """Only axes that are on — off axes (False/None/"none") are safe points and carry no information."""
     return {k: v for k, v in (axes or {}).items()
@@ -709,10 +774,16 @@ def _ledger_block(history: list[dict]) -> str:
             lines.append(f"... and {len(rows) - MAX_LEDGER_ROWS} more values")
     tried = tried_under_champion(history)[-MAX_TRIED:]
     # the current champion's own combination (empty increment) comes first —
-    # stating it is not a candidate
+    # stating it is not a candidate. If the request that adopted the champion
+    # differs from its label (unused-axis correction, rescorer identity refit),
+    # that is the champion too — stated so it is not read as a new combination
+    asked = [", ".join(f"{k}={v}" for k, v in sorted(_delta_axes(a, champ).items()))
+             for a in champion_requests(history)]
+    itself = [CHAMPION_REQUEST.format(f"{{{a}}}") for a in dict.fromkeys(asked) if a]
     lines.append("Combos already tried, as differences from the champion (an exact "
                  "repeat is dropped as skipped=\"combo_tried\"): "
-                 + "; ".join([CHAMPION_COMBO] + [f"{{{t}}}" for t in tried]))
+                 + "; ".join([CHAMPION_COMBO] + itself
+                             + [f"{{{t}}}" for t in tried if t not in asked]))
     return "\n".join(lines)
 
 
@@ -720,10 +791,16 @@ def _ledger_block(history: list[dict]) -> str:
 # Re-proposing it has no increment and is dropped
 CHAMPION_COMBO = ("{} = the current champion itself (not a candidate: re-proposing "
                   "it changes nothing and is dropped as skipped=\"no_change\")")
+# when the request that adopted the champion differs from its label — that
+# request is the champion too
+CHAMPION_REQUEST = ("{} = the request that adopted the current champion (an axis it "
+                    "asked for was unused or came out identity, so it IS the champion; "
+                    "dropped as skipped=\"champion_combo\")")
 
 
 def _allowed_lines(history: list[dict], *, prescreen: dict | None, dead: list[str],
-                   folded: list[str], carried: list[str]) -> list[str]:
+                   folded: list[str], carried: list[str],
+                   untried: list[str] = ()) -> list[str]:
     """What may be proposed this round — what is blocked (tiling fold, folded
     axes, exhausted material, carried candidates) and which values are
     prescreened. Disabled axes are already stated by the axis list (axes_doc)."""
@@ -752,7 +829,8 @@ def _allowed_lines(history: list[dict], *, prescreen: dict | None, dead: list[st
     if carried:
         lines.append(CARRY_BLOCK.strip("\n").format(
             carried="\n".join(f"- {x}" for x in carried)))
-    return lines or ["- No blocked axes or prescreened values right now."]
+    return (lines or ["- No blocked axes or prescreened values right now."]) \
+        + list(untried)
 
 
 def _older_lines(history: list[dict], window: int) -> list[str]:
@@ -945,7 +1023,8 @@ the current champion, then why it was dropped):
 {outcomes}
 Propose up to {k} new candidates that differ from all of the above and from the
 already-tried combinations, under the same rules, in the same JSON format. Avoid
-the same failure: a folded tiling grid is blocked, an axis the screen left unused
+the same failure: re-proposing the current champion (skipped="champion_combo")
+changes nothing, a folded tiling grid is blocked, an axis the screen left unused
 stays unused for other values of it, a quantity whose material collapsed to
 the same setting collapses again, and a variant of a clearly-lost value that the
 prescreen dropped (lost_value_prescreen) needs a real difference to pass. If
@@ -1126,7 +1205,13 @@ class LLMPlanner:
         allowed = _allowed_lines(history, prescreen=self.prescreen,
                                  dead=_dead_axis_lines(history),
                                  folded=_folded_axis_lines(history),
-                                 carried=carry_lines)
+                                 carried=carry_lines,
+                                 untried=_untried_axis_lines(
+                                     history,
+                                     {k: [x for x in v
+                                          if x not in self.disabled_values.get(k, ())]
+                                      for k, v in axis_values(self.facts).items()},
+                                     self.disabled_axes))
         budget = _budget_lines(self.budget, history, self.disabled_axes)
         champion_text = _champion_block(history)
         ledger = _ledger_block(history)
