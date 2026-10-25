@@ -363,3 +363,82 @@ def test_classifier_margin_rejection_is_not_dead(root, tmp_path, monkeypatch):
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}["r1_human_fixcls"]
     assert rec["skipped"] == "classifier_gate" and "empty_axis" not in rec
+
+
+# ------------------------------- detector-state candidates mine their materials on the champion state
+
+def _two_arm_loop(root, tmp_path, monkeypatch, state):
+    from agentic_configuration_search.fitting.materials import Materials
+    from agentic_configuration_search.loop.runner import Loop
+    loop = Loop(config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root),
+                                  "lora": {"min_images": 1}}),
+                root, tmp_path / "run",
+                detector_hooks={"weights_ctl": lambda w: state.__setitem__("w", w),
+                                "adapt_ctl": lambda p: state.__setitem__("a", p),
+                                "repo_root": tmp_path, "base_weights": tmp_path / "b"})
+    mined = []
+
+    def materialize(self, axes, mat_dir, wall):
+        mined.append((state.get("w"), state.get("a"), gateway.classifier_blend()))
+        return Materials()
+    monkeypatch.setattr(Loop, "_materialize_timed", materialize)
+    monkeypatch.setattr(Loop, "_guard_material", lambda self, *a, **k: False)
+    monkeypatch.setattr(Loop, "_arm_rescorer", lambda self, e, s, m, d: s)
+    monkeypatch.setattr(Loop, "_fit_dev_cmp", lambda self, s: None)
+    monkeypatch.setattr(Loop, "_arm_skip", lambda self, row: False)
+    monkeypatch.setattr(Loop, "_gate", lambda self, ch, ev: {})
+    monkeypatch.setattr(Loop, "_evaluate_candidate", lambda self, e, s, m: {})
+    loop._round_no = 1
+    return loop, mined
+
+
+def _two_candidates(loop, tmp_path, axis, prefix):
+    from agentic_configuration_search.loop.runner import _RoundAcc
+    champion = {"weights": None, "adapt_root": None, "adapt_lambda": None, "axes": {}}
+    acc = _RoundAcc(served_w=None, served_a=None, served_l=None)
+    loop._attempt(tmp_path / "rd", champion,
+                  {"candidates": [{"id": f"{prefix}1", "axes": {axis: True}},
+                                  {"id": f"{prefix}2", "axes": {axis: True}}],
+                   "stop": False},
+                  acc)
+    assert len(acc.evaluated) == 2, "both candidates were not evaluated — scenario invalid"
+
+
+def test_second_lora_candidate_mines_on_champion_weights(root, tmp_path, monkeypatch):
+    """An adopted lora candidate is measured on holdout with its arm weights loaded.
+    The next lora candidate's materials (FP-mining train pass) must be mined on the
+    champion detector — run_tail_candidate restores the baseline only after the
+    materials are built."""
+    from agentic_configuration_search.loop import tail_round
+    state = {"w": None, "a": None}
+    loop, mined = _two_arm_loop(root, tmp_path, monkeypatch, state)
+
+    def fake_tail(cfg, ds, axes, materials, out_dir, *, weights_ctl, **kw):
+        arm = tmp_path / f"{Path(out_dir).name}.json"
+        weights_ctl(arm)                                 # ends with the adopted arm loaded
+        return {"weights": arm, "setting": {"fit_dev_micro_f_beta": 0.5},
+                "grid": [{"f_beta": 0.5}], "decision": {"adopted": True}}
+    monkeypatch.setattr(tail_round, "run_tail_candidate", fake_tail)
+    _two_candidates(loop, tmp_path, "lora", "l")
+    assert [m[0] for m in mined] == [None, None], "mined on the previous arm's weights"
+
+
+def test_second_classifier_candidate_mines_without_previous_arm(root, tmp_path,
+                                                                 monkeypatch):
+    """Same for classifier candidates — mining the next candidate's materials with
+    the adopted arm's artifact and λ loaded picks FPs from reclassified detections."""
+    from agentic_configuration_search.loop import adapt_round
+    state = {"w": None, "a": None}
+    loop, mined = _two_arm_loop(root, tmp_path, monkeypatch, state)
+
+    def fake_clf(cfg, ds, axes, materials, out_dir, *, adapt_ctl, restore_root,
+                 restore_lambda, **kw):
+        adapt_ctl(restore_root, restore_lambda)
+        art = Path(out_dir) / "artifact"
+        adapt_ctl(art, 1.0)                              # ends with the adopted arm loaded
+        return {"adapt_root": art, "adapt_lambda": 1.0,
+                "setting": {"fit_dev_micro_f_beta": 0.5}, "decision": {"adopted": True}}
+    monkeypatch.setattr(adapt_round, "run_classifier_candidate", fake_clf)
+    _two_candidates(loop, tmp_path, "crop_classifier", "k")
+    assert [m[1:] for m in mined] == [(None, None), (None, None)], \
+        "mined on the previous arm's artifact"
