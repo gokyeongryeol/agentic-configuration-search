@@ -129,10 +129,13 @@ rescorer:                                 # discriminator on fit_train + α grid
   ensemble_members: 5
   inner_folds: 5                          # for the oof_phat diagnostic
 
-crop_classifier:                          # detection reclassification axis — corrects class_confusion, removes background FPs (off by default, the planner turns it on)
+crop_classifier:                          # detection reclassification axis — corrects class_confusion, suppresses background FPs (off by default, the planner turns it on)
   min_samples: 32                         # total crop tripwire — skip training below this
   min_background: 4                       # minimum background crops — without them reclassification is meaningless
+  lambdas: [0.0, 0.25, 0.5, 0.75, 1.0]    # blend λ grid — score = s^(1-λ)·p(c*)^λ; λ=0 is relabel-only (no classifier is the baseline, not a λ)
   margin: 0.01                            # adopt the arm only if fit_dev ΔF(β) exceeds this
+  reuse: true                             # train once per run (<run>/classifier_cache/), later proposals re-score only the λ grid
+  retune_lambda: true                     # while the champion has a classifier, ordinary candidates re-choose λ on their setting
 
 lora:                                     # tail fine-tune + λ-interpolation arms — off by default, the planner turns it on
   min_images: 20                          # block lora candidates if fit_train has fewer images

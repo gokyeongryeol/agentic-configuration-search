@@ -130,7 +130,7 @@ def test_arm_tripwire_skips_training(dataset_root, tmp_path, monkeypatch):
     out = run_classifier_candidate(
         cfg, ds, {"exemplar": "none"}, Materials(),
         tmp_path / "cand", screen_fn=fake_screen,
-        adapt_ctl=lambda p: None, repo_root=tmp_path, restore_root=None,
+        adapt_ctl=lambda p, lam=None: None, repo_root=tmp_path, restore_root=None,
         seed=0, client=object(), train_fn=lambda *a, **k: calls.append(1))
     assert out["decision"]["adopted"] is False
     assert "training skipped" in out["decision"]["reason"]

@@ -236,9 +236,16 @@ class YoloeClient:
                        apply_topk: int = 300,
                        iou_threshold: float = 0.5,
                        neg_eta: Optional[float] = None,
-                       return_embeddings: bool = False) -> list[dict]:
+                       return_embeddings: bool = False,
+                       return_classifier_probs: bool = False) -> list[dict]:
         """Batch inference — per image {"boxes","scores","text"[,"embeddings"]}
         (clients.wire contract). neg_eta = negative-suppression IoU threshold.
+
+        With return_classifier_probs=True and a crop classifier loaded, boxes are
+        not reclassified: each item instead carries `classifier_probs` (per box
+        the class probabilities, background first, or None for a box that could
+        not be cropped) and `classifier_class_names` (["background", *names]) —
+        the caller blends them (infer.gateway.blend_classifier).
         """
         key, channels, floor = self._channels_for(queries)
         backend = self._get_backend()
@@ -279,7 +286,10 @@ class YoloeClient:
                 # end2end models output without NMS — do per-class folding
                 # (batched NMS) here (same rule as the negative path)
                 kept = batched_nms(pos, float(iou_threshold))
-            if reclassifier is not None and kept:
+            probs = None
+            if reclassifier is not None and return_classifier_probs:
+                probs = _classifier_probs(reclassifier, image, kept)
+            elif reclassifier is not None and kept:
                 # Order contract: NMS → negative suppression → **reclassify** →
                 # response. Reclassification happens before the loop sees the
                 # detections (i.e. before the rescorer and τ).
@@ -289,23 +299,23 @@ class YoloeClient:
                     "text": [d.get("reclass_name")
                              or channels[d["category_id"]]["name"]
                              for d in kept]}
+            if probs is not None:
+                item["classifier_probs"] = probs
+                item["classifier_class_names"] = ["background",
+                                                  *reclassifier.class_names]
             if return_embeddings:
                 item["embeddings"] = [d["embedding"] for d in kept]
             out.append(item)
         return out
 
 
-def _reclassify(reclassifier, image, dets: list[dict]) -> list[dict]:
-    """Reclassify detection-box crops — replace the category, or drop on
-    background (0).
-
-    Scores are kept (reclassification corrects labels; it does not re-estimate
-    confidence). Degenerate boxes (not promptable) cannot be cropped and keep
-    their original label. Uses the same crop_image (default padding) as training
-    crops to match the distribution."""
+def _croppable(image, dets: list[dict]) -> tuple[list[int], list]:
+    """(indices, crops) of the boxes the classifier can read — promptable boxes
+    whose crop is larger than 3 px on both sides. Uses the same crop_image
+    (default padding) as training crops to match the distribution."""
     idx = [i for i, d in enumerate(dets) if promptable(d["box"])]
     if not idx:
-        return dets
+        return [], []
     if isinstance(image, Image.Image):
         im, close = image, False
     else:
@@ -325,10 +335,39 @@ def _reclassify(reclassifier, image, dets: list[dict]) -> list[dict]:
             if min(crop.size) > 3:
                 kept_idx.append(i)
                 crops.append(crop)
-        idx = kept_idx
+        return kept_idx, crops
     finally:
         if close:
             im.close()
+
+
+def _classifier_probs(reclassifier, image, dets: list[dict]) -> list:
+    """Per detection the classifier's class probabilities (background first),
+    or None for a box that cannot be cropped — the blend leaves those as they are."""
+    out: list = [None] * len(dets)
+    idx, crops = _croppable(image, dets)
+    if not idx:
+        return out
+    probs = reclassifier.probs(crops)
+    if len(probs) != len(idx):
+        raise RuntimeError(f"reclassifier prob count mismatch: {len(probs)} vs {len(idx)}")
+    width = len(reclassifier.class_names) + 1
+    for i, p in zip(idx, probs):
+        if len(p) != width:
+            raise RuntimeError(f"reclassifier probs have {len(p)} classes, expected "
+                               f"{width} (background included)")
+        out[i] = [float(v) for v in p]
+    return out
+
+
+def _reclassify(reclassifier, image, dets: list[dict]) -> list[dict]:
+    """Reclassify detection-box crops — replace the category, or drop on
+    background (0).
+
+    Scores are kept (reclassification corrects labels; it does not re-estimate
+    confidence). Boxes that cannot be cropped (_croppable) keep their original
+    label."""
+    idx, crops = _croppable(image, dets)
     if not idx:
         return dets
     labels = reclassifier.classify(crops)
@@ -417,15 +456,25 @@ class _CropReclassifier:
         self.device = device
         log.info("loaded crop classifier: %s (classes=%d)", root, num)
 
-    def classify(self, crops: list) -> list[int]:
+    def _logits(self, crops: list):
         import torch
-        out: list[int] = []
         with torch.inference_mode():
             for i in range(0, len(crops), self.BATCH):
                 pv = self.processor(images=crops[i:i + self.BATCH],
                                     return_tensors="pt")["pixel_values"]
-                logits = self.model(pixel_values=pv.to(self.device)).logits
-                out += logits.argmax(dim=-1).cpu().tolist()
+                yield self.model(pixel_values=pv.to(self.device)).logits
+
+    def classify(self, crops: list) -> list[int]:
+        out: list[int] = []
+        for logits in self._logits(crops):
+            out += logits.argmax(dim=-1).cpu().tolist()
+        return out
+
+    def probs(self, crops: list) -> list[list[float]]:
+        """Softmax class probabilities per crop — background (0) first."""
+        out: list[list[float]] = []
+        for logits in self._logits(crops):
+            out += logits.float().softmax(dim=-1).cpu().tolist()
         return out
 
 

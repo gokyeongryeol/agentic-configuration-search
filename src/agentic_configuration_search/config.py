@@ -162,13 +162,27 @@ class RescorerCfg:
 
 @dataclass(frozen=True)
 class CropClassifierCfg:
-    """crop classifier axis — the client reclassifies predicted boxes (category
-    swap or background). The levers are correcting class_confusion and removing
-    background FPs. Training hyperparameters are the worker's universal-best
-    constants (not knobs); only tripwires and the gate live here."""
+    """crop classifier axis — the client gives per-box class probabilities and
+    the loop blends them with λ (class = foreground argmax, score = s^(1-λ)·p^λ).
+    The levers are correcting class_confusion and suppressing background FPs.
+    Training runs once per run (loop.adapt_round) and each proposal only
+    re-scores the λ grid. Training hyperparameters are the worker's
+    universal-best constants (not knobs); only tripwires, the λ grid and the
+    gate live here."""
     min_samples: int = 32            # total-crop tripwire — skip training below this
     min_background: int = 4          # minimum background crops — reclassification is pointless without them
+    # blend λ grid — [0, 1]. λ=0 is relabel-only (scores unchanged, fixes only
+    # class_confusion). No classifier is not a λ — it is measured separately as
+    # the baseline (lam=None on the grid)
+    lambdas: list = field(default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0])
     margin: float = 0.01             # adopt the arm only if fit_dev ΔF(β) exceeds this
+    # train once per run and let later proposals reuse it (<run>/classifier_cache/).
+    # false re-mines and retrains on each proposal's champion
+    reuse: bool = True
+    # while the champion has a classifier, ordinary candidates re-choose λ on
+    # their own setting too (λ first, then the rescorer refit on top). λ changes
+    # only when it beats the champion's λ by more than margin
+    retune_lambda: bool = True
 
 
 @dataclass(frozen=True)
@@ -432,6 +446,18 @@ def _validate(cfg: Config) -> None:
     if cfg.rescorer.ensemble_members < 1:
         raise ConfigError("rescorer.ensemble_members must be >= 1 "
                           f"({cfg.rescorer.ensemble_members})")
+    lams = list(cfg.crop_classifier.lambdas)
+    if (not lams
+            or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                       and 0.0 <= float(x) <= 1.0 for x in lams)
+            or len({float(x) for x in lams}) != len(lams)):
+        raise ConfigError(f"crop_classifier.lambdas: {lams} — needs one or more distinct "
+                          "numbers in [0, 1] (λ=0 is relabel-only; no classifier is "
+                          "measured separately as the baseline)")
+    for knob in ("reuse", "retune_lambda"):
+        if not isinstance(getattr(cfg.crop_classifier, knob), bool):
+            raise ConfigError(f"crop_classifier.{knob} must be true/false "
+                              f"({getattr(cfg.crop_classifier, knob)!r})")
     if 0.0 not in cfg.lora.lambdas:
         raise ConfigError("lora.lambdas must include 0.0 — λ=0 (=base) must be on the "
                           "grid so that non-adoption is exactly the status quo")

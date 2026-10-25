@@ -667,7 +667,8 @@ STATIC_COST = {
     # axis not observed yet. Durations differ per dataset; once observed, the
     # measured minutes above (_cost_lines) take over
     "lora": "lora: fine-tunes the detector tail before screening",
-    "crop_classifier": "crop_classifier: trains a crop classifier before screening",
+    "crop_classifier": "crop_classifier: trains a crop classifier once per run, "
+                       "then screens a grid of blend weights per proposal",
     "rescorer": "rescorer: re-infers fit_train and fit_dev to refit the rescorer",
 }
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from contextlib import contextmanager
 import json
 import logging
 import re
@@ -58,6 +59,8 @@ FINAL_DIR = "final"                   # the final champion's diagnosis at the en
 RESIDUAL = "residual.json"            # structure of residual misses (report only, diagnose.residual)
 # run-level lora training cache (loop.tail_round._train_or_reuse) — never deleted while the run is alive
 LORA_CACHE = "lora_cache"
+# run-level crop classifier training cache (loop.adapt_round._train_or_reuse)
+CLASSIFIER_CACHE = "classifier_cache"
 
 @dataclass
 class RunResult:
@@ -73,6 +76,7 @@ class _RoundAcc:
     """State accumulated across a round's attempts (the first proposal + re-asks)."""
     served_w: object = None              # weights the detector has loaded now
     served_a: object = None              # reclassification artifact the detector has loaded now
+    served_l: object = None              # that artifact's blend λ (None without an artifact)
     skipped: list = field(default_factory=list)
     screened: list = field(default_factory=list)
     evaluated: list = field(default_factory=list)
@@ -156,6 +160,12 @@ class Loop:
         # same input becomes a different inference
         self.detector_hooks = (_invalidating_hooks(detector_hooks) if detector_hooks
                                else detector_hooks)
+        # loaded classifier artifact and its blend λ — λ is the loop-side half of
+        # the detector state (gateway holds it). A new process's client starts
+        # without a classifier, so blending starts off too
+        self._adapt_path = None
+        self._adapt_lambda = None
+        gateway.set_classifier_blend(None)
         # validated here because config is a leaf — no silent absorption of typos (see config.py)
         bad = sorted(set(cfg.search.disabled_axes) - set(AXES))
         if bad:
@@ -185,6 +195,7 @@ class Loop:
                   "micro_f_beta": champion["eval"]["micro_f_beta"],
                   "weights": champion.get("weights"),
                   "adapt_root": champion.get("adapt_root"),
+                  "adapt_lambda": champion.get("adapt_lambda"),
                   "rescorer_path": champion.get("rescorer_path"),
                   "forwards_per_image": setting_forwards(champion["setting"]),
                   "fit_dev_micro_f_beta":
@@ -202,6 +213,7 @@ class Loop:
                 "materials_dir": meta["materials_dir"], "eval": ev,
                 "weights": meta.get("weights"),
                 "adapt_root": meta.get("adapt_root"),
+                "adapt_lambda": meta.get("adapt_lambda"),
                 "rescorer_path": meta.get("rescorer_path")}
 
     def _append_history(self, entry: dict) -> None:
@@ -240,17 +252,88 @@ class Loop:
         The rescorer is a client-side calibration layer, so skipping it in
         evaluation changes the score channel and the paired Δ becomes
         "candidate ± calibration layer" instead of the candidate's increment.
-        The branch lives in this one place so call sites cannot drift apart.
+        If the candidate re-chose the classifier λ (_choose_lambda), it is
+        measured with that λ. The branch lives in this one place so call sites
+        cannot drift apart.
         """
-        if entry.get("_rescorer") is not None:
-            return rescore.rescored_evaluate(self.cfg, self.client, self.ds,
-                                             setting, materials,
-                                             entry["_rescorer"])
-        return self._evaluate(setting, materials)
+        with self._lambda_for(entry):
+            if entry.get("_rescorer") is not None:
+                return rescore.rescored_evaluate(self.cfg, self.client, self.ds,
+                                                 setting, materials,
+                                                 entry["_rescorer"])
+            return self._evaluate(setting, materials)
 
-    def _adapt_ctl(self, path) -> None:
-        """Load/unload the classifier artifact."""
-        self.detector_hooks["adapt_ctl"](path)
+    @contextmanager
+    def _lambda_for(self, entry: dict):
+        """Apply the classifier λ the candidate re-chose for this block — the
+        artifact stays loaded, only the blend changes, and afterwards it returns
+        to the detector state's λ (self._adapt_lambda)."""
+        lam = entry.get("_adapt_lambda")
+        if lam is None or self._adapt_path is None or lam == self._adapt_lambda:
+            yield
+            return
+        gateway.set_classifier_blend(lam)
+        try:
+            yield
+        finally:
+            gateway.set_classifier_blend(self._adapt_lambda)
+
+    def _choose_lambda(self, materials, axes: dict, entry: dict, setting0: dict) -> dict:
+        """If the champion has a classifier, re-choose the blend λ on this
+        candidate's setting.
+
+        The blend mixes into detection scores, so when something upstream
+        changes (exemplar, negatives, tiling, …) the best λ can change too — it
+        is refit per candidate, like the rescorer. Order: λ first, then the
+        rescorer refit on top (the rescorer takes the blended scores and
+        relabelled classes as input). The artifact stays loaded, so detector
+        responses are the same and the pass cache serves the re-inference. The
+        champion λ's setting (setting0) is the reference, and λ changes only if
+        the best beats it by more than crop_classifier.margin — so λ does not
+        drift with noise on the same fit_dev. The chosen λ stays in
+        entry["_adapt_lambda"] for the rescorer refit, holdout, served
+        fingerprint and adoption. The lora λ is not re-chosen."""
+        cc = self.cfg.crop_classifier
+        base = self._adapt_lambda
+        if not cc.retune_lambda or self._adapt_path is None or base is None:
+            return setting0
+        f0 = setting0["fit_dev_micro_f_beta"]
+        grid = [{"lam": base, "f_beta": f0}]
+        settings = {base: setting0}
+        for lam in sorted({float(x) for x in cc.lambdas} - {base}):
+            gateway.set_classifier_blend(lam)
+            try:
+                s = self._screen(materials, axes)
+            finally:
+                gateway.set_classifier_blend(base)
+            grid.append({"lam": lam, "f_beta": s["fit_dev_micro_f_beta"]})
+            settings[lam] = s
+        best = max(grid, key=lambda g: (g["f_beta"], g["lam"] == base, -g["lam"]))
+        if best["f_beta"] - f0 <= cc.margin:
+            best = grid[0]
+        entry["_adapt_lambda"] = best["lam"]
+        entry["classifier_lambda_grid"] = grid
+        if best["lam"] != base:
+            log.info("candidate %s: classifier λ %g → %g (fit_dev %.4f → %.4f)",
+                     entry.get("id"), base, best["lam"], f0, best["f_beta"])
+        return settings[best["lam"]]
+
+    def _adapt_ctl(self, path, lam: float | None = None) -> None:
+        """Load/unload the classifier artifact and set its blend λ — recording
+        the detector state.
+
+        The artifact is reloaded only when it changes (the hook also empties the
+        pass cache). λ is the loop-side blend (gateway.set_classifier_blend), so
+        detector responses stay the same and an arm grid that only changes λ
+        runs without reloading (re-inference is served by the pass cache). λ=0
+        is relabel-only and differs from None (no classifier)."""
+        if path is not None and lam is None:
+            raise ValueError("loading a classifier needs a blend λ")
+        if not _same_state(path, self._adapt_path):
+            self.detector_hooks["adapt_ctl"](path)
+        self._adapt_path = path
+        self._adapt_lambda = lam if path is not None else None
+        gateway.set_classifier_blend(self._adapt_lambda)
 
     def _restore_detector_state(self, champion: dict) -> None:
         """On resume, re-apply the champion's detector state (weights and
@@ -269,8 +352,15 @@ class Loop:
             log.info("resume: restored champion weights %s", weights)
             self.detector_hooks["weights_ctl"](Path(weights))
         if adapt_root and self.detector_hooks.get("adapt_ctl"):
-            log.info("resume: restored champion reclassification artifact %s", adapt_root)
-            self._adapt_ctl(Path(adapt_root))
+            if champion.get("adapt_lambda") is None:
+                raise RuntimeError(
+                    f"champion.json has adapt_root ({adapt_root}) but no adapt_lambda — "
+                    "the run predates the classifier blend λ. The client would serve "
+                    "argmax reclassification and different predictions, so it cannot "
+                    "be continued — start a new run")
+            log.info("resume: restored champion reclassification artifact %s (λ=%s)",
+                     adapt_root, champion.get("adapt_lambda"))
+            self._adapt_ctl(Path(adapt_root), champion.get("adapt_lambda"))
 
     def _screen(self, materials: Materials, axes: dict, split=None) -> dict:
         """Fix the candidate setting on fit_dev (or a subset of it — prescreen)."""
@@ -302,7 +392,7 @@ class Loop:
         ev = champion["eval"]
         key = {"champion": {k: champion.get(k) for k in
                             ("round", "id", "materials_dir", "weights",
-                             "adapt_root", "rescorer_path")}
+                             "adapt_root", "adapt_lambda", "rescorer_path")}
                | {"micro_f_beta": ev["micro_f_beta"], "tau_test": ev["tau_test"]},
                "config": hashlib.sha256(json.dumps(
                    cfg, sort_keys=True, default=str).encode()).hexdigest()}
@@ -869,13 +959,16 @@ class Loop:
                 return
             setting0 = (entry.pop("_full_screen", None)
                         or self._screen(materials, base_axes))
+            # choose the classifier λ first (the rescorer is fit on top — downstream on upstream)
+            setting0 = self._choose_lambda(materials, base_axes, entry, setting0)
             # judge sameness **before** the refit — if the served state equals the
             # champion's, a sibling's or an already-evaluated candidate's, skip
             # the discriminator refit (train re-inference) and holdout altogether
             if self._skip_same(c, entry, setting0, materials, skipped):
                 return
-            rescorer, info, dev_preds = rescore.fit_for_setting(
-                self.cfg, self.client, self.ds, setting0, materials, mat_dir)
+            with self._lambda_for(entry):
+                rescorer, info, dev_preds = rescore.fit_for_setting(
+                    self.cfg, self.client, self.ds, setting0, materials, mat_dir)
             if rescorer is None or not rescorer.active:
                 # the identity verdict is deterministic — a sibling in the same
                 # state gets the same result, so block it
@@ -897,6 +990,7 @@ class Loop:
                 return
             setting = (entry.pop("_full_screen", None)
                        or self._screen(materials, c["axes"]))
+            setting = self._choose_lambda(materials, c["axes"], entry, setting)
             if self._skip_same(c, entry, setting, materials, skipped):
                 return
         entry.update({"setting": setting,
@@ -974,10 +1068,15 @@ class Loop:
 
     def _served_state(self, entry: dict) -> dict:
         """Server state a wired candidate is served with — the champion's weights
-        and artifact (or the prompt dictionary alias widened, if any)."""
+        and artifact (or the prompt dictionary alias widened, if any), and the
+        classifier blend λ (the candidate's re-chosen one, if any). λ is left
+        out without a classifier so fingerprints of classifier-free states stay
+        as they were."""
         ch = getattr(self, "_champion", None) or {}
-        return {"weights": ch.get("weights"),
-                "adapt_root": entry.get("_adapt_root", ch.get("adapt_root"))}
+        state = {"weights": ch.get("weights"),
+                 "adapt_root": entry.get("_adapt_root", ch.get("adapt_root"))}
+        lam = entry.get("_adapt_lambda", ch.get("adapt_lambda"))
+        return state | ({"adapt_lambda": lam} if lam is not None else {})
 
     def _champion_fp(self) -> str | None:
         ch = getattr(self, "_champion", None) or {}
@@ -1004,7 +1103,7 @@ class Loop:
         champion = {"round": 0, "id": "baseline", "axes": dict(BASELINE),
                     "setting": setting, "materials_dir": str(mat_dir),
                     "eval": ev, "weights": None, "adapt_root": None,
-                    "rescorer_path": None}
+                    "adapt_lambda": None, "rescorer_path": None}
         decision = {"round": 0, "kind": "baseline", "adopted": True,
                     "id": "baseline", "micro_f_beta": ev["micro_f_beta"],
                     "tau_test": ev["tau_test"]}
@@ -1053,7 +1152,8 @@ class Loop:
         # served_* is what the detector has loaded right now — detector-state
         # candidates swap it in turn
         acc = _RoundAcc(served_w=champion.get("weights"),
-                        served_a=champion.get("adapt_root"))
+                        served_a=champion.get("adapt_root"),
+                        served_l=champion.get("adapt_lambda"))
         self._attempt(rd, champion, proposal, acc)
         # re-asks — k (the artifact number) runs in order whether or not the
         # re-ask is free. If a proposal only re-proposed the champion
@@ -1078,7 +1178,7 @@ class Loop:
             proposal = nxt
             self._attempt(rd, champion, proposal, acc)
         skipped, screened, evaluated = acc.skipped, acc.screened, acc.evaluated
-        served_w, served_a = acc.served_w, acc.served_a
+        served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
         reask_mark = ({"reasks": reasks} if reasks else {}) \
             | ({"free_reasks": free} if free else {})
 
@@ -1137,6 +1237,10 @@ class Loop:
             # downstream inheritance: a classifier-arm winner keeps its own artifact;
             # any other winner (lora included) inherits the champion's as-is.
             adapt_root = winner.get("_adapt_root", champion.get("adapt_root"))
+            # the blend λ follows the same rule — a classifier-arm winner keeps its
+            # own λ, any other winner its re-chosen λ or the champion's
+            adapt_lambda = (winner.get("_adapt_lambda", champion.get("adapt_lambda"))
+                            if adapt_root else None)
             if not adapt_root:
                 w_axes["crop_classifier"] = False
             # The champion can lose the rescorer in two ways that mean different things:
@@ -1158,6 +1262,7 @@ class Loop:
                         # a detector-state winner keeps its own; otherwise inherit current
                         "weights": winner.get("_weights", champion.get("weights")),
                         "adapt_root": adapt_root,
+                        "adapt_lambda": adapt_lambda,
                         "rescorer_path": winner.get("rescorer_path")}
             self._save_champion(champion)
             decision["micro_f_beta"] = winner["eval"]["micro_f_beta"]
@@ -1167,8 +1272,9 @@ class Loop:
         # the classifier candidates.
         if not _same_state(served_w, champion.get("weights")):
             self.detector_hooks["weights_ctl"](champion.get("weights"))
-        if not _same_state(served_a, champion.get("adapt_root")):
-            self._adapt_ctl(champion.get("adapt_root"))
+        if not (_same_state(served_a, champion.get("adapt_root"))
+                and served_l == champion.get("adapt_lambda")):
+            self._adapt_ctl(champion.get("adapt_root"), champion.get("adapt_lambda"))
         _write(rd / "decision.json", decision)
         self._append_history({
             "round": r,
@@ -1187,7 +1293,7 @@ class Loop:
                                if c.get("_wall") else {})
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | _source_record(c) | _reuse_record(c)
-                            | _skip_record(c)
+                            | _classifier_lambda_record(c) | _skip_record(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -1217,6 +1323,30 @@ class Loop:
         row.update(why)
         log.info("candidate %s: %s", row["id"], why["note"])
         return True
+
+    def _serve_champion(self, champion: dict, acc: "_RoundAcc") -> None:
+        """Bring the detector back to the champion state (weights, artifact, blend λ).
+
+        A detector-state arm that clears its margin leaves the detector in its
+        own state on the way to holdout, and stays there if the pre-holdout
+        fit_dev verdict (_arm_skip) drops it. If the round continues with a
+        re-ask, the next attempt's ordinary candidates would be measured on a
+        non-champion state — and a winner would then be served (inheriting the
+        champion state) differently from how it was measured. A lora arm
+        restores only the weights (tail_round), so this is needed before lora
+        candidates too, so they are not measured on a leftover classifier arm —
+        hence it runs at the start of every attempt. Nothing happens when the
+        detector is already in the champion state."""
+        if not self.detector_hooks:
+            return                        # run without state controls — the state never changed
+        if not _same_state(acc.served_w, champion.get("weights")):
+            self.detector_hooks["weights_ctl"](champion.get("weights"))
+            acc.served_w = champion.get("weights")
+        if not (_same_state(acc.served_a, champion.get("adapt_root"))
+                and acc.served_l == champion.get("adapt_lambda")):
+            self._adapt_ctl(champion.get("adapt_root"), champion.get("adapt_lambda"))
+            acc.served_a = champion.get("adapt_root")
+            acc.served_l = champion.get("adapt_lambda")
 
     def _attempt(self, rd: Path, champion: dict, proposal: dict,
                  acc: "_RoundAcc") -> None:
@@ -1274,6 +1404,7 @@ class Loop:
             return
         acc.n_runnable += len(wired) + len(lora_cands) + len(classifier_cands)
 
+        self._serve_champion(champion, acc)
         screened = []
         for c in wired:
             mat_dir = rd / "settings" / _slug(c["id"])
@@ -1303,7 +1434,7 @@ class Loop:
         # function is not tied to the detector's score distribution, and removing
         # it would make lora fight carrying a handicap equal to its gain.
         # served_* is what the detector has loaded right now (updated per candidate).
-        served_w, served_a = acc.served_w, acc.served_a
+        served_w, served_a, served_l = acc.served_w, acc.served_a, acc.served_l
         for c in lora_cands:
             mat_dir = rd / "settings" / _slug(c["id"])
             base_axes = {**c["axes"], "lora": False}
@@ -1396,13 +1527,23 @@ class Loop:
                     adapt_ctl=self._adapt_ctl,
                     repo_root=self.detector_hooks["repo_root"],
                     restore_root=champion.get("adapt_root"),
-                    seed=self.cfg.run_seed, client=self.client)
-                # adopted: its own artifact stays loaded; otherwise restore_root (current)
-                served_a = res["adapt_root"] or champion.get("adapt_root")
+                    restore_lambda=champion.get("adapt_lambda"),
+                    seed=self.cfg.run_seed, client=self.client,
+                    # training reuse — trained once per run, each proposal re-scores the λ grid
+                    cache_dir=(self.out_dir / CLASSIFIER_CACHE
+                               if self.cfg.crop_classifier.reuse else None),
+                    origin={"round": self._round_no, "id": c["id"]})
+                # adopted: its own artifact and λ stay loaded; otherwise the current state
+                if res["adapt_root"]:
+                    served_a, served_l = res["adapt_root"], res["adapt_lambda"]
+                else:
+                    served_a = champion.get("adapt_root")
+                    served_l = champion.get("adapt_lambda")
             except Exception as exc:  # noqa: BLE001 — a candidate failure is that candidate's rejection
                 log.exception("classifier candidate %s failed — restored current state and rejected", c["id"])
-                self._adapt_ctl(champion.get("adapt_root"))
+                self._adapt_ctl(champion.get("adapt_root"), champion.get("adapt_lambda"))
                 served_a = champion.get("adapt_root")
+                served_l = champion.get("adapt_lambda")
                 skipped.append({**c, "skipped": "error",
                                 "note": f"{type(exc).__name__}: {exc}"})
                 _close_wall(wall, t0, skipped[n_skip:])
@@ -1431,7 +1572,8 @@ class Loop:
                         if res["decision"].get("tripwire") else {})
                 skipped.append({**c, "skipped": "classifier_gate", **dead,
                                 "note": res["decision"].get("reason", ""),
-                                "wall_min": _wall_min(wall)})
+                                "wall_min": _wall_min(wall)} | _reuse_record(row)
+                               | _classifier_lambda_record(row))
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
@@ -1443,9 +1585,10 @@ class Loop:
             wall["holdout"] = time.monotonic() - t1
             evaluated.append({**entry, "_materials": materials,
                               "_adapt_root": str(res["adapt_root"]),
+                              "_adapt_lambda": res["adapt_lambda"],
                               "eval": ev, "gate": _gate(ev)})
         acc.screened.extend(screened)
-        acc.served_w, acc.served_a = served_w, served_a
+        acc.served_w, acc.served_a, acc.served_l = served_w, served_a, served_l
 
 
 def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
@@ -1621,7 +1764,9 @@ def _champion_summary(champion: dict) -> dict:
     return {"axes": champion["axes"], "round": champion["round"],
             "id": champion["id"], "micro_f_beta": champion["eval"]["micro_f_beta"],
             "fit_dev_micro_f_beta": champion["setting"]["fit_dev_micro_f_beta"],
-            "forwards_per_image": setting_forwards(champion["setting"])}
+            "forwards_per_image": setting_forwards(champion["setting"])} \
+        | ({"classifier_lambda": champion["adapt_lambda"]}
+           if champion.get("adapt_lambda") is not None else {})
 
 
 def _uses_tiling(setting: dict) -> bool:
@@ -1926,11 +2071,30 @@ def _source_record(c: dict) -> dict:
 
 
 def _reuse_record(c: dict) -> dict:
-    """The origin of a cached tuned subset a lora arm used instead of training —
-    {"tail": {round, id}} (loop.tail_round._train_or_reuse). It explains why
-    wall_min is short."""
-    reused = (c.get("lora") or {}).get("delta_reused")
-    return {"delta_reused": reused} if reused else {}
+    """The origin of a run cache a detector-state arm used instead of training —
+    lora: delta_reused ({"tail": {round, id}}, loop.tail_round._train_or_reuse),
+    classifier: classifier_reused ({round, id}, loop.adapt_round._train_or_reuse).
+    It explains why wall_min is short."""
+    out = {}
+    if reused := (c.get("lora") or {}).get("delta_reused"):
+        out["delta_reused"] = reused
+    if reused := (c.get("crop_classifier") or {}).get("classifier_reused"):
+        out["classifier_reused"] = reused
+    return out
+
+
+def _classifier_lambda_record(c: dict) -> dict:
+    """The classifier blend λ the candidate chose — a classifier arm (the grid's
+    best when not adopted; Δ is in classifier_decision.json's grid), or an
+    ordinary candidate that re-chose λ while the champion had a classifier
+    (_choose_lambda — its grid is classifier_lambda_grid)."""
+    lam = (c.get("crop_classifier") or {}).get("lam")
+    if lam is None:
+        lam = c.get("_adapt_lambda")
+    out = {"classifier_lambda": lam} if lam is not None else {}
+    if c.get("classifier_lambda_grid"):
+        out["classifier_lambda_grid"] = c["classifier_lambda_grid"]
+    return out
 
 
 def _unused_record(c: dict) -> dict:

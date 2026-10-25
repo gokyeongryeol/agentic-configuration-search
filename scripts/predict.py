@@ -3,7 +3,8 @@
 
 `champion.json` is the complete replay recipe:
   weights       tail arm descriptor (detector weights)
-  adapt_root    crop classifier reclassification artifact
+  adapt_root    crop classifier artifact
+  adapt_lambda  crop classifier blend λ (score = s^(1-λ)·p^λ; 0.0 = relabel-only)
   materials_dir exemplar / alias / negative materials
   rescorer_path score recalibrator (client-side post-processing)
   setting       config grid + per-class (config_id, modality) assignment
@@ -30,6 +31,26 @@ from pathlib import Path
 for _t in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_t, "1")
+
+
+def apply_serving_state(detector_hooks: dict, champ: dict) -> None:
+    """Load the champion's serving state — weights, classifier artifact and its
+    blend λ — through the same hooks as the loop.
+
+    The artifact alone would serve argmax reclassification, which is not what
+    won adoption, so a champion with adapt_root but no adapt_lambda (a run made
+    before the blend) is refused. λ=0.0 is relabel-only and differs from None."""
+    from agentic_configuration_search.infer import gateway
+    weights = Path(champ["weights"]) if champ.get("weights") else None
+    adapt_root = Path(champ["adapt_root"]) if champ.get("adapt_root") else None
+    lam = champ.get("adapt_lambda")
+    if adapt_root is not None and lam is None:
+        raise SystemExit(f"champion.json has adapt_root ({adapt_root}) but no "
+                         "adapt_lambda — the run predates the classifier blend and "
+                         "cannot be replayed as adopted")
+    detector_hooks["weights_ctl"](weights)
+    detector_hooks["adapt_ctl"](adapt_root)
+    gateway.set_classifier_blend(lam if adapt_root is not None else None)
 
 
 def _image_split(root: Path, ontology):
@@ -142,17 +163,13 @@ def main(argv=None) -> int:
              {k: v for k, v in champ["axes"].items() if v})
 
     # The detector is an in-process client — build it through the same seam as the
-    # loop (build_hooks) and apply serving state (weights, reclassification artifact)
-    # via the same hooks. Replay wired differently from the loop would itself be a
-    # reproducibility hole.
-    weights = Path(champ["weights"]) if champ.get("weights") else None
-    adapt_root = Path(champ["adapt_root"]) if champ.get("adapt_root") else None
+    # loop (build_hooks) and apply serving state (weights, classifier artifact and
+    # blend λ) via the same hooks. Replay wired differently from the loop would
+    # itself be a reproducibility hole.
     from agentic_configuration_search.loop.hooks import build_hooks
     hooks = build_hooks(cfg, repo_root, run_dir.parent)
     client = hooks["client"]
-    deps = hooks["detector_hooks"]
-    deps["weights_ctl"](weights)
-    deps["adapt_ctl"](adapt_root)
+    apply_serving_state(hooks["detector_hooks"], champ)
     materials = Materials.load(champ["materials_dir"])
     setting = champ["setting"]
     grid = {c["config_id"]: c for c in setting["configs"]}
