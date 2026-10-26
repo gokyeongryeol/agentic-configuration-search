@@ -18,6 +18,8 @@ import requests
 log = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 300.0  # per-request HTTP timeout (seconds)
+JSON_ATTEMPTS = 2        # a reply that does not parse as JSON is asked once more (one-off degeneration)
+EXCERPT = 300            # characters of the head and tail of an unparseable reply put in the error
 
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
@@ -57,9 +59,39 @@ def _extract_json(text: str) -> dict:
         raise
 
 
+class LLMReplyError(ValueError):
+    """A reply that does not parse as JSON — carries the finish reason, token
+    count and the head and tail of the text."""
+
+
+def _excerpt(text: str) -> str:
+    if len(text) <= 2 * EXCERPT:
+        return repr(text)
+    return (f"{text[:EXCERPT]!r} … ({len(text) - 2 * EXCERPT} chars omitted) … "
+            f"{text[-EXCERPT:]!r}")
+
+
+def parse_reply(body: dict) -> dict:
+    """chat completions response body → JSON object.
+
+    If it does not parse, LLMReplyError — the reply text is kept nowhere else,
+    so the error message carries the clues to tell the cause apart (cut off at
+    the token limit, repetitive degeneration, …)."""
+    choice = body["choices"][0]
+    text = choice["message"]["content"] or ""
+    try:
+        return _extract_json(text)
+    except json.JSONDecodeError as exc:
+        tokens = (body.get("usage") or {}).get("completion_tokens")
+        raise LLMReplyError(
+            f"{exc} — finish_reason={choice.get('finish_reason')}, "
+            f"completion_tokens={tokens}, reply {len(text)} chars: {_excerpt(text)}") from exc
+
+
 class LLMClient:
-    """One chat = one HTTP call. Stateless — replay is implemented by the caller
-    persisting prompt and response as artifacts."""
+    """One chat = one HTTP call (chat_json asks once more if the reply does not
+    parse as JSON). Stateless — replay is implemented by the caller persisting
+    prompt and response as artifacts."""
 
     def __init__(self, base_url: str, model: str,
                  session: Optional[requests.Session] = None,
@@ -79,6 +111,12 @@ class LLMClient:
              temperature: float = 0.0, schema: Optional[dict] = None) -> str:
         """`messages` is in OpenAI chat format as-is. Passing `schema` requests
         json_schema guided decoding. Returns the response content text."""
+        body = self._complete(messages, max_tokens=max_tokens,
+                              temperature=temperature, schema=schema)
+        return body["choices"][0]["message"]["content"] or ""
+
+    def _complete(self, messages: list[dict], *, max_tokens: int,
+                  temperature: float, schema: Optional[dict]) -> dict:
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -90,14 +128,25 @@ class LLMClient:
             payload["response_format"] = {"type": "json_schema", "json_schema": schema}
         resp = post_with_retry(self.session, f"{self.base_url}/v1/chat/completions",
                                payload, timeout=self.timeout)
-        choice = resp.json()["choices"][0]
+        body = resp.json()
+        choice = body["choices"][0]
         if choice.get("finish_reason") == "length":
             # a truncated response — as JSON it turns into a parse failure that
             # hides the cause
             log.warning("LLM response was cut off at max_tokens (%d)", max_tokens)
-        return choice["message"]["content"] or ""
+        return body
 
     def chat_json(self, messages: list[dict], *, max_tokens: int = 1024,
                   temperature: float = 0.0, schema: Optional[dict] = None) -> dict:
-        return _extract_json(self.chat(messages, max_tokens=max_tokens,
-                                       temperature=temperature, schema=schema))
+        """A JSON reply — asked once more if it does not parse. The last failure
+        is raised to the caller as LLMReplyError (the caller records it with its
+        fallback)."""
+        for attempt in range(1, JSON_ATTEMPTS + 1):
+            body = self._complete(messages, max_tokens=max_tokens,
+                                  temperature=temperature, schema=schema)
+            try:
+                return parse_reply(body)
+            except LLMReplyError as exc:
+                if attempt == JSON_ATTEMPTS:
+                    raise
+                log.warning("LLM reply did not parse as JSON (%s) — asking again", exc)

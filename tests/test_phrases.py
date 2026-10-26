@@ -107,6 +107,46 @@ def test_refine_failure_drops_phrases(monkeypatch):
     assert phrases.refine_alias("http://x", "m", "t", ["t"], ["p"])["alias"] is None
 
 
+class _RawResp:
+    """A reply that does not parse as JSON — cut off at the token limit."""
+    def __init__(self, text):
+        self._text = text
+
+    def json(self):
+        return {"choices": [{"message": {"content": self._text},
+                             "finish_reason": "length"}]}
+
+
+def test_refine_asks_again_after_unparseable_reply(monkeypatch, caplog):
+    import logging
+    replies = iter([_RawResp('{"keep": ["blue'),
+                    _FakeResp({"keep": ["blue ring"], "rejected": []})])
+    monkeypatch.setattr(phrases, "post_with_retry", lambda *a, **k: next(replies))
+    with caplog.at_level(logging.WARNING):
+        out = phrases.refine_negatives("http://x", "m", "cat a", ["cat a"], ["blue ring"])
+    assert out["keep"] == ["blue ring"]
+    assert any('{"keep": ["blue' in r.getMessage() and "length" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_refine_failure_after_retry_logs_the_reply(monkeypatch, caplog):
+    """If both replies fail to parse, the fallback applies (drop / keep the class
+    name) and the warning keeps the head and tail of the reply."""
+    import logging
+    calls = []
+
+    def broken(*a, **k):
+        calls.append(1)
+        return _RawResp('{"alias": "half')
+    monkeypatch.setattr(phrases, "post_with_retry", broken)
+    with caplog.at_level(logging.WARNING):
+        assert phrases.refine_negatives("http://x", "m", "t", ["t"], ["p"])["keep"] == []
+        assert phrases.refine_alias("http://x", "m", "t", ["t"], ["p"])["alias"] is None
+    assert len(calls) == 4
+    fails = [r.getMessage() for r in caplog.records if "refinement failed" in r.getMessage()]
+    assert len(fails) == 2 and all('{"alias": "half' in m for m in fails)
+
+
 def test_vlm_caption_rows_contract():
     """VLM captioner contract: rows -> {id: [phrase, ...]}.
     It actually shows the crop (multimodal), so captions are not trapped in the class-name context."""
