@@ -74,18 +74,26 @@ def _excerpt(text: str) -> str:
 def parse_reply(body: dict) -> dict:
     """chat completions response body → JSON object.
 
-    If it does not parse, LLMReplyError — the reply text is kept nowhere else,
-    so the error message carries the clues to tell the cause apart (cut off at
-    the token limit, repetitive degeneration, …)."""
+    If it does not parse or is not a JSON object, LLMReplyError — the reply text
+    is kept nowhere else, so the error message carries the clues to tell the
+    cause apart (cut off at the token limit, repetitive degeneration, …)."""
     choice = body["choices"][0]
     text = choice["message"]["content"] or ""
-    try:
-        return _extract_json(text)
-    except json.JSONDecodeError as exc:
+
+    def fail(why):
         tokens = (body.get("usage") or {}).get("completion_tokens")
-        raise LLMReplyError(
-            f"{exc} — finish_reason={choice.get('finish_reason')}, "
-            f"completion_tokens={tokens}, reply {len(text)} chars: {_excerpt(text)}") from exc
+        return LLMReplyError(
+            f"{why} — finish_reason={choice.get('finish_reason')}, "
+            f"completion_tokens={tokens}, reply {len(text)} chars: {_excerpt(text)}")
+    try:
+        parsed = _extract_json(text)
+    except json.JSONDecodeError as exc:
+        raise fail(exc) from exc
+    if not isinstance(parsed, dict):
+        # callers assume a dict — a list or the like is treated as an unreadable
+        # reply, so it is asked again and then falls back
+        raise fail(f"not a JSON object ({type(parsed).__name__})")
+    return parsed
 
 
 class LLMClient:
@@ -131,8 +139,8 @@ class LLMClient:
         body = resp.json()
         choice = body["choices"][0]
         if choice.get("finish_reason") == "length":
-            # a truncated response — as JSON it turns into a parse failure that
-            # hides the cause
+            # a truncated response — logged so a cut-off is visible on the
+            # non-JSON path (chat) too
             log.warning("LLM response was cut off at max_tokens (%d)", max_tokens)
         return body
 

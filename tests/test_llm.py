@@ -89,3 +89,36 @@ def test_chat_json_gives_up_after_the_second_unparseable_reply(json_server):
     with pytest.raises(LLMReplyError, match="again"):
         LLMClient(base, "m").chat_json([{"role": "user", "content": "x"}])
     assert len(records) == 2
+
+
+def test_non_object_json_is_an_unreadable_reply(json_server):
+    """Valid JSON that is not an object (a list, …) is an unreadable reply —
+    callers assume a dict and call .get, so passing it on would skip the
+    fallback and raise AttributeError."""
+    with pytest.raises(LLMReplyError, match="object"):
+        parse_reply({"choices": [{"message": {"content": "[1, 2]"},
+                                  "finish_reason": "stop"}]})
+    base, records = _replies(json_server, ["[1, 2]", '{"a": 1}'])
+    assert LLMClient(base, "m").chat_json([{"role": "user", "content": "x"}]) == {"a": 1}
+    assert len(records) == 2
+
+
+def test_http_error_is_not_asked_again(json_server):
+    """The re-ask is only for unreadable replies — HTTP errors are post_with_retry's
+    job (4xx is not retried)."""
+    base, records = json_server(lambda p, b: (400, {"error": "bad"}))
+    with pytest.raises(Exception):
+        LLMClient(base, "m").chat_json([{"role": "user", "content": "x"}])
+    assert len(records) == 1
+
+
+def test_planner_records_the_unreadable_reply(tmp_path):
+    """The clues of a reply the planner could not read (finish reason, head and
+    tail of the reply) land in the proposal's error."""
+    from agentic_configuration_search.planner.llm import LLMPlanner
+
+    def chat(messages, **kw):
+        raise LLMReplyError("Unterminated string — finish_reason=length, reply '{\"c'")
+    LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history=[], diagnosis={})
+    stored = json.loads((tmp_path / "proposal.json").read_text())
+    assert "finish_reason=length" in stored["error"]

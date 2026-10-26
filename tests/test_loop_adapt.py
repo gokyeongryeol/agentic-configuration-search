@@ -553,25 +553,24 @@ def test_resume_restore_marks_the_champion_weights_as_loaded(root, tmp_path):
 
 # ------------------------------- lora winners re-choose the classifier λ too
 
-def test_lora_winner_reselects_classifier_lambda(root, tmp_path, monkeypatch):
-    """lora changes the detections — on the winning arm the classifier λ is
-    re-chosen by the same rule as ordinary candidates (margin over the champion
-    λ), the rescorer is refit on that λ and holdout is measured with it. On
-    adoption the champion inherits that λ (it is in the history row too)."""
+def _lora_on_classifier(root, tmp_path, monkeypatch, f, *, cfg_extra=None,
+                        arm_skip=False):
+    """Run one lora candidate through _attempt on a classifier champion (λ=0.5) —
+    with the winning arm loaded, screen returns f[λ] per blend λ. Returns
+    (loop, acc, seen, the λs measured on the winning arm)."""
     from agentic_configuration_search.fitting.materials import Materials
     from agentic_configuration_search.loop import tail_round
     from agentic_configuration_search.loop.runner import Loop, _RoundAcc
     state = {"w": None}
     loop = Loop(config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root),
                                   "lora": {"min_images": 1},
-                                  "crop_classifier": {"margin": 0.01}}),
+                                  "crop_classifier": {"margin": 0.01, **(cfg_extra or {})}}),
                 root, tmp_path / "run",
                 detector_hooks={"weights_ctl": lambda w: state.__setitem__("w", w),
                                 "adapt_ctl": lambda p: None,
                                 "repo_root": tmp_path, "base_weights": tmp_path / "b"})
     loop._adapt_ctl(tmp_path / "artifact", 0.5)
     arm = tmp_path / "arm.json"
-    f = {0.0: 0.6, 0.25: 0.6, 0.5: 0.6, 0.75: 0.7, 1.0: 0.6}
     screened_on = []
 
     def screen(materials, axes, split=None):
@@ -592,7 +591,7 @@ def test_lora_winner_reselects_classifier_lambda(root, tmp_path, monkeypatch):
     monkeypatch.setattr(Loop, "_guard_material", lambda self, *a, **k: False)
     monkeypatch.setattr(Loop, "_arm_rescorer", arm_rescorer)
     monkeypatch.setattr(Loop, "_fit_dev_cmp", lambda self, s: None)
-    monkeypatch.setattr(Loop, "_arm_skip", lambda self, row: False)
+    monkeypatch.setattr(Loop, "_arm_skip", lambda self, row: arm_skip)
     monkeypatch.setattr(Loop, "_evaluate", evaluate)
     monkeypatch.setattr(Loop, "_gate", lambda self, ch, ev: {})
 
@@ -609,11 +608,46 @@ def test_lora_winner_reselects_classifier_lambda(root, tmp_path, monkeypatch):
                   {"candidates": [{"id": "l1", "axes": {"lora": True,
                                                          "crop_classifier": True}}],
                    "stop": False}, acc)
-    # the λ grid is measured on the winning arm
-    assert {lam for w, lam in screened_on if w == arm} == {0.0, 0.25, 0.5, 0.75, 1.0}
+    return loop, acc, seen, [lam for w, lam in screened_on if w == arm]
+
+
+def test_lora_winner_reselects_classifier_lambda(root, tmp_path, monkeypatch):
+    """lora changes the detections — on the winning arm the classifier λ is
+    re-chosen by the same rule as ordinary candidates (margin over the champion
+    λ), the rescorer is refit on that λ and holdout is measured with it. The
+    history row's setting and fit_dev are that final setting too."""
+    _, acc, seen, on_arm = _lora_on_classifier(
+        root, tmp_path, monkeypatch, {0.0: 0.6, 0.25: 0.6, 0.5: 0.6, 0.75: 0.7, 1.0: 0.6})
+    assert set(on_arm) == {0.0, 0.25, 0.5, 0.75, 1.0}       # the λ grid on the winning arm
     (ev,) = acc.evaluated
     assert ev["_adapt_lambda"] == 0.75
     assert seen == {"refit": 0.75, "refit_setting": 0.75, "holdout": 0.75}
     assert gateway.classifier_blend() == 0.5             # back to the detector state's λ
     (row,) = acc.screened
     assert row["classifier_lambda"] == 0.75 and len(row["classifier_lambda_grid"]) == 5
+    assert row["setting"]["lam"] == 0.75 and row["fit_dev_micro_f_beta"] == 0.7
+
+
+def test_lora_winner_keeps_champion_lambda_within_margin(root, tmp_path, monkeypatch):
+    _, acc, seen, _ = _lora_on_classifier(
+        root, tmp_path, monkeypatch, {0.0: 0.6, 0.25: 0.605, 0.5: 0.6, 0.75: 0.6, 1.0: 0.6})
+    (ev,) = acc.evaluated
+    assert ev["_adapt_lambda"] == 0.5 and seen["holdout"] == 0.5
+    assert gateway.classifier_blend() == 0.5
+
+
+def test_lora_without_retune_keeps_champion_lambda(root, tmp_path, monkeypatch):
+    _, acc, seen, on_arm = _lora_on_classifier(
+        root, tmp_path, monkeypatch, {0.5: 0.6, 0.75: 0.9},
+        cfg_extra={"retune_lambda": False})
+    assert on_arm == [0.5] and "_adapt_lambda" not in acc.evaluated[0]
+    assert seen["holdout"] == 0.5
+
+
+def test_lora_arm_skipped_after_retune_restores_the_blend(root, tmp_path, monkeypatch):
+    """If λ changed and the pre-holdout fit_dev verdict then drops the arm, the
+    blend still returns to the detector state's λ."""
+    _, acc, _, _ = _lora_on_classifier(
+        root, tmp_path, monkeypatch, {0.0: 0.6, 0.25: 0.6, 0.5: 0.6, 0.75: 0.7, 1.0: 0.6},
+        arm_skip=True)
+    assert not acc.evaluated and gateway.classifier_blend() == 0.5

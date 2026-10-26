@@ -205,9 +205,104 @@ class Rescorer:
 
 
 def fit_discriminator(feature_names: list[str], X_hand: np.ndarray,
-                      E: np.ndarray, y: np.ndarray, *, members: int = 5) -> GbdtVerifier:
+                      E: np.ndarray, y: np.ndarray, *, members: int = 5,
+                      sample_weight: np.ndarray | None = None) -> GbdtVerifier:
     """Train the discriminator — thin wrapper over GbdtVerifier.fit (produces the rescorer's P̂)."""
-    return GbdtVerifier.fit(feature_names, X_hand, E, y, members=members)
+    return GbdtVerifier.fit(feature_names, X_hand, E, y, members=members,
+                            sample_weight=sample_weight)
+
+
+SCORE_BINS = 4      # FP strata = (class × score quantile bin)
+
+
+def _row_hash(r: dict) -> str:
+    return hashlib.sha256(f"{r['image']}|{r['det_id']}".encode()).hexdigest()
+
+
+def _proportional(sizes: list[int], budget: int) -> list[int]:
+    """Split budget in proportion to sizes (largest remainder, deterministic) —
+    each share is at most its size."""
+    total = sum(sizes)
+    if total <= budget:
+        return list(sizes)
+    raw = [budget * s / total for s in sizes]
+    out = [int(x) for x in raw]
+    for i in sorted(range(len(sizes)), key=lambda i: (out[i] - raw[i], i))[
+            :budget - sum(out)]:
+        out[i] += 1
+    return out
+
+
+def _even(sizes: list[int], budget: int) -> list[int]:
+    """Split budget evenly — what a small bin cannot fill is shared by the rest."""
+    out = [0] * len(sizes)
+    left, open_ = budget, [i for i, s in enumerate(sizes) if s > 0]
+    while left > 0 and open_:
+        share = max(1, left // len(open_))
+        for i in list(open_):
+            take = min(share, sizes[i] - out[i], left)
+            out[i] += take
+            left -= take
+            if out[i] >= sizes[i]:
+                open_.remove(i)
+            if left == 0:
+                break
+    return out
+
+
+def cap_train_rows(rows: list[dict], cap: int):
+    """Thin the discriminator's training rows to cap — (kept rows, row weights, record).
+
+    TPs are rare and the core of the ranking signal, so they are kept first — if
+    the TPs alone exceed half of cap they are thinned in class proportion, but slots
+    the FPs cannot fill (cap − the TP share) go to the TPs — rows are always at
+    most cap, and when thinning, cap is used in full. FPs get a share per class
+    proportional to the class's FP count, split evenly across score quartile
+    bins — easy low-score FPs shrink a lot while FPs near the threshold mostly
+    stay. Within a stratum, rows are taken in (image, det_id) hash order
+    (deterministic, independent of input order). A kept row's weight is the
+    stratum's original row count ÷ the number kept, so the GBDT and the
+    isotonic calibration see the original distribution (TP rate, score
+    distribution). Kept rows keep their original order.
+    """
+    n = len(rows)
+    if cap <= 0 or n <= cap:
+        return rows, np.ones(n), {"capped": False, "n_rows": n, "n_kept": n}
+    pos = [i for i, r in enumerate(rows) if r["y"]]
+    neg = [i for i, r in enumerate(rows) if not r["y"]]
+    strata: list[list[int]] = []
+    budgets: list[int] = []
+
+    def by_class(idx):
+        out: dict = {}
+        for i in idx:
+            out.setdefault(rows[i]["cid"], []).append(i)
+        return [out[c] for c in sorted(out)]
+
+    pos_groups = by_class(pos)
+    pos_take = _proportional([len(g) for g in pos_groups],
+                             min(len(pos), max(cap // 2, cap - len(neg))))
+    strata += pos_groups
+    budgets += pos_take
+    neg_groups = by_class(neg)
+    neg_take = _proportional([len(g) for g in neg_groups], cap - sum(pos_take))
+    for g, take in zip(neg_groups, neg_take):
+        s = np.array([rows[i]["score"] for i in g])
+        edges = np.quantile(s, np.linspace(0, 1, SCORE_BINS + 1)[1:-1])
+        b = np.searchsorted(edges, s, side="right")
+        bins = [[g[j] for j in np.flatnonzero(b == k)] for k in range(SCORE_BINS)]
+        strata += bins
+        budgets += _even([len(x) for x in bins], take)
+    weight = np.zeros(n)
+    for idx, k in zip(strata, budgets):
+        if k <= 0:
+            continue
+        for i in sorted(idx, key=lambda i: _row_hash(rows[i]))[:k]:
+            weight[i] = len(idx) / k
+    keep = np.flatnonzero(weight > 0)
+    return ([rows[i] for i in keep], weight[keep],
+            {"capped": True, "n_rows": n, "n_kept": int(len(keep)),
+             "n_pos": len(pos), "n_pos_kept": int(sum(pos_take))})
 
 
 def oof_phat(feature_names: list[str], X_hand: np.ndarray, E: np.ndarray,
@@ -339,10 +434,14 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
         for r in rows_tr + rows_dev:
             r["emb"] = []
     feat_names = list(VERIFIER_FEATURES)
+    # row cap — thinned and weighted only above it (otherwise the same uniform fit as before)
+    n_raw = len(rows_tr)
+    rows_tr, w_tr, cap_info = cap_train_rows(rows_tr, rs_cfg.max_train_rows)
     ys_tr = np.array([r["y"] for r in rows_tr], dtype=float)
     info = {"n_train": len(rows_tr), "n_dev": len(rows_dev),
             "pos_train": int(ys_tr.sum()) if len(ys_tr) else 0,
-            "embeddings": bool(has_emb)}
+            "embeddings": bool(has_emb), "n_train_raw": n_raw,
+            "train_rows_capped": cap_info["capped"]}
     if len(rows_tr) < rs_cfg.min_samples or not (0 < ys_tr.sum() < len(ys_tr)):
         # The total-count guard is a discriminator-fit tripwire (below it,
         # HistGradientBoosting's min_samples_leaf degenerates P̂ to a constant)
@@ -357,7 +456,8 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
         log.info("rescorer: fitting without embeddings — using only %d hand-crafted features "
                  "(the detector does not provide embeddings)", len(feat_names))
     disc = fit_discriminator(feat_names, X_tr, E_tr, ys_tr,
-                             members=rs_cfg.ensemble_members)
+                             members=rs_cfg.ensemble_members,
+                             sample_weight=w_tr if cap_info["capped"] else None)
 
     alphas: dict[int, float] = {}
     sel_f1: dict[int, dict[float, float]] = {}
@@ -427,8 +527,9 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
                  "sel_f_beta_by_class_alpha": {
                      str(cid): {str(a): round(v, 4) for a, v in sorted(c.items())}
                      for cid, c in sel_f1.items()}})
-    log.info("rescorer: train n=%d, dev n=%d, α>0 classes %d/%d (margin %.3f)",
-             len(rows_tr), len(rows_dev), n_on, len(counts), rs_cfg.margin)
+    log.info("rescorer: train n=%d%s, dev n=%d, α>0 classes %d/%d (margin %.3f)",
+             len(rows_tr), f" (capped — {n_raw} before)" if cap_info["capped"] else "",
+             len(rows_dev), n_on, len(counts), rs_cfg.margin)
     fp = dataset_fingerprint(dataset_name, ontology)
     return Rescorer(disc, alphas, meta=dict(info), fingerprint=fp), info
 

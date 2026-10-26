@@ -55,7 +55,7 @@ decide       adopt the gate-passing candidate with max Δ  holdout
 
 | split | role ([split roles](docs/design.md#split-roles)) |
 |---|---|
-| `train` = `fit_train` 80% + `fit_dev` 20% | material mining (all of train), training (`fit_train`), candidate scoring (`fit_dev`) |
+| `train` = `fit_train` 80% + `fit_dev` 20% | material mining (all of train), training (`fit_train` — a subset of it above `subsample.max_images`), candidate scoring (`fit_dev`) |
 | `valid` (holdout) | τ_c estimation, adoption, stop decisions. Without it, `test` takes its place |
 | `test` | never read by the loop. Measured once with `predict.py` |
 
@@ -93,6 +93,8 @@ details in the [axis reference](docs/design.md#axis-reference).
 | `gate.min_delta` | 0.005 | minimum Δ for adoption |
 | `saturation.rounds` | 5 | stagnant rounds before stopping |
 | `detector.device` · `mine.device` · `lora.device` | `cuda:0` · `cuda:0` · `cuda:0` | GPU placement (keep off the planner's GPU) |
+| `subsample.max_images` · `subsample.center_ratio` | 400 · 0.1 | when fit_train is large, train lora, the rescorer and the classifier on a subset that covers the GT embedding clusters. 0 = off |
+| `rescorer.max_train_rows` | 100000 | rescorer discriminator training row cap (every TP, FPs stratified + weighted). 0 = off |
 
 The lora and crop_classifier axes swap the in-process detector's state (tail
 weights, classifier artifact) through controls the CLI wires in.
@@ -102,7 +104,8 @@ weights, classifier artifact) through controls the CLI wires in.
 ```
 runs/<dataset>/run/
   history.jsonl       round ledger (per-candidate axes, outcome, gate, wall_min)
-  run_summary.json    stop reason, final champion, holdout_split
+  run_summary.json    stop reason, final champion, holdout_split, fit_train (training images, subset record)
+  fit_train_subset.json  fit_train subset (picked images, centers, coverage) — only when fit_train exceeds the cap
   champion.json       champion setting (axes, materials, weight paths, classifier blend λ)
   champion_eval.json  holdout evaluation, tau_test
   rounds/round_NNN/   proposal, settings/<cand>/, screen, eval, decision, diagnosis

@@ -128,6 +128,16 @@ class SplitCfg:
 
 
 @dataclass(frozen=True)
+class SubsampleCfg:
+    """fit_train subset — an image cap on the training material (lora, rescorer,
+    crop classifier). When fit_train is larger than max_images, images are
+    picked in the order that covers the GT embedding clusters
+    (fitting.subsample). Mining, fit_dev and holdout are unchanged."""
+    max_images: int = 400        # 0 turns it off (all of fit_train)
+    center_ratio: float = 0.1    # k-centers per class = GT objects × ratio (at least 1)
+
+
+@dataclass(frozen=True)
 class LoraCfg:
     """lora axis = YOLOE tail fine-tune + λ-interpolation arms — **off by
     default**; the planner enables it on a structural-miss diagnosis. Training
@@ -158,6 +168,11 @@ class RescorerCfg:
     margin: float = 0.005             # adopt α>0 only if the fit_dev F(β) gain exceeds this
     ensemble_members: int = 5         # discriminator ensemble size
     inner_folds: int = 5              # for the oof_phat diagnostic
+    # discriminator training row cap — TPs first (up to half of the cap, plus the
+    # slots FPs cannot fill), FPs thinned in (class × score quartile) strata with
+    # inverse-probability weights restoring the original distribution
+    # (fitting.rescorer.cap_train_rows). 0 turns it off
+    max_train_rows: int = 100_000
 
 
 @dataclass(frozen=True)
@@ -179,9 +194,10 @@ class CropClassifierCfg:
     # train once per run and let later proposals reuse it (<run>/classifier_cache/).
     # false re-mines and retrains on each proposal's champion
     reuse: bool = True
-    # while the champion has a classifier, ordinary candidates re-choose λ on
-    # their own setting too (λ first, then the rescorer refit on top). λ changes
-    # only when it beats the champion's λ by more than margin
+    # while the champion has a classifier, ordinary candidates (on their own
+    # setting) and lora candidates (on the winning arm) re-choose λ too (λ first,
+    # then the rescorer refit on top). λ changes only when it beats the
+    # champion's λ by more than margin
     retune_lambda: bool = True
 
 
@@ -312,6 +328,7 @@ class Config:
     saturation: SaturationCfg = field(default_factory=SaturationCfg)
     screen: ScreenCfg = field(default_factory=ScreenCfg)
     split: SplitCfg = field(default_factory=SplitCfg)
+    subsample: SubsampleCfg = field(default_factory=SubsampleCfg)
     detector: DetectorCfg = field(default_factory=DetectorCfg)
     query: QueryCfg = field(default_factory=QueryCfg)
     mine: MineCfg = field(default_factory=MineCfg)
@@ -323,7 +340,8 @@ class Config:
 
 
 _SECTIONS = {"planner": PlannerCfg, "gate": GateCfg, "saturation": SaturationCfg,
-             "screen": ScreenCfg, "split": SplitCfg, "detector": DetectorCfg,
+             "screen": ScreenCfg, "split": SplitCfg, "subsample": SubsampleCfg,
+             "detector": DetectorCfg,
              "query": QueryCfg, "mine": MineCfg, "search": SearchCfg,
              "rescorer": RescorerCfg, "lora": LoraCfg,
              "crop_classifier": CropClassifierCfg, "diagnose": DiagnoseCfg}
@@ -368,6 +386,18 @@ def _validate(cfg: Config) -> None:
     # leaf and cannot import planner.axes (AXES) (layering invariant).
     if not (0.0 < cfg.split.fit_train_ratio < 1.0):
         raise ConfigError(f"split.fit_train_ratio: outside (0,1) ({cfg.split.fit_train_ratio})")
+    if cfg.subsample.max_images < 0:
+        raise ConfigError("subsample.max_images: must be >= 0 — 0 is off "
+                          f"({cfg.subsample.max_images})")
+    if not (0.0 < cfg.subsample.center_ratio <= 1.0):
+        raise ConfigError(f"subsample.center_ratio: outside (0,1] ({cfg.subsample.center_ratio})")
+    if cfg.rescorer.max_train_rows < 0:
+        raise ConfigError("rescorer.max_train_rows: must be >= 0 — 0 is off "
+                          f"({cfg.rescorer.max_train_rows})")
+    if 0 < cfg.rescorer.max_train_rows < cfg.rescorer.min_samples:
+        raise ConfigError(
+            f"rescorer.max_train_rows ({cfg.rescorer.max_train_rows}) is below min_samples "
+            f"({cfg.rescorer.min_samples}) — the discriminator fit would always be skipped")
     if cfg.rounds < 1:
         raise ConfigError(f"rounds: must be >= 1 ({cfg.rounds})")
     if cfg.beta <= 0:

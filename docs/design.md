@@ -10,12 +10,54 @@ Datasets use the Roboflow layout (`train/`, `valid/`, `test/`).
 
 | split | role |
 |---|---|
-| `train` (80% `fit_train` / 20% `fit_dev`) | builds all materials — prompts from all of `train`, tail fine-tune / rescorer / crop classifier trained on `fit_train`; `fit_dev` scores candidates |
+| `train` (80% `fit_train` / 20% `fit_dev`) | builds all materials — prompts from all of `train`, tail fine-tune / rescorer / crop classifier trained on `fit_train` (a subset of it above `subsample.max_images` — below); `fit_dev` scores candidates |
 | `valid` (holdout) | per-class thresholds τ_c, adoption decision, saturation |
 | `test` | never read by the loop — measures the final champion once |
 
 Without `valid/`, `test/` becomes the holdout and no unopened split remains;
 the run records this as `holdout_split` in `run_summary.json`.
+
+### fit_train subset — training time does not follow the dataset size
+
+The three trainings (tail fine-tune, rescorer discriminator, crop classifier)
+read fit_train as is, so their time grows with its size. When fit_train is
+larger than `subsample.max_images` (400), only that many images are used for
+training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
+
+- **Picked in the order that covers the appearances, not at random** (greedy
+  set cover). The DINOv3 embeddings of GT crops are clustered per class with
+  k-center (centers = objects × `subsample.center_ratio`, 0.1), and images
+  holding the most not-yet-covered centers go first. Once all are covered,
+  another pass runs over the remaining images. Before that, one image per
+  class goes in first (classes with fewer centers first) — the cover score does
+  not tell classes apart, so if the first pass does not finish within the cap,
+  a large class could take every slot. In a random sample the large clusters
+  take the slots.
+- Background images without GT keep their original share — they are the FP
+  material the rescorer and classifier learn from. Even when background
+  dominates, the GT images keep a share (one per class).
+- **Only the training material shrinks.** Mining (all of train), verdicts
+  (fit_dev) and adoption (holdout) are unchanged — verdict noise must not
+  grow. The subset is picked within fit_train only, so material purity is
+  unaffected.
+- Deterministic (sorting, argmax, hashes); resume reuses the recorded subset
+  (key = fit_train fingerprint, settings and embedding model; a record that no
+  longer matches fit_train picks again). The training reuse keys hold the
+  fit_train fingerprint, so a changed subset also breaks reuse.
+- On datasets with many objects per image, 400 images can still mean many
+  boxes — the cap bounds images, not objects.
+- **The rescorer also caps its training rows** (`rescorer.max_train_rows`,
+  100,000). A row is one detection candidate, so many detections per image can
+  exceed it even after the subset. TPs are rare and the core of the ranking
+  signal, so they are kept first (if TPs alone exceed half the cap they are
+  thinned in class proportion, but slots the FPs cannot fill go to the TPs —
+  rows are always at most the cap). FPs get a share per class proportional to
+  the class's FP count, split evenly across score quartile bins — easy
+  low-score FPs shrink a lot, FPs near the threshold mostly stay. Kept rows
+  carry inverse-probability weights (stratum's original count ÷ kept) so the
+  GBDT and the isotonic calibration see the original distribution (TP rate,
+  score distribution). Under the cap it is the same uniform fit as before, and
+  fit_dev rows (α grid, non-degradation check) are not thinned.
 
 Every round, apart from the axes:
 
@@ -80,7 +122,7 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 | `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
 | `visual_negatives` | train: `visual_negative_k` mining-pass false-positive crops per class | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
 | `tiling` | none — an inference setting | tiled and untiled configs are chosen from the same grid, shared by all classes (a text-only candidate runs the text pass per tiling variant). If untiled wins, `axis_unused`. Grids ≥ `screen.prescreen_min_grid` are first screened on a `fit_dev` subset | 〃 |
-| `rescorer` | `fit_train`: discriminator training (area statistics over all of train) | per-class α grid — identity unless the gain exceeds `rescorer.margin` | 〃 |
+| `rescorer` | `fit_train`: discriminator training (area statistics over all of train, row cap `rescorer.max_train_rows`) | per-class α grid — identity unless the gain exceeds `rescorer.margin` | 〃 |
 | `lora` | `fit_train`: YOLOE tail fine-tune (no validation split during training) | λ grid — the arm's ΔF must exceed `lora.margin` | 〃 |
 | `crop_classifier` | `fit_train`: GT crops (positive) and false positives from a fit_train pass (background), mined at the `fit_dev` thresholds | the λ grid is scored on `fit_dev`; the best ΔF must exceed `crop_classifier.margin` | 〃 |
 
@@ -264,7 +306,10 @@ planner's input for the same round.
   it too, on the winning arm: lora changes the detections themselves, so a
   layer below it (classifier λ, then the rescorer) is refit on top, and with
   the winning arm loaded only λ changes, so the detector responses are the same
-  and it costs almost nothing. The lora arm grid (which lora λ wins) is chosen
+  and it costs almost nothing (if the winner is not the last arm measured, the
+  winner is loaded again and fit_dev is inferred once more). The history row
+  keeps the final setting (chosen λ, refit rescorer) and its fit_dev, like an
+  ordinary candidate; the arm grid's best stays in the lora decision. The lora arm grid (which lora λ wins) is chosen
   on the champion's classifier λ, and the classifier λ once on that winner —
   the two grids are not swept as a product, so the number of picks on fit_dev
   matches an ordinary candidate's. The training cache key
@@ -341,7 +386,10 @@ runs/<dataset>/run/
                        # delta_reused, classifier_reused, classifier_lambda(_grid);
                        # per-round pass_cache counts)
   run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
-                       # holdout_split, final_diagnosis (reused or not, duration)
+                       # holdout_split, fit_train (training images, images before the subset,
+                       # selection record), final_diagnosis (reused or not, duration)
+  fit_train_subset.json  # fit_train subset (key, picked images, selection record) — above the cap only
+  _subsample/gt_crops/ # GT crops embedded for the subset selection
   champion.json        # champion setting (axes, materials, weights, adapt_root, adapt_lambda,
                        # forwards_per_image,
                        # per-image fit_dev (tp, fp, fn) — the baseline of the next fit_dev_cmp)
@@ -366,6 +414,8 @@ runs/<dataset>/run/
   is dropped.
 - **Final diagnosis** (`rounds/final/`): a failure still ends the run, and the
   error is kept in `run_summary.json` as `final_diagnosis.error`.
+- **Rescorer row cap**: a rescorer candidate's `rescorer_info.json` carries
+  `n_train_raw` (rows before the cap) and `train_rows_capped`.
 
 ### Report
 

@@ -99,12 +99,18 @@ def test_refine_negatives_rule1_double_check(monkeypatch):
 
 
 def test_refine_failure_drops_phrases(monkeypatch):
-    """The fallback for LLM server errors or parse failures is "drop" — no suppression means current behavior."""
+    """The fallback for LLM server errors or parse failures is "drop" — no suppression
+    means current behavior. Server errors are not asked again (retrying is
+    post_with_retry's job)."""
+    calls = []
+
     def boom(*a, **k):
+        calls.append(1)
         raise RuntimeError("down")
     monkeypatch.setattr(phrases, "post_with_retry", boom)
     assert phrases.refine_negatives("http://x", "m", "t", ["t"], ["p"])["keep"] == []
     assert phrases.refine_alias("http://x", "m", "t", ["t"], ["p"])["alias"] is None
+    assert len(calls) == 2
 
 
 class _RawResp:
