@@ -168,9 +168,10 @@ class RescorerCfg:
     margin: float = 0.005             # adopt α>0 only if the fit_dev F(β) gain exceeds this
     ensemble_members: int = 5         # discriminator ensemble size
     inner_folds: int = 5              # for the oof_phat diagnostic
-    # discriminator training row cap — every TP, FPs thinned in (class × score
-    # quartile) strata with inverse-probability weights restoring the original
-    # distribution (fitting.rescorer.cap_train_rows). 0 turns it off
+    # discriminator training row cap — TPs first (up to half of the cap, plus the
+    # slots FPs cannot fill), FPs thinned in (class × score quartile) strata with
+    # inverse-probability weights restoring the original distribution
+    # (fitting.rescorer.cap_train_rows). 0 turns it off
     max_train_rows: int = 100_000
 
 
@@ -193,9 +194,10 @@ class CropClassifierCfg:
     # train once per run and let later proposals reuse it (<run>/classifier_cache/).
     # false re-mines and retrains on each proposal's champion
     reuse: bool = True
-    # while the champion has a classifier, ordinary candidates re-choose λ on
-    # their own setting too (λ first, then the rescorer refit on top). λ changes
-    # only when it beats the champion's λ by more than margin
+    # while the champion has a classifier, ordinary candidates (on their own
+    # setting) and lora candidates (on the winning arm) re-choose λ too (λ first,
+    # then the rescorer refit on top). λ changes only when it beats the
+    # champion's λ by more than margin
     retune_lambda: bool = True
 
 

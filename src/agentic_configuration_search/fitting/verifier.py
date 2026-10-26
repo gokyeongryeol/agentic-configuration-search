@@ -232,7 +232,8 @@ class GbdtVerifier:
         for te in np.array_split(order, inner_folds):
             tr = np.setdiff1d(order, te)
             if len(set(y[tr].tolist())) < 2:
-                oof[te] = float(y[tr].mean())
+                oof[te] = float(np.average(y[tr], weights=None if sample_weight is None
+                                           else sample_weight[tr]))
                 continue
             fold = fit_members(X[tr], y[tr], members,
                                None if sample_weight is None else sample_weight[tr])

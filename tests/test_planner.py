@@ -1020,8 +1020,8 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
     props = cands["items"]["properties"]
     assert props["rationale"]["maxLength"] == L.RATIONALE_MAX_CHARS
     assert props["id"]["maxLength"] <= 80
-    # the longest response the schema allows fits under the cap — at 2.0
-    # chars/token (more conservative than the measured minimum of 2.68), with
+    # the longest response the schema allows fits under the cap — at a
+    # conservative 2.0 chars/token, with
     # 600 characters per candidate for axes (12 enumerated keys) and 100 for
     # the two number fields (expected_gain, cost_min) and key names. differs is
     # the longest string field, so it is counted too
@@ -1034,9 +1034,8 @@ def test_planner_bounds_its_output_by_schema_and_cap(tmp_path):
 
 def test_token_budget_is_language_aware_and_fits_context():
     """The input budget is in estimated tokens — a character budget plus the
-    output share overflowed the server context on CJK-heavy prompts (around 1.8
-    chars/token). ASCII counts at the worst measured ratio (1.85 chars/token),
-    other characters generously at 1.5 tokens each."""
+    output share can overflow the server context on CJK-heavy prompts. ASCII
+    counts at 1.85 chars/token, other characters generously at 1.5 tokens each."""
     from agentic_configuration_search.config import config_from_dict
     from agentic_configuration_search.loop.runner import _token_budget
     from agentic_configuration_search.planner import llm as L

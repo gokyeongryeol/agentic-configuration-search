@@ -108,3 +108,17 @@ def test_config_validates_max_train_rows():
     with pytest.raises(ConfigError):     # below the tripwire the fit would always be skipped
         config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": 10,
                                                        "min_samples": 64}})
+
+
+def test_fit_rescorer_under_the_cap_is_unchanged(tmp_path):
+    """Under the cap the fit is unweighted and the same as before — P̂ and α match
+    a fit with the cap off."""
+    from tests.test_rescorer import _fit, _rs
+    kw = dict(min_samples=50, min_samples_per_class=1, margin=0.005, ensemble_members=2)
+    off, info_off = _fit(tmp_path / "a", _rs(**kw, max_train_rows=0))
+    big, info_big = _fit(tmp_path / "b", _rs(**kw, max_train_rows=10_000))
+    assert info_big["train_rows_capped"] is False
+    assert info_off["sel_f_beta_by_class_alpha"] == info_big["sel_f_beta_by_class_alpha"]
+    X = np.random.default_rng(0).normal(
+        size=(20, len(off.discriminator.features) + off.discriminator.emb_dim))
+    assert np.array_equal(off.discriminator.predict_proba(X), big.discriminator.predict_proba(X))

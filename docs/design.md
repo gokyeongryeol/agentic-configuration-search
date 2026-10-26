@@ -28,24 +28,28 @@ training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
   set cover). The DINOv3 embeddings of GT crops are clustered per class with
   k-center (centers = objects × `subsample.center_ratio`, 0.1), and images
   holding the most not-yet-covered centers go first. Once all are covered,
-  another pass runs over the remaining images. Rare classes and appearances
-  always get in on the first pass — in a random sample the large clusters take
-  the slots.
+  another pass runs over the remaining images. Before that, one image per
+  class goes in first (classes with fewer centers first) — the cover score does
+  not tell classes apart, so if the first pass does not finish within the cap,
+  a large class could take every slot. In a random sample the large clusters
+  take the slots.
 - Background images without GT keep their original share — they are the FP
-  material the rescorer and classifier learn from.
+  material the rescorer and classifier learn from. Even when background
+  dominates, the GT images keep a share (one per class).
 - **Only the training material shrinks.** Mining (all of train), verdicts
   (fit_dev) and adoption (holdout) are unchanged — verdict noise must not
   grow. The subset is picked within fit_train only, so material purity is
   unaffected.
 - Deterministic (sorting, argmax, hashes); resume reuses the recorded subset
-  (key = fit_train fingerprint and settings). The training reuse keys hold the
+  (key = fit_train fingerprint, settings and embedding model; a record that no
+  longer matches fit_train picks again). The training reuse keys hold the
   fit_train fingerprint, so a changed subset also breaks reuse.
 - On datasets with many objects per image, 400 images can still mean many
   boxes — the cap bounds images, not objects.
 - **The rescorer also caps its training rows** (`rescorer.max_train_rows`,
   100,000). A row is one detection candidate, so many detections per image can
   exceed it even after the subset. TPs are rare and the core of the ranking
-  signal, so all of them stay (if TPs alone exceed half the cap they are
+  signal, so they are kept first (if TPs alone exceed half the cap they are
   thinned in class proportion, but slots the FPs cannot fill go to the TPs —
   rows are always at most the cap). FPs get a share per class proportional to
   the class's FP count, split evenly across score quartile bins — easy
@@ -302,7 +306,10 @@ planner's input for the same round.
   it too, on the winning arm: lora changes the detections themselves, so a
   layer below it (classifier λ, then the rescorer) is refit on top, and with
   the winning arm loaded only λ changes, so the detector responses are the same
-  and it costs almost nothing. The lora arm grid (which lora λ wins) is chosen
+  and it costs almost nothing (if the winner is not the last arm measured, the
+  winner is loaded again and fit_dev is inferred once more). The history row
+  keeps the final setting (chosen λ, refit rescorer) and its fit_dev, like an
+  ordinary candidate; the arm grid's best stays in the lora decision. The lora arm grid (which lora λ wins) is chosen
   on the champion's classifier λ, and the classifier λ once on that winner —
   the two grids are not swept as a product, so the number of picks on fit_dev
   matches an ordinary candidate's. The training cache key

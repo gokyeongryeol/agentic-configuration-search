@@ -334,8 +334,9 @@ class Loop:
         Only ds.fit_train changes — what lora, the rescorer discriminator and
         the crop classifier read. train (mining), fit_dev (verdicts) and holdout
         (adoption) stay as they are. The picked images are recorded in the run
-        directory and resume reads them back (key = fit_train fingerprint and
-        settings — a different key picks again). The training reuse keys hold
+        directory and resume reads them back (key = fit_train fingerprint,
+        settings and embedding model — a different key, or a record that no
+        longer matches fit_train, picks again). The training reuse keys hold
         the fit_train fingerprint, so a changed subset also breaks reuse."""
         sc = self.cfg.subsample
         n = len(ds.fit_train.images)
@@ -343,10 +344,11 @@ class Loop:
         if sc.max_images <= 0 or n <= sc.max_images:
             return ds
         key = {"fit_train": split_identity(ds.fit_train), "max_images": sc.max_images,
-               "center_ratio": sc.center_ratio}
+               "center_ratio": sc.center_ratio, "embedder": self.cfg.mine.embedder_model}
         path = self.out_dir / subsample.SUBSET_FILE
         rec = json.loads(path.read_text()) if path.exists() else {}
-        if rec.get("key") != key:
+        names_all = {e.file_name for e in ds.fit_train.images}
+        if rec.get("key") != key or not set(rec.get("images") or ()) <= names_all:
             if encode_fn is None:
                 raise ValueError(
                     f"fit_train has {n} images > subsample.max_images {sc.max_images} — "
@@ -359,7 +361,9 @@ class Loop:
             rec = {"key": key, "report": report,
                    "images": [ds.fit_train.images[i].file_name for i in idx]}
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
+            tmp = path.with_suffix(".tmp")   # so resume never reads a half-written record
+            tmp.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
+            tmp.replace(path)
         self._fit_train_subset = rec["report"]
         names = set(rec["images"])
         keep = {i for i, e in enumerate(ds.fit_train.images) if e.file_name in names}
@@ -1314,8 +1318,8 @@ class Loop:
             # downstream inheritance: a classifier-arm winner keeps its own artifact;
             # any other winner (lora included) inherits the champion's as-is.
             adapt_root = winner.get("_adapt_root", champion.get("adapt_root"))
-            # the blend λ follows the same rule — a classifier-arm winner keeps its
-            # own λ, any other winner its re-chosen λ or the champion's
+            # the blend λ — a classifier arm keeps its own λ, ordinary and lora
+            # candidates the λ they re-chose (_choose_lambda), otherwise the champion's
             adapt_lambda = (winner.get("_adapt_lambda", champion.get("adapt_lambda"))
                             if adapt_root else None)
             if not adapt_root:
@@ -1589,7 +1593,12 @@ class Loop:
             row.update(_classifier_lambda_record(entry))
             with self._lambda_for(entry):
                 setting = self._arm_rescorer(entry, setting, materials, mat_dir)
-            entry["setting"] = setting
+            # the row and the candidate keep the final setting's fit_dev (chosen λ,
+            # refit rescorer) — the same as ordinary candidates. The arm grid's
+            # best stays in the lora decision's grid
+            entry["setting"] = row["setting"] = setting
+            entry["fit_dev_micro_f_beta"] = row["fit_dev_micro_f_beta"] = \
+                setting["fit_dev_micro_f_beta"]
             row.update(_cmp_of(self._fit_dev_cmp(setting)))
             if self._arm_skip(row):
                 continue
@@ -2190,8 +2199,8 @@ def _reuse_record(c: dict) -> dict:
 def _classifier_lambda_record(c: dict) -> dict:
     """The classifier blend λ the candidate chose — a classifier arm (the grid's
     best when not adopted; Δ is in classifier_decision.json's grid), or an
-    ordinary candidate that re-chose λ while the champion had a classifier
-    (_choose_lambda — its grid is classifier_lambda_grid)."""
+    ordinary or lora (winning arm) candidate that re-chose λ while the champion
+    had a classifier (_choose_lambda — its grid is classifier_lambda_grid)."""
     lam = (c.get("crop_classifier") or {}).get("lam")
     if lam is None:
         lam = c.get("_adapt_lambda")

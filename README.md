@@ -55,7 +55,7 @@ decide       adopt the gate-passing candidate with max Δ  holdout
 
 | split | role ([split roles](docs/design.md#split-roles)) |
 |---|---|
-| `train` = `fit_train` 80% + `fit_dev` 20% | material mining (all of train), training (`fit_train`), candidate scoring (`fit_dev`) |
+| `train` = `fit_train` 80% + `fit_dev` 20% | material mining (all of train), training (`fit_train` — a subset of it above `subsample.max_images`), candidate scoring (`fit_dev`) |
 | `valid` (holdout) | τ_c estimation, adoption, stop decisions. Without it, `test` takes its place |
 | `test` | never read by the loop. Measured once with `predict.py` |
 

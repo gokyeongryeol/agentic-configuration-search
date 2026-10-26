@@ -253,8 +253,8 @@ def _even(sizes: list[int], budget: int) -> list[int]:
 def cap_train_rows(rows: list[dict], cap: int):
     """Thin the discriminator's training rows to cap — (kept rows, row weights, record).
 
-    TPs are rare and the core of the ranking signal, so all of them stay. If the
-    TPs alone exceed half of cap they are thinned in class proportion, but slots
+    TPs are rare and the core of the ranking signal, so they are kept first — if
+    the TPs alone exceed half of cap they are thinned in class proportion, but slots
     the FPs cannot fill (cap − the TP share) go to the TPs — rows are always at
     most cap, and when thinning, cap is used in full. FPs get a share per class
     proportional to the class's FP count, split evenly across score quartile

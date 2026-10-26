@@ -5,8 +5,9 @@ larger than `subsample.max_images`, the DINOv3 embeddings of GT objects are
 clustered per class with k-center, and images holding the most not-yet-covered
 centers are picked first (greedy set cover). Contract:
 - at or under the cap, or 0 (off), nothing changes
-- rare appearances (centers) are covered first — a large cluster cannot take
-  every slot the way it does in a random sample
+- at least one image per class (rarer classes first), then not-yet-covered
+  appearances (centers) first — a large cluster cannot take every slot the way
+  it does in a random sample
 - background images without GT keep their original share (FP material for the
   rescorer and classifier)
 - deterministic — same input, same subset (resume, training reuse cache)
@@ -78,6 +79,33 @@ def test_rare_class_is_always_kept():
     keep, _ = subsample.select_fit_train(sp, _emb(sp, look), max_images=2,
                                          center_ratio=1.0)
     assert 3 in keep
+
+
+def test_rare_class_survives_an_unfinished_first_pass():
+    """Even when the first pass does not finish within the budget, every class
+    gets at least one image — the cover score does not tell classes apart, so
+    images of a large class with many centers could take every slot."""
+    sp = _split([[1, 1, 1]] * 30 + [[2]])
+    look = {i: i - 1 for i in range(1, 91)} | {91: 90}     # class 1's appearances all differ
+    keep, rep = subsample.select_fit_train(sp, _emb(sp, look), max_images=10,
+                                           center_ratio=1.0)
+    assert 30 in keep and len(keep) == 10
+    assert rep["first_pass_coverage"] < 1.0                 # the first pass did not finish
+
+
+def test_background_cannot_take_every_slot():
+    # even when background dominates, the GT images keep a share (one per class,
+    # at most the number of GT images)
+    sp = _split([[]] * 9 + [[1]])
+    keep, rep = subsample.select_fit_train(sp, _emb(sp, {1: 0}), max_images=2,
+                                           center_ratio=1.0)
+    assert 9 in keep and rep["n_background"] == 1
+
+
+def test_all_background_fit_train():
+    sp = _split([[]] * 6)
+    keep, rep = subsample.select_fit_train(sp, {}, max_images=3, center_ratio=0.1)
+    assert len(keep) == 3 and rep["n_background"] == 3
 
 
 def test_background_images_keep_their_share():
@@ -204,6 +232,29 @@ def test_changed_settings_reselect(dataset_root, tmp_path):
     calls = []
     loop = _loop(dataset_root, tmp_path / "run", _fake_encoder(calls), max_images=3)
     assert calls and len(loop.ds.fit_train.images) == 3
+
+
+def test_changed_embedder_reselects(dataset_root, tmp_path):
+    _loop(dataset_root, tmp_path / "run", _fake_encoder([]))
+    calls = []
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import Loop
+    cfg = config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(dataset_root),
+                            "subsample": {"max_images": 4},
+                            "mine": {"embedder_model": "other/model"}})
+    Loop(cfg, dataset_root, tmp_path / "run", encode_fn=_fake_encoder(calls))
+    assert calls, "a changed embedding model picks the subset again"
+
+
+def test_record_with_missing_images_reselects(dataset_root, tmp_path):
+    _loop(dataset_root, tmp_path / "run", _fake_encoder([]))
+    path = tmp_path / "run" / subsample.SUBSET_FILE
+    rec = json.loads(path.read_text())
+    rec["images"][0] = "gone.png"                          # the record no longer matches fit_train
+    path.write_text(json.dumps(rec))
+    calls = []
+    loop = _loop(dataset_root, tmp_path / "run", _fake_encoder(calls))
+    assert calls and len(loop.ds.fit_train.images) == 4
 
 
 def test_large_fit_train_without_encoder_is_an_error(dataset_root, tmp_path):
