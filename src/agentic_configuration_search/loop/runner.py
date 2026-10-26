@@ -296,7 +296,9 @@ class Loop:
         the best beats it by more than crop_classifier.margin — so λ does not
         drift with noise on the same fit_dev. The chosen λ stays in
         entry["_adapt_lambda"] for the rescorer refit, holdout, served
-        fingerprint and adoption. The lora λ is not re-chosen."""
+        fingerprint and adoption. Called for ordinary candidates (after screen)
+        and lora candidates (on the winning arm). The lora candidate's own λ
+        (weight interpolation) is not re-chosen after adoption."""
         cc = self.cfg.crop_classifier
         base = self._adapt_lambda
         if not cc.retune_lambda or self._adapt_path is None or base is None:
@@ -1527,7 +1529,13 @@ class Loop:
                                 "note": res["decision"].get("reason", ""),
                                 "wall_min": _wall_min(wall)} | _reuse_record(row))
                 continue
-            setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
+            # lora changes the detections — on the winning arm (the weights
+            # loaded now) re-choose the classifier λ by the same rule as ordinary
+            # candidates, and refit the rescorer on that λ
+            setting = self._choose_lambda(materials, base_axes, entry, res["setting"])
+            row.update(_classifier_lambda_record(entry))
+            with self._lambda_for(entry):
+                setting = self._arm_rescorer(entry, setting, materials, mat_dir)
             entry["setting"] = setting
             row.update(_cmp_of(self._fit_dev_cmp(setting)))
             if self._arm_skip(row):

@@ -549,3 +549,71 @@ def test_resume_restore_marks_the_champion_weights_as_loaded(root, tmp_path):
     loop._restore_detector_state({"weights": str(arm), "adapt_root": None})
     loop._weights_ctl(arm)
     assert calls == [("w", arm)]
+
+
+# ------------------------------- lora winners re-choose the classifier λ too
+
+def test_lora_winner_reselects_classifier_lambda(root, tmp_path, monkeypatch):
+    """lora changes the detections — on the winning arm the classifier λ is
+    re-chosen by the same rule as ordinary candidates (margin over the champion
+    λ), the rescorer is refit on that λ and holdout is measured with it. On
+    adoption the champion inherits that λ (it is in the history row too)."""
+    from agentic_configuration_search.fitting.materials import Materials
+    from agentic_configuration_search.loop import tail_round
+    from agentic_configuration_search.loop.runner import Loop, _RoundAcc
+    state = {"w": None}
+    loop = Loop(config_from_dict({"planner": {"kind": "deterministic"}, "dataset": str(root),
+                                  "lora": {"min_images": 1},
+                                  "crop_classifier": {"margin": 0.01}}),
+                root, tmp_path / "run",
+                detector_hooks={"weights_ctl": lambda w: state.__setitem__("w", w),
+                                "adapt_ctl": lambda p: None,
+                                "repo_root": tmp_path, "base_weights": tmp_path / "b"})
+    loop._adapt_ctl(tmp_path / "artifact", 0.5)
+    arm = tmp_path / "arm.json"
+    f = {0.0: 0.6, 0.25: 0.6, 0.5: 0.6, 0.75: 0.7, 1.0: 0.6}
+    screened_on = []
+
+    def screen(materials, axes, split=None):
+        lam = gateway.classifier_blend()
+        screened_on.append((state["w"], lam))
+        return {"fit_dev_micro_f_beta": f[lam], "configs": [], "per_class": {}, "lam": lam}
+    loop._screen = screen
+    seen = {}
+
+    def arm_rescorer(self, entry, setting, materials, mat_dir):
+        seen["refit"], seen["refit_setting"] = gateway.classifier_blend(), setting["lam"]
+        return setting
+
+    def evaluate(self, setting, materials):
+        seen["holdout"] = gateway.classifier_blend()
+        return {}
+    monkeypatch.setattr(Loop, "_materialize_timed", lambda self, *a, **k: Materials())
+    monkeypatch.setattr(Loop, "_guard_material", lambda self, *a, **k: False)
+    monkeypatch.setattr(Loop, "_arm_rescorer", arm_rescorer)
+    monkeypatch.setattr(Loop, "_fit_dev_cmp", lambda self, s: None)
+    monkeypatch.setattr(Loop, "_arm_skip", lambda self, row: False)
+    monkeypatch.setattr(Loop, "_evaluate", evaluate)
+    monkeypatch.setattr(Loop, "_gate", lambda self, ch, ev: {})
+
+    def fake_tail(cfg, ds, axes, materials, out_dir, *, weights_ctl, screen_fn, **kw):
+        weights_ctl(arm)                                 # ends with the winning arm loaded
+        return {"weights": arm, "setting": screen_fn(materials, axes),
+                "grid": [{"f_beta": 0.6}], "decision": {"adopted": True}}
+    monkeypatch.setattr(tail_round, "run_tail_candidate", fake_tail)
+    champion = {"weights": None, "adapt_root": str(tmp_path / "artifact"),
+                "adapt_lambda": 0.5, "axes": {"crop_classifier": True}}
+    loop._champion, loop._round_no = champion, 1
+    acc = _RoundAcc(served_w=None, served_a=str(tmp_path / "artifact"), served_l=0.5)
+    loop._attempt(tmp_path / "rd", champion,
+                  {"candidates": [{"id": "l1", "axes": {"lora": True,
+                                                         "crop_classifier": True}}],
+                   "stop": False}, acc)
+    # the λ grid is measured on the winning arm
+    assert {lam for w, lam in screened_on if w == arm} == {0.0, 0.25, 0.5, 0.75, 1.0}
+    (ev,) = acc.evaluated
+    assert ev["_adapt_lambda"] == 0.75
+    assert seen == {"refit": 0.75, "refit_setting": 0.75, "holdout": 0.75}
+    assert gateway.classifier_blend() == 0.5             # back to the detector state's λ
+    (row,) = acc.screened
+    assert row["classifier_lambda"] == 0.75 and len(row["classifier_lambda_grid"]) == 5

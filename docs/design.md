@@ -260,7 +260,14 @@ planner's input for the same round.
   relabel-only. While the champion has a classifier, ordinary candidates
   re-choose λ on their own setting before the rescorer refit
   (`crop_classifier.retune_lambda`), switching only when another λ beats the
-  champion's by more than `crop_classifier.margin`. The training cache key
+  champion's by more than `crop_classifier.margin`. Lora candidates re-choose
+  it too, on the winning arm: lora changes the detections themselves, so a
+  layer below it (classifier λ, then the rescorer) is refit on top, and with
+  the winning arm loaded only λ changes, so the detector responses are the same
+  and it costs almost nothing. The lora arm grid (which lora λ wins) is chosen
+  on the champion's classifier λ, and the classifier λ once on that winner —
+  the two grids are not swept as a product, so the number of picks on fit_dev
+  matches an ordinary candidate's. The training cache key
   leaves the champion out — background crops come from the first training's
   champion, and the λ grid absorbs the drift. A tripwire is not cached.
   Resume and `scripts/predict.py` restore λ with the artifact; a champion with
