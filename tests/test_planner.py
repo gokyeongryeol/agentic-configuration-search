@@ -479,9 +479,26 @@ def test_no_rebuild_nudge_after_identity_refit():
     history = [{"round": 2, "champion": {"axes": champ}, "candidates": [],
                 "decision": {"adopted": True, "rescorer_identity": True}}]
     out = deterministic.propose(history, _diag(fn={"missed": 3}))
-    assert all(not c["id"].startswith("refit:") for c in out["candidates"])
+    assert all(not c["rationale"].startswith("refit") for c in out["candidates"])
     # only remedies pointed to by the diagnosis
-    assert out["candidates"][0]["id"].startswith("missed:")
+    assert out["candidates"][0]["rationale"].endswith("for missed errors")
+
+
+def test_deterministic_ids_are_folder_safe():
+    """Candidate ids become material and arm folder names — cand_<i> like the LLM planner's,
+    so the folder name is the id as is and an id unique within the round (runner._round_ids)
+    is a unique folder."""
+    import re
+    from agentic_configuration_search.loop.runner import _slug
+    champ = validate_axes(dict(BASELINE))
+    history = [{"round": 0, "champion": {"axes": champ}, "candidates": [],
+                "decision": {"adopted": True}}]
+    out = deterministic.propose(history, _diag(fn={"missed": 3, "missed_small": 2},
+                                               fp={"background": 4,
+                                                   "class_confusion": 2}))
+    ids = [c["id"] for c in out["candidates"]]
+    assert ids and ids == [f"cand_{i}" for i in range(len(ids))]   # same format as the LLM planner
+    assert all(re.fullmatch(r"[A-Za-z0-9_.-]+", i) and _slug(i) == i for i in ids)
 
 
 def test_prompt_has_no_rebuild_hint(tmp_path):
