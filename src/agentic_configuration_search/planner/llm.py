@@ -80,8 +80,8 @@ SCHEMA = {
 # assembled prompt (DEFAULT_TOKEN_BUDGET).
 # Recent rounds carried in detail (the budget guard may cut further). Older
 # rounds fold into one-line summaries (_older_lines), and results under the
-# current champion into the axis ledger (_ledger_block) — when 8 rounds were
-# carried as JSON, history was a quarter of the soccer R7 prompt
+# current champion into the axis ledger (_ledger_block) — carrying every round
+# as JSON lets history take a large share of the prompt
 MAX_HISTORY = 3
 MAX_OLDER_LINES = 24     # cap on old rounds carried as one-line summaries (most recent first)
 MAX_LEDGER_ROWS = 24     # cap on rows of the ledger table
@@ -94,14 +94,13 @@ RATIONALE_MAX_CHARS = SCHEMA["schema"]["properties"]["candidates"]["items"][
     "properties"]["rationale"]["maxLength"]
 OUTPUT_MAX_TOKENS = 4096
 # Prompt token estimate — counted generously without the server tokenizer.
-# ASCII counts at 1.85 chars/token (whole planner prompts measured no lower than
-# 2.68; number-heavy JSON fragments about 1.85), and other characters (Hangul,
-# Han, ...) count 1.5 tokens each — a character budget overflowed the server
-# context on CJK-heavy prompts (around 1.8 chars/token). It is not a bound:
-# text that is a long run of digits tokenizes below it, since the Qwen
-# tokenizer splits digits one by one (synthetic numeric JSON about 1.2). Real
-# prompts mix in prose, and on all measured planner prompts the estimate came
-# out above the actual count.
+# ASCII counts at 1.85 chars/token (prose-heavy prompts tokenize at more chars
+# per token, number-heavy JSON close to this), and other characters (Hangul,
+# Han, ...) count 1.5 tokens each — a plain character budget can overflow the
+# server context on CJK-heavy prompts. It is not a bound: text that is a long
+# run of digits tokenizes below it, since the Qwen tokenizer splits digits one
+# by one. Real prompts mix in prose, so the estimate is meant to land above the
+# actual count.
 ASCII_CHARS_PER_TOKEN = 1.85
 NON_ASCII_TOKENS = 1.5
 CONTEXT_MARGIN = 256      # chat template tokens etc.
