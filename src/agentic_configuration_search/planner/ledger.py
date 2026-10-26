@@ -3,8 +3,8 @@ champion.
 
 Exact combination dedup (combo_tried) only blocks the same combination.
 Variants of a value that lost badly (another k, a combination with other axes)
-went all the way through screen and holdout only to confirm the same result
-(soccer and aquarium validation runs). Variants are not blocked — they can work
+could go all the way through screen and holdout only to confirm the same
+result. Variants are not blocked — they can work
 with another k or another combination. Instead, variants of a **clearly-lost
 value** are measured on a fit_dev subset first (the runner's lost-value
 prescreen). This module computes that verdict and the planner prompt's ledger
