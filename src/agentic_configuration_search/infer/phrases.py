@@ -12,8 +12,10 @@ these, hence an LLM.
 whether a surviving phrase actually reduces FPs is decided by the adoption gate.
 
 Uses vLLM's `/v1/chat/completions` + `json_schema` (same server as the planner).
-On parse failure or server error the fallback is **to drop the phrase** — no
-suppression is the status quo, while wrong suppression costs recall.
+A reply that does not parse as JSON is asked once more (one-off degeneration);
+if it still fails, or on server error, the fallback is **to drop the phrase** —
+no suppression is the status quo, while wrong suppression costs recall. The
+failure warning keeps the finish reason and the head and tail of the reply.
 """
 
 from __future__ import annotations
@@ -24,12 +26,27 @@ from collections import Counter
 
 import requests
 
-from ..clients.llm import REQUEST_TIMEOUT, _extract_json
+from ..clients.llm import JSON_ATTEMPTS, REQUEST_TIMEOUT, LLMReplyError, parse_reply
 from ..clients.llm import post_with_retry
 
 log = logging.getLogger(__name__)
 
 _ARTICLE = re.compile(r"^(?:a|an|the)\s+")
+
+
+def _ask_json(sess: requests.Session, base_url: str, payload: dict) -> dict:
+    """A JSON reply — asked once more if it does not parse (the same rule as
+    clients.llm.LLMClient.chat_json). The last failure is raised as
+    LLMReplyError (finish reason and the head and tail of the reply included)."""
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    for attempt in range(1, JSON_ATTEMPTS + 1):
+        resp = post_with_retry(sess, url, payload, timeout=REQUEST_TIMEOUT)
+        try:
+            return parse_reply(resp.json())
+        except LLMReplyError as exc:
+            if attempt == JSON_ATTEMPTS:
+                raise
+            log.warning("refinement reply did not parse as JSON (%s) — asking again", exc)
 
 
 def normalize_caption(text: str) -> str:
@@ -146,9 +163,7 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
     }
     sess = session or requests.Session()
     try:
-        resp = post_with_retry(sess, f"{base_url.rstrip('/')}/v1/chat/completions",
-                               payload, timeout=REQUEST_TIMEOUT)
-        parsed = _extract_json(resp.json()["choices"][0]["message"]["content"] or "")
+        parsed = _ask_json(sess, base_url, payload)
         keep = [p for p in parsed.get("keep", []) if isinstance(p, str) and p.strip()]
         # Mechanical double-check for rule 1 in case the LLM misses it — cheap and harmless
         lowered = {c.lower() for c in categories}
@@ -258,9 +273,7 @@ def refine_alias(base_url: str, model: str, target: str, categories: list[str],
     }
     sess = session or requests.Session()
     try:
-        resp = post_with_retry(sess, f"{base_url.rstrip('/')}/v1/chat/completions",
-                               payload, timeout=REQUEST_TIMEOUT)
-        parsed = _extract_json(resp.json()["choices"][0]["message"]["content"] or "")
+        parsed = _ask_json(sess, base_url, payload)
         alias = parsed.get("alias")
         if not (isinstance(alias, str) and alias.strip()):
             return {"alias": None, "reason": str(parsed.get("reason", ""))}
