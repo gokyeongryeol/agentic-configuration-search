@@ -1,4 +1,4 @@
-"""crop classifier axis e2e — a stub where server-side reclassification fixes class_confusion.
+"""crop classifier axis e2e — a stub where client-side reclassification fixes class_confusion.
 
 Scenario: the stub detector **misclassifies** class-2 GT as class 1 (boxes are exact).
 Once the classifier artifact is loaded (FakeAdapt.root) labels are corrected -> fit_dev Δ passes
@@ -135,7 +135,7 @@ def test_classifier_candidate_adopted_end_to_end(root, tmp_path, monkeypatch):
     assert r1["adopted"] is True and r1["id"] == "r1_human_fixcls"
     assert result.champion["axes"]["crop_classifier"] is True
     assert result.champion["eval"]["micro_f_beta"] == pytest.approx(1.0)
-    # champion carries the artifact, and the server stays in that state
+    # champion carries the artifact, and the detector stays in that state
     assert result.champion["adapt_root"] and "artifact" in result.champion["adapt_root"]
     assert server.root is not None
     meta = json.loads((tmp_path / "run" / "champion.json").read_text())
@@ -229,7 +229,7 @@ def test_arm_refits_rescorer_instead_of_dropping(root, tmp_path, monkeypatch):
     assert loop._arm_rescorer(entry3, setting, materials, tmp_path / "m") is setting
 
 
-def test_resume_restores_server_state(root, tmp_path, monkeypatch):
+def test_resume_restores_detector_state(root, tmp_path, monkeypatch):
     """resume must reapply the champion's detector state — a fresh process starts with the base
     model, so without reapplying, candidates are scored by a different detector than the
     champion and Δ is contaminated."""
@@ -255,12 +255,12 @@ def test_resume_restores_server_state(root, tmp_path, monkeypatch):
                              "repo_root": tmp_path, "base_weights": tmp_path / "b"}
              )._restore_detector_state({"weights": None, "adapt_root": "/a/artifact"})
 
-    # champion without server state -> reapply nothing (avoid needless restarts)
+    # champion without detector state -> reapply nothing (avoid needless swaps)
     seen["w"].clear(); seen["a"].clear()
     loop._restore_detector_state({"weights": None, "adapt_root": None})
     assert seen["w"] == [] and seen["a"] == []
 
-    # a run that does not own the server (no detector_hooks) skips silently
+    # a run without detector state controls (no detector_hooks) skips silently
     bare = Loop(config_from_dict({"dataset": str(root)}), root, tmp_path / "r2")
     bare._restore_detector_state({"weights": "/w", "adapt_root": "/a"})
 

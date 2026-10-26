@@ -1090,9 +1090,9 @@ class Loop:
         return True
 
     def _served_state(self, entry: dict) -> dict:
-        """Server state a wired candidate is served with — the champion's weights
-        and artifact (or the prompt dictionary alias widened, if any), and the
-        classifier blend λ (the candidate's re-chosen one, if any). λ is left
+        """Detector state a wired candidate is served with — the champion's
+        weights and artifact, and the classifier blend λ (the candidate's
+        re-chosen one, if any). λ is left
         out without a classifier so fingerprints of classifier-free states stay
         as they were."""
         ch = getattr(self, "_champion", None) or {}
@@ -1893,7 +1893,7 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
     because each has its own grid, so content is compared —, the materials of
     the modalities the setting uses (text: aliases and suppression phrases;
     semantic: exemplars, plus visual negatives if a negative config is used),
-    whether the rescorer is on, and the server state (weights, artifact).
+    whether the rescorer is on, and the detector state (weights, artifact).
     Thresholds are left out — they are re-estimated on holdout."""
     configs = {cf["config_id"]: {k: v for k, v in cf.items() if k != "config_id"}
                for cf in setting.get("configs", [])}
