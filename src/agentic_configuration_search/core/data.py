@@ -52,9 +52,15 @@ class Dataset:
     ontology: Ontology
     train: Split      # full train — prompt mining, FP/FN diagnosis
     fit_train: Split    # training for YOLOE tail fine-tune (lora axis), rescorer and crop classifier
+                        # (the loop may swap in a subset — fitting.subsample)
     fit_dev: Split      # scoring grids, λ, α (screen)
     holdout: Split      # τ_c estimation, adoption, saturation
     holdout_split: str  # directory the holdout came from — "valid" or substitute "test"
+
+
+def subset_split(split: Split, keep: set[int]) -> Split:
+    """A subset of split — only the indices in keep, in the original (file name) order."""
+    return _subset(split, keep)
 
 
 def _subset(split: Split, keep: set[int]) -> Split:

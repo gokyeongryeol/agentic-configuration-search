@@ -32,13 +32,15 @@ from pathlib import Path
 import yaml
 
 from ..config import Config, config_from_dict
-from ..core.data import Dataset, load_dataset, prescreen_subset
+from ..core.data import Dataset, load_dataset, prescreen_subset, subset_split
 from ..diagnose import describe, residual
 from ..diagnose.errors import diagnose, size_profile
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
 from ..eval.screen import fit_dev_gap, screen_candidate
+from ..fitting import subsample
 from ..fitting.materials import Materials
+from ..fitting.tail import split_identity
 from ..infer import gateway
 from ..planner import deterministic
 from ..planner.deterministic import tried_combos
@@ -140,9 +142,10 @@ class Loop:
                  refine_negatives_fn=None,
                  candidates_file=None, detector_hooks: dict | None = None):
         self.cfg = cfg
-        self.ds: Dataset = load_dataset(dataset_root, seed=cfg.split.seed,
-                                        fit_train_ratio=cfg.split.fit_train_ratio)
         self.out_dir = Path(out_dir)
+        self.ds: Dataset = self._subsample_fit_train(
+            load_dataset(dataset_root, seed=cfg.split.seed,
+                         fit_train_ratio=cfg.split.fit_train_ratio), encode_fn)
         self.client = client
         self.llm_chat = llm_chat
         self.candidates_file = candidates_file
@@ -323,6 +326,56 @@ class Loop:
             log.info("candidate %s: classifier λ %g → %g (fit_dev %.4f → %.4f)",
                      entry.get("id"), base, best["lam"], f0, best["f_beta"])
         return settings[best["lam"]]
+
+    def _subsample_fit_train(self, ds: Dataset, encode_fn) -> Dataset:
+        """If fit_train is larger than subsample.max_images, swap the training
+        material for a subset.
+
+        Only ds.fit_train changes — what lora, the rescorer discriminator and
+        the crop classifier read. train (mining), fit_dev (verdicts) and holdout
+        (adoption) stay as they are. The picked images are recorded in the run
+        directory and resume reads them back (key = fit_train fingerprint and
+        settings — a different key picks again). The training reuse keys hold
+        the fit_train fingerprint, so a changed subset also breaks reuse."""
+        sc = self.cfg.subsample
+        n = len(ds.fit_train.images)
+        self._fit_train_before, self._fit_train_subset = n, None
+        if sc.max_images <= 0 or n <= sc.max_images:
+            return ds
+        key = {"fit_train": split_identity(ds.fit_train), "max_images": sc.max_images,
+               "center_ratio": sc.center_ratio}
+        path = self.out_dir / subsample.SUBSET_FILE
+        rec = json.loads(path.read_text()) if path.exists() else {}
+        if rec.get("key") != key:
+            if encode_fn is None:
+                raise ValueError(
+                    f"fit_train has {n} images > subsample.max_images {sc.max_images} — "
+                    "picking the subset needs GT embeddings (encode_fn) "
+                    "(subsample.max_images: 0 turns it off)")
+            emb = subsample.fit_train_embeddings(
+                ds.fit_train, ds.ontology, encode_fn, self.out_dir / "_subsample" / "gt_crops")
+            idx, report = subsample.select_fit_train(
+                ds.fit_train, emb, max_images=sc.max_images, center_ratio=sc.center_ratio)
+            rec = {"key": key, "report": report,
+                   "images": [ds.fit_train.images[i].file_name for i in idx]}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
+        self._fit_train_subset = rec["report"]
+        names = set(rec["images"])
+        keep = {i for i, e in enumerate(ds.fit_train.images) if e.file_name in names}
+        log.info("fit_train subset: %d/%d images (%d background; the first pass's %d "
+                 "images cover %.0f%% of centers) — %s",
+                 len(keep), n, rec["report"]["n_background"],
+                 rec["report"]["first_pass_images"],
+                 100 * rec["report"]["first_pass_coverage"], path)
+        return dataclasses.replace(ds, fit_train=subset_split(ds.fit_train, keep))
+
+    def fit_train_summary(self) -> dict:
+        """run_summary's fit_train record — images used for training and the
+        subset selection record (None without one)."""
+        return {"images": len(self.ds.fit_train.images),
+                "images_before_subset": self._fit_train_before,
+                "subset": self._fit_train_subset}
 
     def _adapt_ctl(self, path, lam: float | None = None) -> None:
         """Load/unload the classifier artifact and set its blend λ — recording
@@ -1713,6 +1766,10 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
         # there is no sealed split and this run's micro_f_beta is optimistically
         # biased. Reporters must check this to avoid mixing both in one table (see core.data).
         "holdout_split": loop.ds.holdout_split,
+        # whether the training material (lora, rescorer, classifier) was a
+        # fit_train subset — look at it when comparing training time and scores
+        # across datasets (fitting.subsample)
+        "fit_train": loop.fit_train_summary(),
         "last_round": history[-1]["round"] if history else None,
         "adopted_rounds": sum(1 for e in history if e["round"] > 0
                               and (e.get("decision") or {}).get("adopted")),

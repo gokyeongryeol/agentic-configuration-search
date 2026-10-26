@@ -77,6 +77,10 @@ split:                                    # boundaries stay fixed across rounds
   fit_train_ratio: 0.8                    # fit_train share within train (image-level stratified)
   seed: 0
 
+subsample:                                # fit_train subset — thins only the lora, rescorer and crop classifier training material
+  max_images: 400                         # if fit_train is larger, pick images in the order that covers the GT embedding clusters. 0 = off
+  center_ratio: 0.1                       # k-centers per class = GT objects × ratio (at least 1)
+
 detector:                                 # detector — YOLOE (ultralytics), in-process, no server
   model: weights_yoloe/yoloe-26x-seg.pt   # checkpoint path (relative paths resolve against repo_root)
   device: "cuda:0"
@@ -128,6 +132,7 @@ rescorer:                                 # discriminator on fit_train + α grid
   margin: 0.005                           # adopt α>0 only if the fit_dev F(β) gain exceeds this
   ensemble_members: 5
   inner_folds: 5                          # for the oof_phat diagnostic
+  max_train_rows: 100000                  # discriminator training row cap — every TP, FPs in (class × score quartile) strata + inverse-probability weights. 0 = off
 
 crop_classifier:                          # detection reclassification axis — corrects class_confusion, suppresses background FPs (off by default, the planner turns it on)
   min_samples: 32                         # total crop tripwire — skip training below this

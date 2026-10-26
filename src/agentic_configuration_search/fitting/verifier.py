@@ -77,7 +77,8 @@ def detection_features(det: dict, context_dets: list[dict], area_stats: dict,
 
 
 
-def fit_isotonic(scores: np.ndarray, y: np.ndarray) -> list[list[float]]:
+def fit_isotonic(scores: np.ndarray, y: np.ndarray,
+                 weights: np.ndarray | None = None) -> list[list[float]]:
     """PAV (pool adjacent violators) — list of (score, calibrated_p) breakpoints.
 
     Corrects, via a monotone map, raw classifier probabilities that disagree
@@ -88,17 +89,24 @@ def fit_isotonic(scores: np.ndarray, y: np.ndarray) -> list[list[float]]:
     different blocks, one x gets several y values and `np.interp` picks the
     last, so a tied group's calibration depends on row order. Ties are common
     (clip saturation, constant fill for degenerate folds, identical GBDT leaves).
+
+    With `weights` (row weights) it is weighted PAV — an integer weight equals
+    repeating that row as many times (the rescorer row cap's inverse-probability
+    weights restore the original distribution).
     """
     s_all = np.asarray(scores, dtype=float)
     y_all = np.asarray(y, dtype=float)
     if s_all.size == 0:
         return []
+    w_all = (np.ones_like(y_all) if weights is None
+             else np.asarray(weights, dtype=float))
     order = np.argsort(s_all, kind="mergesort")
     s = s_all[order]
     t = y_all[order]
+    w = w_all[order]
     xs, starts = np.unique(s, return_index=True)      # ascending unique values + first positions
-    sums = np.add.reduceat(t, starts)
-    cnts = np.add.reduceat(np.ones_like(t), starts)
+    sums = np.add.reduceat(t * w, starts)
+    cnts = np.add.reduceat(w, starts)
     # block: (x_lo, x_hi, sum, count) — merge with the previous block on monotonicity violation
     blocks: list[list[float]] = []
     for x, bsum, bcnt in zip(xs, sums, cnts):
@@ -122,8 +130,14 @@ def fit_isotonic(scores: np.ndarray, y: np.ndarray) -> list[list[float]]:
 GBDT_SEED = 0
 
 
-def fit_members(X: np.ndarray, y: np.ndarray, members: int) -> list:
-    """Members varying seed and an 80% subsample. members=1 is a single model on all data."""
+def fit_members(X: np.ndarray, y: np.ndarray, members: int,
+                sample_weight: np.ndarray | None = None) -> list:
+    """Members varying seed and an 80% subsample. members=1 is a single model on all data.
+    `sample_weight` is the row weight (the rescorer row cap's inverse-probability
+    weights) — None means uniform."""
+    def w(idx):
+        return None if sample_weight is None else np.asarray(sample_weight)[idx]
+
     from sklearn.ensemble import HistGradientBoostingClassifier
 
     def make(seed):
@@ -131,14 +145,15 @@ def fit_members(X: np.ndarray, y: np.ndarray, members: int) -> list:
             max_iter=200, max_leaf_nodes=15, random_state=seed)
 
     if members <= 1:
-        return [make(GBDT_SEED).fit(X, y.astype(bool))]
+        return [make(GBDT_SEED).fit(X, y.astype(bool), sample_weight=w(slice(None)))]
     out = []
     for m in range(members):
         rng = np.random.default_rng(GBDT_SEED + m)
         sub = rng.choice(len(y), size=max(2, int(0.8 * len(y))), replace=False)
         if len(set(y[sub].tolist())) < 2:      # use all data if the subsample is single-class
             sub = np.arange(len(y))
-        out.append(make(GBDT_SEED + m).fit(X[sub], y[sub].astype(bool)))
+        out.append(make(GBDT_SEED + m).fit(X[sub], y[sub].astype(bool),
+                                           sample_weight=w(sub)))
     return out
 
 
@@ -203,10 +218,14 @@ class GbdtVerifier:
     @classmethod
     def fit(cls, features: list[str], X_hand: np.ndarray, E: np.ndarray,
             y: np.ndarray, *, inner_folds: int = 5,
-            members: int = 1) -> "GbdtVerifier":
-        """X_hand: (n, len(features)) hand-crafted features, E: (n, emb_dim) embeddings."""
+            members: int = 1, sample_weight: np.ndarray | None = None) -> "GbdtVerifier":
+        """X_hand: (n, len(features)) hand-crafted features, E: (n, emb_dim) embeddings.
+        `sample_weight`: row weights — used by both the GBDT and the isotonic
+        calibration (None means uniform)."""
         X = np.hstack([np.asarray(X_hand, dtype=float), np.asarray(E, dtype=float)])
         y = np.asarray(y, dtype=float)
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=float)
         rng = np.random.default_rng(GBDT_SEED)
         order = rng.permutation(len(y))
         oof = np.zeros(len(y))
@@ -215,10 +234,11 @@ class GbdtVerifier:
             if len(set(y[tr].tolist())) < 2:
                 oof[te] = float(y[tr].mean())
                 continue
-            fold = fit_members(X[tr], y[tr], members)
+            fold = fit_members(X[tr], y[tr], members,
+                               None if sample_weight is None else sample_weight[tr])
             oof[te] = ensemble_raw(fold, X[te])
-        iso = fit_isotonic(oof, y)
-        models = fit_members(X, y, members)
+        iso = fit_isotonic(oof, y, sample_weight)
+        models = fit_members(X, y, members, sample_weight)
         return cls(features, E.shape[1], models, iso,
                    meta={"n": int(len(y)), "pos": int(y.sum()), "members": len(models)})
 
