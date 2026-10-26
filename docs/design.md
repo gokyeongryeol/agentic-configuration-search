@@ -282,10 +282,19 @@ planner's input for the same round.
   (same-round re-asks too, `proposal_reask<k>.json`).
   The prompt is rebuilt every round; when it exceeds the estimated-token budget
   (server context − output cap), the history window shrinks first. Response
-  length is bounded by the schema (rationale, id, candidate count). One call
+  length is bounded by the schema (rationale, id, candidate count). A reply
+  that does not parse as JSON is asked once more (one-off degeneration); if it
+  still fails, the round falls back to deterministic, and the warning and the
+  proposal's `error` keep the finish reason (`finish_reason`), the token count
+  and the head and tail of the reply. One call
   per round, plus at most one follow-up in the same conversation when the
   planner repeats carried candidates: those are dropped as
   `carried_duplicate` and the freed slots are asked for again.
+- The other paths on the same vLLM follow the same rule: negative and alias
+  phrase refinement, the VLM crop captioner and the FP/FN crop notes ask once
+  more on an unparseable reply, and if that fails too each takes its own
+  fallback (drop the phrases, keep the class name, skip the caption batch, no
+  notes). Crop notes are a diagnostic signal only and never decide anything.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 - The prompt is organized in sections.
