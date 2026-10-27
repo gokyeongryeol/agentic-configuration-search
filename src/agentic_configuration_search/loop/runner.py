@@ -301,7 +301,8 @@ class Loop:
         entry["_adapt_lambda"] for the rescorer refit, holdout, served
         fingerprint and adoption. Called for ordinary candidates (after screen)
         and lora candidates (on the winning arm). The lora candidate's own λ
-        (weight interpolation) is not re-chosen after adoption."""
+        (weight interpolation) is not re-chosen after adoption (docs/design.md —
+        weight rebuild, re-inference and downstream refits would all run again)."""
         cc = self.cfg.crop_classifier
         base = self._adapt_lambda
         if not cc.retune_lambda or self._adapt_path is None or base is None:

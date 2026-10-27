@@ -65,7 +65,7 @@ Every round, apart from the axes:
 | step | split |
 |---|---|
 | diagnosis (planner input) | all of train inferred with the champion and split by cause (with samples); the holdout as aggregates only. Thresholds are the champion's holdout thresholds — planner input only, never fed into materials |
-| screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` to holdout |
+| screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` ordinary candidates to holdout (lora and classifier arms go to holdout on their own margin, outside `top_k`) |
 | adoption, saturation | holdout (`valid`, or `test` when there is no `valid`) — compared with the champion at holdout thresholds; adopted only if the paired-bootstrap lower bound is ≥ `gate.margin`, Δ > 0 and Δ ≥ `gate.min_delta` (0.005) |
 | final measurement | `test` (when `valid` was the holdout) — the settled champion, once, outside the loop (`scripts/predict.py --split test`) |
 
@@ -118,7 +118,7 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 
 | axis | materials / training | selection (`fit_dev`) | adoption (holdout) |
 |---|---|---|---|
-| `alias` | train: a few GT crops per class (the candidate's exemplars, or a k-center selection, default 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
+| `alias` | train: a few GT crops per class (the candidate's exemplars, or else a GT selection by `mine.exemplar_selection` — k-center by default — of `mine.exemplars_per_class`, 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
 | `exemplar` | train: `base` takes `exemplar_k` GT crops by k-center; `fn_arm` adds `fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
 | `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
 | `visual_negatives` | train: `visual_negative_k` mining-pass false-positive crops per class | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
@@ -137,7 +137,8 @@ The diagnosis comes first: it is of the champion at the start of the round
 (reused when the champion and config are unchanged — see below), and it is the
 planner's input for the same round.
 
-- **screen** passes only the top-K candidates to holdout. A candidate that
+- **screen** passes only the top-K ordinary candidates to holdout (lora and
+  classifier arms are judged on their own margin and are not counted in `top_k`). A candidate that
   changes only tiling and raises the grid above the champion's to ≥
   `screen.prescreen_min_grid` is first
   screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
@@ -241,7 +242,9 @@ planner's input for the same round.
   skip only saves holdout time and does not change when the run stops.
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
-  previous round's are copied (`diagnosis_key.json`).
+  previous round's are copied (`diagnosis_key.json` — the champion's round, id,
+  materials, weights, artifact, blend λ, rescorer, holdout micro F(β) and
+  thresholds, and a hash of the config without `rounds` and `out_dir`).
 - **final champion diagnosis**: a round's diagnosis is of the champion at the
   start of the round, so when the last round adopts, the final champion's
   residual errors would be recorded nowhere. At the end of the run the final
@@ -321,7 +324,9 @@ planner's input for the same round.
   ordinary candidate; the arm grid's best stays in the lora decision. The lora arm grid (which lora λ wins) is chosen
   on the champion's classifier λ, and the classifier λ once on that winner —
   the two grids are not swept as a product, so the number of picks on fit_dev
-  matches an ordinary candidate's. The training cache key
+  matches an ordinary candidate's. The lora λ itself (weight interpolation) is
+  not re-chosen after adoption: rebuilding the weights, re-inferring and
+  refitting the layers below would all run again. The training cache key
   leaves the champion out — background crops come from the first training's
   champion, and the λ grid absorbs the drift. A tripwire is not cached.
   Resume and `scripts/predict.py` restore λ with the artifact; a champion with
@@ -413,12 +418,16 @@ runs/<dataset>/run/
 ```
 
 - **Candidate ids** get an `r<round>_` prefix before recording; only carried
-  candidates keep `carry_<original id>` (see the round loop).
+  candidates keep `carry_<original id>` (see the round loop). The id is optional
+  in the LLM response — an empty one becomes `cand_<i>` (re-ask `reask<k>_<i>`),
+  and a clash gets `_2`, `_3`….
 - **History fields**: candidate rows carry `wall_min`, `reask`, `fit_dev_cmp`,
   `lost_values`, `plan`, `delta_reused` / `classifier_reused` (origin of a
   reused tail or classifier training) and `classifier_lambda` (the arm's best λ,
-  or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`); the
-  round's champion summary carries `classifier_lambda`; round rows carry
+  or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`),
+  `source` (carryover or human), `remedy` (deterministic candidates),
+  `prescreen` (the subset verdict) and `tiling_f` (tiling candidates' fit_dev
+  comparison); the round's champion summary carries `classifier_lambda`; round rows carry
   `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
   response's `expected_gain`, `cost_min` and `differs`; only a malformed field
   is dropped.
@@ -434,7 +443,8 @@ technical background. It is written automatically at the end of a run and
 `acs report <run_dir> [--config c.yaml]` redraws it (no GPU, no LLM); figures go
 to `report_assets/`. The order is at a glance → the data (counts, sizes,
 crowding, representative photos) → attempts and the score chart by round → the
-remaining error patterns with example photos → data suggestions. Its material
+remaining error patterns with example photos → data suggestions, with a
+glossary appendix at the end. Its material
 (trajectory, candidate attempts, the final diagnosis bundle) is read by
 `diagnose/report.py`.
 
@@ -451,8 +461,9 @@ remaining error patterns with example photos → data suggestions. Its material
 - `rounds/final` counts as the final diagnosis only when the champion id in its
   diagnosis key matches the current champion (after a resume, a failed final
   diagnosis of the new champion leaves the old files behind). Otherwise the last
-  round's diagnosis stands in (stale): the summary and sections 3 and 4 say so,
-  and no "final" bars are drawn. A run whose final diagnosis failed does not use
+  round's diagnosis stands in. It is stale only when the last round adopted
+  (otherwise it is the final champion's own diagnosis): then the summary and
+  sections 3 and 4 say so, and no "final" bars are drawn. A run whose final diagnosis failed does not use
   `residual.json`. Without a holdout diagnosis, sections 3 and 4 are skipped.
 - Example photos are picked only from rows of train files, and captions are
   numbered only for photos actually drawn. A photo that cannot be opened drops
