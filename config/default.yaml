@@ -78,7 +78,7 @@ split:                                    # boundaries stay fixed across rounds
   seed: 0
 
 subsample:                                # fit_train subset — thins only the lora, rescorer and crop classifier training material
-  max_images: 400                         # if fit_train is larger, pick images in the order that covers the GT embedding clusters. null = off (no cap)
+  max_images: 500                         # if fit_train is larger, pick images in the order that covers the GT embedding clusters. null = off (no cap)
   center_ratio: 0.1                       # k-centers per class = GT objects × ratio (at least 1)
 
 detector:                                 # detector — YOLOE (ultralytics), in-process, no server

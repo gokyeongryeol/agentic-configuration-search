@@ -21,7 +21,7 @@ the run records this as `holdout_split` in `run_summary.json`.
 
 The three trainings (tail fine-tune, rescorer discriminator, crop classifier)
 read fit_train as is, so their time grows with its size. When fit_train is
-larger than `subsample.max_images` (400), only that many images are used for
+larger than `subsample.max_images` (500), only that many images are used for
 training (`null` turns it off — a cap of 0 is refused by config, since it reads as
 "0 images"; `fitting.subsample`, `fit_train_subset.json` in the run directory).
 
@@ -45,7 +45,7 @@ training (`null` turns it off — a cap of 0 is refused by config, since it read
   (key = fit_train fingerprint, settings and embedding model; a record that no
   longer matches fit_train picks again). The training reuse keys hold the
   fit_train fingerprint, so a changed subset also breaks reuse.
-- On datasets with many objects per image, 400 images can still mean many
+- On datasets with many objects per image, 500 images can still mean many
   boxes — the cap bounds images, not objects.
 - **The rescorer also caps its training rows** (`rescorer.max_train_rows`,
   100,000; `null` for no cap). A row is one detection candidate, so many detections per image can

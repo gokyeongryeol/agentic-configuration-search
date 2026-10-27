@@ -93,7 +93,7 @@ details in the [axis reference](docs/design.md#axis-reference).
 | `gate.min_delta` | 0.005 | minimum Δ for adoption |
 | `saturation.rounds` | 5 | stagnant rounds before stopping |
 | `detector.device` · `mine.device` · `lora.device` | `cuda:0` · `cuda:0` · `cuda:0` | GPU placement (keep off the planner's GPU) |
-| `subsample.max_images` · `subsample.center_ratio` | 400 · 0.1 | when fit_train is large, train lora, the rescorer and the classifier on a subset that covers the GT embedding clusters. null = off |
+| `subsample.max_images` · `subsample.center_ratio` | 500 · 0.1 | when fit_train is large, train lora, the rescorer and the classifier on a subset that covers the GT embedding clusters. null = off |
 | `rescorer.max_train_rows` | 100000 | rescorer discriminator training row cap (every TP, FPs stratified + weighted). null = no cap |
 
 The lora and crop_classifier axes swap the in-process detector's state (tail

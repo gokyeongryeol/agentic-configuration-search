@@ -133,7 +133,7 @@ class SubsampleCfg:
     crop classifier). When fit_train is larger than max_images, images are
     picked in the order that covers the GT embedding clusters
     (fitting.subsample). Mining, fit_dev and holdout are unchanged."""
-    max_images: int | None = 400   # null = no cap (all of fit_train) — 0 is refused, it reads as "0 images"
+    max_images: int | None = 500   # null = no cap (all of fit_train) — 0 is refused, it reads as "0 images"
     center_ratio: float = 0.1    # k-centers per class = GT objects × ratio (at least 1)
 
 
