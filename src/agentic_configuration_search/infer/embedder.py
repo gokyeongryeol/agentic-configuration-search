@@ -193,15 +193,15 @@ _MAD_TO_SIGMA = 1.4826
 _MEANAD_TO_SIGMA = 1.2533
 
 
-def trim_outliers(embeddings: np.ndarray, outlier_mad: float,
+def trim_outliers(embeddings: np.ndarray, outlier_mad: float | None,
                   min_keep: int = 1) -> np.ndarray:
     """**Original indices** (ascending) of candidates left after dropping those whose
     centroid distance stands out from the distribution.
 
     A distance d is an outlier if it exceeds `median(d) + outlier_mad × σ̂`
     (σ̂ = MAD × 1.4826 — a spread estimate not pulled by extremes). Unlike a
-    fixed-fraction trim, nothing is dropped when there are no outliers. 0 turns
-    trimming off.
+    fixed-fraction trim, nothing is dropped when there are no outliers. None turns
+    trimming off (0 is refused — it would read as "everything above the median").
 
     The centroid is computed once on the **full, untrimmed set** — recomputing it
     iteratively makes results vary strongly with the data, hurting
@@ -211,10 +211,10 @@ def trim_outliers(embeddings: np.ndarray, outlier_mad: float,
     n = len(embeddings)
     if n == 0:
         return np.zeros(0, dtype=int)
-    if outlier_mad < 0:
-        raise ValueError(f"outlier_mad must be >= 0 (got {outlier_mad})")
-    if outlier_mad == 0.0:
+    if outlier_mad is None:
         return np.arange(n)
+    if outlier_mad <= 0:
+        raise ValueError(f"outlier_mad must be > 0 — None turns it off (got {outlier_mad})")
     d = np.linalg.norm(embeddings - embeddings.mean(axis=0, keepdims=True), axis=1)
     med = float(np.median(d))
     dev = np.abs(d - med)
@@ -261,11 +261,12 @@ def _farthest_point_traversal(embeddings: np.ndarray, k: int) -> list[int]:
     return centers
 
 
-def kcenter_greedy(embeddings: np.ndarray, k: int, outlier_mad: float = 0.0) -> list[int]:
+def kcenter_greedy(embeddings: np.ndarray, k: int,
+                   outlier_mad: float | None = None) -> list[int]:
     """Farthest-point traversal — k points covering the embedding space as widely
     as possible.
 
-    With `outlier_mad > 0`, **first drop candidates whose centroid distance stands
+    Unless `outlier_mad` is None, **first drop candidates whose centroid distance stands
     out from the distribution** (trim_outliers), then traverse only the remainder.
     Pure k-center picks the most atypical instances, but such outliers hurt as
     visual prompts — keep diversity, exclude the extremes. Returned indices
@@ -297,7 +298,7 @@ def mean_nearest(embeddings: np.ndarray, k: int) -> list[int]:
 
 
 def select_indices(selection: str, k: int, n: int, *, embeddings=None,
-                   outlier_mad: float = 0.0, rng=None) -> list[int]:
+                   outlier_mad: float | None = None, rng=None) -> list[int]:
     """Per-class exemplar selection dispatch (single entry point per exemplar_selection).
 
     mean/kcenter need `embeddings`; random needs `rng`. random needs no

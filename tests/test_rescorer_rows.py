@@ -28,7 +28,7 @@ def _rows(n_tp=30, n_fp=970, cids=(1, 2), seed=0):
 
 def test_under_cap_is_untouched():
     rows = _rows()
-    kept, w, info = rs_mod.cap_train_rows(rows, 0)
+    kept, w, info = rs_mod.cap_train_rows(rows, None)          # None = no cap
     assert kept == rows and np.all(w == 1.0) and info["capped"] is False
     kept, w, info = rs_mod.cap_train_rows(rows, 5000)
     assert kept == rows and info["capped"] is False
@@ -101,10 +101,18 @@ def test_fit_rescorer_records_the_cap(tmp_path):
     assert info["train_rows_capped"] is True
 
 
+def test_zero_cap_is_not_off():
+    with pytest.raises(ValueError, match="None"):
+        rs_mod.cap_train_rows(_rows(), 0)
+
+
 def test_config_validates_max_train_rows():
     from agentic_configuration_search.config import ConfigError, config_from_dict
-    with pytest.raises(ConfigError):
-        config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": -1}})
+    for bad in (0, -1):
+        with pytest.raises(ConfigError, match="null"):
+            config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": bad}})
+    cfg = config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": None}})
+    assert cfg.rescorer.max_train_rows is None
     with pytest.raises(ConfigError):     # below the tripwire the fit would always be skipped
         config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": 10,
                                                        "min_samples": 64}})
@@ -115,7 +123,7 @@ def test_fit_rescorer_under_the_cap_is_unchanged(tmp_path):
     a fit with the cap off."""
     from tests.test_rescorer import _fit, _rs
     kw = dict(min_samples=50, min_samples_per_class=1, margin=0.005, ensemble_members=2)
-    off, info_off = _fit(tmp_path / "a", _rs(**kw, max_train_rows=0))
+    off, info_off = _fit(tmp_path / "a", _rs(**kw, max_train_rows=None))
     big, info_big = _fit(tmp_path / "b", _rs(**kw, max_train_rows=10_000))
     assert info_big["train_rows_capped"] is False
     assert info_off["sel_f_beta_by_class_alpha"] == info_big["sel_f_beta_by_class_alpha"]

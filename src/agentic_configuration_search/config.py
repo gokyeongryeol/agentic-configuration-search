@@ -97,11 +97,11 @@ class ScreenCfg:
     # tiling prescreen — a candidate turning on grid ≥ prescreen_min_grid is first
     # scored on a deterministic fit_dev subset (max(min_images, ⌈fraction·N⌉)
     # images). If no class uses a tile there it is rejected without the full
-    # screen; otherwise the full fit_dev is screened as before. fraction 0 turns
-    # it off. If the subset would be max_share of fit_dev or more, the full
+    # screen; otherwise the full fit_dev is screened as before. A null fraction
+    # turns it off. If the subset would be max_share of fit_dev or more, the full
     # screen runs directly — a passing candidate is re-screened in full, so a
     # large subset saves nothing.
-    prescreen_fraction: float = 0.25
+    prescreen_fraction: float | None = 0.25
     prescreen_min_images: int = 20
     prescreen_min_grid: int = 3
     prescreen_max_share: float = 0.5
@@ -133,7 +133,7 @@ class SubsampleCfg:
     crop classifier). When fit_train is larger than max_images, images are
     picked in the order that covers the GT embedding clusters
     (fitting.subsample). Mining, fit_dev and holdout are unchanged."""
-    max_images: int = 400        # 0 turns it off (all of fit_train)
+    max_images: int | None = 400   # null = no cap (all of fit_train) — 0 is refused, it reads as "0 images"
     center_ratio: float = 0.1    # k-centers per class = GT objects × ratio (at least 1)
 
 
@@ -171,8 +171,8 @@ class RescorerCfg:
     # discriminator training row cap — TPs first (up to half of the cap, plus the
     # slots FPs cannot fill), FPs thinned in (class × score quartile) strata with
     # inverse-probability weights restoring the original distribution
-    # (fitting.rescorer.cap_train_rows). 0 turns it off
-    max_train_rows: int = 100_000
+    # (fitting.rescorer.cap_train_rows). null = no cap — 0 is refused, it reads as "0 rows"
+    max_train_rows: int | None = 100_000
 
 
 @dataclass(frozen=True)
@@ -257,11 +257,11 @@ class MineCfg:
     exemplars_per_class: int = 4          # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
     # Outlier trim before kcenter — drop only candidates whose centroid distance
-    # exceeds median + k·MAD (0 = off). 3.0 is about 3σ under a normal distribution.
-    kcenter_outlier_mad: float = 3.0
+    # exceeds median + k·MAD (null = no trim). 3.0 is about 3σ under a normal distribution.
+    kcenter_outlier_mad: float | None = 3.0
     # The FN arm trims less than base (a larger multiple) — filter the noise but
     # keep the diversity that broadly covers missed appearances.
-    fn_kcenter_outlier_mad: float = 3.5
+    fn_kcenter_outlier_mad: float | None = 3.5
     fn_exemplars_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
     fn_min_miss_rate: float = 0.02
@@ -386,15 +386,21 @@ def _validate(cfg: Config) -> None:
     # leaf and cannot import planner.axes (AXES) (layering invariant).
     if not (0.0 < cfg.split.fit_train_ratio < 1.0):
         raise ConfigError(f"split.fit_train_ratio: outside (0,1) ({cfg.split.fit_train_ratio})")
-    if cfg.subsample.max_images < 0:
-        raise ConfigError("subsample.max_images: must be >= 0 — 0 is off "
-                          f"({cfg.subsample.max_images})")
+    for key, v in (("subsample.max_images", cfg.subsample.max_images),
+                   ("rescorer.max_train_rows", cfg.rescorer.max_train_rows)):
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+            raise ConfigError(f"{key}: must be an integer or null (got {v!r}) — to remove "
+                              "the cap, use an unquoted null")
+    if cfg.subsample.max_images is not None and cfg.subsample.max_images < 1:
+        raise ConfigError("subsample.max_images: must be >= 1 — to turn subsampling off, "
+                          f"use null (no cap) ({cfg.subsample.max_images})")
     if not (0.0 < cfg.subsample.center_ratio <= 1.0):
         raise ConfigError(f"subsample.center_ratio: outside (0,1] ({cfg.subsample.center_ratio})")
-    if cfg.rescorer.max_train_rows < 0:
-        raise ConfigError("rescorer.max_train_rows: must be >= 0 — 0 is off "
-                          f"({cfg.rescorer.max_train_rows})")
-    if 0 < cfg.rescorer.max_train_rows < cfg.rescorer.min_samples:
+    if cfg.rescorer.max_train_rows is not None and cfg.rescorer.max_train_rows < 1:
+        raise ConfigError("rescorer.max_train_rows: must be >= 1 — to remove the cap, use "
+                          f"null ({cfg.rescorer.max_train_rows})")
+    if (cfg.rescorer.max_train_rows is not None
+            and cfg.rescorer.max_train_rows < cfg.rescorer.min_samples):
         raise ConfigError(
             f"rescorer.max_train_rows ({cfg.rescorer.max_train_rows}) is below min_samples "
             f"({cfg.rescorer.min_samples}) — the discriminator fit would always be skipped")
@@ -407,9 +413,11 @@ def _validate(cfg: Config) -> None:
                           f"(got {type(cfg.dataset_notes).__name__})")
     if cfg.screen.top_k < 1:
         raise ConfigError(f"screen.top_k: must be >= 1 ({cfg.screen.top_k})")
-    if not (0.0 <= cfg.screen.prescreen_fraction <= 1.0):
-        raise ConfigError("screen.prescreen_fraction: outside [0,1] — 0 is off "
-                          f"({cfg.screen.prescreen_fraction})")
+    pf = cfg.screen.prescreen_fraction
+    if pf is not None and (isinstance(pf, bool) or not isinstance(pf, (int, float))
+                           or not 0.0 < pf <= 1.0):
+        raise ConfigError("screen.prescreen_fraction: must be in (0,1] — to turn it off, "
+                          f"use null ({pf!r})")
     if cfg.screen.prescreen_min_images < 1:
         raise ConfigError("screen.prescreen_min_images: must be >= 1 "
                           f"({cfg.screen.prescreen_min_images})")
@@ -441,9 +449,11 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"mine.exemplar_selection: {cfg.mine.exemplar_selection!r} must be "
                           f"one of {EXEMPLAR_SELECTIONS}")
     for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
-        if getattr(cfg.mine, key) < 0:
-            raise ConfigError(f"mine.{key}: must be >= 0 — 0 is off "
-                              f"({getattr(cfg.mine, key)})")
+        v = getattr(cfg.mine, key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                              or v <= 0):
+            raise ConfigError(f"mine.{key}: must be > 0 — to turn the trim off, use null "
+                              f"({v!r})")
     if cfg.mine.fn_min_candidates < 0:
         raise ConfigError("mine.fn_min_candidates cannot be negative — 0 means off "
                           f"(got {cfg.mine.fn_min_candidates})")

@@ -22,7 +22,8 @@ the run records this as `holdout_split` in `run_summary.json`.
 The three trainings (tail fine-tune, rescorer discriminator, crop classifier)
 read fit_train as is, so their time grows with its size. When fit_train is
 larger than `subsample.max_images` (400), only that many images are used for
-training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
+training (`null` turns it off — a cap of 0 is refused by config, since it reads as
+"0 images"; `fitting.subsample`, `fit_train_subset.json` in the run directory).
 
 - **Picked in the order that covers the appearances, not at random** (greedy
   set cover). The DINOv3 embeddings of GT crops are clustered per class with
@@ -47,7 +48,7 @@ training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
 - On datasets with many objects per image, 400 images can still mean many
   boxes — the cap bounds images, not objects.
 - **The rescorer also caps its training rows** (`rescorer.max_train_rows`,
-  100,000). A row is one detection candidate, so many detections per image can
+  100,000; `null` for no cap). A row is one detection candidate, so many detections per image can
   exceed it even after the subset. TPs are rare and the core of the ranking
   signal, so they are kept first (if TPs alone exceed half the cap they are
   thinned in class proportion, but slots the FPs cannot fill go to the TPs —
@@ -215,7 +216,15 @@ planner's input for the same round.
   candidates are `carry_<original id>` (e.g. `carry_r1_cand_1`) — only carried
   candidates made by the loop (`source: carryover`) are exempt from the prefix.
   If the planner imitates a `carry_` id, `carry_` is stripped and the round
-  prefix added (the report also tells carried rows by source).
+  prefix added (the report also tells carried rows by source). The deterministic
+  planner uses the same `cand_<i>` as the LLM planner. The id is the candidate's
+  material and arm folder name (`settings/<id>/`) as is — it is put in
+  folder-safe characters (`A-Za-z0-9_.-`) before deduping within the round, so a
+  unique id is a unique folder. When every LLM candidate is invalid and the round
+  is filled by the deterministic planner, candidates are `det_<i>` — they do not
+  clash with the dropped LLM rows (`cand_<i>`), so proposal and history ids map
+  1:1. Deterministic candidate rows carry their `remedy` (kind:axis=value, e.g.
+  `missed:exemplar=base`).
 - **candidate count**: the planner proposes up to `planner.max_candidates`
   (default 3) per round (and per re-ask) — the prompt, the response schema and
   the deterministic planner follow the same value. The range is 1–3 — larger

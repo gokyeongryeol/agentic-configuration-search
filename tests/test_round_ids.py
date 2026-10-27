@@ -57,3 +57,45 @@ def test_ids_are_unique_across_rounds_and_reasks(big_root, tmp_path,  # noqa: F8
     assert h[1]["decision"]["id"] == "r1_cand_0_2"
     assert h[1]["champion"]["id"] == "r1_cand_0_2"
     assert any(cid.startswith("r2_") for cid in plain)
+
+
+def test_round_ids_are_folder_names():
+    """Candidate ids become material and arm folder names (runner._slug) — the round id is
+    put in folder-safe form before deduping, so whatever the source (LLM, human,
+    deterministic) an id unique within the round is a unique folder (two ids differing
+    only in spaces or symbols do not overwrite the same folder)."""
+    from agentic_configuration_search.loop.runner import _slug
+    items = [{"id": "cand 1"}, {"id": "cand/1"}, {"id": "cand_1"}, {"id": "x_"},
+             {"id": "x"}, {"id": "human_가"}, {"id": "human_나"}]
+    out = [c["id"] for c in _round_ids(items, 2, taken=set())]
+    assert len(set(out)) == len(out), out
+    assert all(_slug(i) == i for i in out), out
+    assert out[2] == "r2_cand_1_3"                 # plain ids get only the prefix and dedupe suffix
+
+
+def test_fallback_candidates_keep_clean_ids():
+    """Candidates get ids before the dropped rows — with the same original id, the
+    candidate keeps the clean id and the dropped row gets the suffix (LLM fallback
+    candidates are det_<i>, so they do not clash in practice)."""
+    from agentic_configuration_search.loop.runner import _with_round_ids
+    prop = {"candidates": [{"id": "cand_0"}, {"id": "cand_1"}],
+            "dropped": [{"id": "cand_0", "skipped": "invalid_axes"}]}
+    out = _with_round_ids(prop, 3, set())
+    assert [c["id"] for c in out["candidates"]] == ["r3_cand_0", "r3_cand_1"]
+    assert [c["id"] for c in out["dropped"]] == ["r3_cand_0_2"]
+
+
+def test_deterministic_remedy_reaches_history(big_root, tmp_path,  # noqa: F811
+                                              monkeypatch):
+    """A deterministic candidate's remedy (kind:axis=value) reaches the history.jsonl row."""
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic", rounds=1,
+               **_fakes())
+    rows = _hist(tmp_path / "run")[1]["candidates"]
+    assert rows and all(":" in c.get("remedy", "") and "=" in c["remedy"] for c in rows)
+    assert all(c["id"].startswith("r1_cand_") for c in rows)
+
+
+def test_empty_id_after_prefix_gets_a_default():
+    out = _round_ids([{"id": "r2_"}, {"id": ""}], 3, taken=set())
+    assert [c["id"] for c in out] == ["r3_cand", "r3_cand_2"]

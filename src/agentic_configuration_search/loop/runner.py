@@ -341,7 +341,7 @@ class Loop:
         sc = self.cfg.subsample
         n = len(ds.fit_train.images)
         self._fit_train_before, self._fit_train_subset = n, None
-        if sc.max_images <= 0 or n <= sc.max_images:
+        if sc.max_images is None or n <= sc.max_images:
             return ds
         key = {"fit_train": split_identity(ds.fit_train), "max_images": sc.max_images,
                "center_ratio": sc.center_ratio, "embedder": self.cfg.mine.embedder_model}
@@ -353,7 +353,7 @@ class Loop:
                 raise ValueError(
                     f"fit_train has {n} images > subsample.max_images {sc.max_images} — "
                     "picking the subset needs GT embeddings (encode_fn) "
-                    "(subsample.max_images: 0 turns it off)")
+                    "(subsample.max_images: null turns it off)")
             emb = subsample.fit_train_embeddings(
                 ds.fit_train, ds.ontology, encode_fn, self.out_dir / "_subsample" / "gt_crops")
             idx, report = subsample.select_fit_train(
@@ -2178,9 +2178,11 @@ def _reask_record(c: dict) -> dict:
 
 
 def _source_record(c: dict) -> dict:
-    """The source of carried and human candidates — shared by plain candidates and
-    the lora and classifier arms (the report's carry verdict reads only this)."""
-    return {"source": c["source"]} if c.get("source") else {}
+    """The source of carried and human candidates and the deterministic remedy
+    (remedy: kind:axis=value) — shared by plain candidates and the lora and
+    classifier arms (the report's carry verdict reads only source)."""
+    return ({"source": c["source"]} if c.get("source") else {}) \
+        | ({"remedy": c["remedy"]} if c.get("remedy") else {})
 
 
 def _reuse_record(c: dict) -> dict:
@@ -2261,8 +2263,10 @@ def _round_ids(items: list[dict], r: int, taken: set) -> list[dict]:
     """Make candidate ids unique within the run — an r<round>_ prefix (if the
     planner imitated an earlier round's prefix, it is stripped and re-added).
     Carried candidates made by the loop (source=carryover, carry_<id>) keep
-    their id, since the original id already has a prefix. On a clash with taken
-    (ids already used this round) _2, _3… is appended. The input dicts are not
+    their id, since the original id already has a prefix. The id is put in
+    folder-name (_slug) form, and on a clash with taken (ids already used this
+    round) _2, _3… is appended — an id unique within the round is a unique
+    folder. The input dicts are not
     modified — replay artifacts (proposal*.json) keep the planner's ids, and
     resume rebuilds the same ids by the same rule."""
     out = []
@@ -2272,7 +2276,10 @@ def _round_ids(items: list[dict], r: int, taken: set) -> list[dict]:
         # carry_ id, carry_ and the round prefix are stripped and this round's
         # prefix is added (so ids do not clash across rounds)
         if c.get("source") != "carryover":
-            cid = f"r{r}_" + _ROUND_PREFIX.sub("", cid)
+            # folder-name (_slug) form before deduping — two ids differing only in
+            # spaces or symbols must not overwrite the same material and arm folder
+            # (whatever the source: LLM or human). Plain ids are unchanged
+            cid = _slug(f"r{r}_" + (_ROUND_PREFIX.sub("", cid) or "cand"))
         base, n = cid, 2
         while cid in taken:
             cid, n = f"{base}_{n}", n + 1

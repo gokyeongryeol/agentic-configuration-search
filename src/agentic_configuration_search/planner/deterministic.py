@@ -200,7 +200,7 @@ def propose(history: list[dict], diagnosis: dict, *,
                 continue                      # block only exact retries of the same combination
             if axis == "tiling" and gate.block(axes):
                 continue                      # fold gate (planner.gates) — the runner blocks it too
-            out.append({"axes": axes,
+            out.append({"axes": axes, "remedy": f"{kind}:{axis}={value}",
                         "rationale": f"{axis} axis remedy for {kind} errors"})
         return out
 
@@ -228,7 +228,8 @@ def propose(history: list[dict], diagnosis: dict, *,
         if len(candidates) >= max_candidates:
             break
     # ids are cand_<i> like the LLM planner's (the loop adds the r<round>_ prefix) — the
-    # material and arm folder names are the id as is. The remedy is in rationale and axes
+    # material and arm folder names are the id as is. The remedy (kind:axis=value) stays
+    # in the history row as remedy
     candidates = [{"id": f"cand_{i}", **c} for i, c in enumerate(candidates)]
     return {"planner": "deterministic", "candidates": candidates,
             "stop": not candidates}

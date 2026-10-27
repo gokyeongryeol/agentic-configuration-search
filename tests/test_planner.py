@@ -1284,3 +1284,26 @@ def test_a_transient_error_gets_one_retry():
     assert key in tried_combos(twice)
     measured = [{"candidates": [{"id": "a", "axes": axes}]}]
     assert key in tried_combos(measured)
+
+
+def test_deterministic_candidates_carry_their_remedy():
+    """Which remedy (kind:axis=value) stays as remedy — the id is cand_<i>, so it is not
+    in the id. It reaches the loop's history row too (runner._source_record)."""
+    from agentic_configuration_search.loop.runner import _source_record
+    out = deterministic.propose([], _diag(fn={"missed": 10}))
+    c = out["candidates"][0]
+    assert c["remedy"].startswith("missed:") and "=" in c["remedy"]
+    assert _source_record(c) == {"remedy": c["remedy"]}
+
+
+def test_llm_fallback_candidates_use_det_ids(tmp_path):
+    """When every LLM candidate is invalid and the deterministic planner fills in, ids are
+    det_<i> — they do not clash with the dropped LLM rows (cand_<i>), so the proposal and
+    the history map 1:1."""
+    bad = {"candidates": [{"axes": {"no_such_axis": True}, "rationale": "x",
+                           "expected_gain": 0.01, "cost_min": 1, "differs": ""}],
+           "stop": False}
+    p = LLMPlanner(chat=lambda m, **k: bad, artifact_dir=tmp_path).propose(
+        [], _diag(fn={"missed": 10}))
+    assert p["candidates"] and all(c["id"].startswith("det_") for c in p["candidates"])
+    assert p["dropped"] and all(d["id"].startswith("cand_") for d in p["dropped"])

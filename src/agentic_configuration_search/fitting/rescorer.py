@@ -250,7 +250,7 @@ def _even(sizes: list[int], budget: int) -> list[int]:
     return out
 
 
-def cap_train_rows(rows: list[dict], cap: int):
+def cap_train_rows(rows: list[dict], cap: int | None):
     """Thin the discriminator's training rows to cap — (kept rows, row weights, record).
 
     TPs are rare and the core of the ranking signal, so they are kept first — if
@@ -266,7 +266,9 @@ def cap_train_rows(rows: list[dict], cap: int):
     distribution). Kept rows keep their original order.
     """
     n = len(rows)
-    if cap <= 0 or n <= cap:
+    if cap is not None and cap < 1:
+        raise ValueError(f"cap {cap} — None removes the cap (it is not 0 rows)")
+    if cap is None or n <= cap:
         return rows, np.ones(n), {"capped": False, "n_rows": n, "n_kept": n}
     pos = [i for i, r in enumerate(rows) if r["y"]]
     neg = [i for i, r in enumerate(rows) if not r["y"]]

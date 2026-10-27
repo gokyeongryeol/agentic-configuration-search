@@ -52,14 +52,16 @@ def _hash_order(split, idx) -> list[int]:
         split.images[i].file_name.encode()).hexdigest())
 
 
-def select_fit_train(split, emb_by_class: dict, *, max_images: int,
+def select_fit_train(split, emb_by_class: dict, *, max_images: int | None,
                      center_ratio: float) -> tuple[list[int], dict]:
     """Image indices of fit_train to keep (ascending) and a record.
 
     emb_by_class: {category_id: (annotation ids, embedding matrix)} — rows follow the ids.
     """
     n = len(split.images)
-    if max_images <= 0 or n <= max_images:
+    if max_images is not None and max_images < 1:
+        raise ValueError(f"max_images {max_images} — None removes the cap (it is not 0 images)")
+    if max_images is None or n <= max_images:
         return list(range(n)), {"applied": False, "n_images": n}
 
     image_of = {a.id: i for i, img in enumerate(split.images) for a in img.annotations}

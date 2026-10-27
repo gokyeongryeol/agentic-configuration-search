@@ -380,7 +380,7 @@ def test_prescreen_without_subset_uses_full_fit_dev(big_root, tmp_path,  # noqa:
                                                     monkeypatch):
     """Without a subset (fit_dev is small) it is measured on the full fit_dev —
     that still saves holdout."""
-    h = _run(big_root, tmp_path / "run", monkeypatch, prescreen_fraction=0.0)
+    h = _run(big_root, tmp_path / "run", monkeypatch, prescreen_fraction=None)
     r2 = {c["id"]: c for c in h[2]["candidates"]}["r2_neg_k2"]
     assert r2["skipped"] == "lost_value_prescreen"
     assert r2["prescreen"]["n_images"] == r2["prescreen"]["of"]

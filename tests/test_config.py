@@ -122,8 +122,20 @@ def test_small_object_ratio_default_and_validation():
 def test_kcenter_outlier_mad_validation_and_old_keys():
     """The outlier trim is distribution-based (median + k·MAD) — the fraction keys are unknown keys."""
     for key in ("kcenter_outlier_mad", "fn_kcenter_outlier_mad"):
-        with pytest.raises(ConfigError, match=f"mine.{key}"):
-            config_from_dict({**BASE, "mine": {key: -1.0}})
+        for bad in (-1.0, 0, 0.0, "3.0", True):        # 0 reads as "everything above the median"
+            with pytest.raises(ConfigError, match=f"mine.{key}"):
+                config_from_dict({**BASE, "mine": {key: bad}})
+        assert getattr(config_from_dict({**BASE, "mine": {key: None}}).mine, key) is None
     for old in ("kcenter_trim", "fn_kcenter_trim"):
         with pytest.raises(ConfigError, match=old):
             config_from_dict({**BASE, "mine": {old: 0.2}})
+
+
+def test_off_switches_are_null_not_zero():
+    """"Off" is null — 0 also reads as "0 images, 0 rows", so config refuses it."""
+    for section, key in (("screen", "prescreen_fraction"), ("subsample", "max_images"),
+                         ("rescorer", "max_train_rows")):
+        with pytest.raises(ConfigError, match="null"):
+            config_from_dict({**BASE, section: {key: 0}})
+        cfg = config_from_dict({**BASE, section: {key: None}})
+        assert getattr(getattr(cfg, section), key) is None

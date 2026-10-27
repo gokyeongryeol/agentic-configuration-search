@@ -72,7 +72,7 @@ def _subset(split: Split, keep: set[int]) -> Split:
 
 
 
-def prescreen_subset(split: Split, fraction: float, min_images: int, *,
+def prescreen_subset(split: Split, fraction: float | None, min_images: int, *,
                      max_share: float) -> Split | None:
     """A deterministic subset of split — max(min_images, ⌈fraction·N⌉) images in
     filename-hash order.
@@ -80,12 +80,14 @@ def prescreen_subset(split: Split, fraction: float, min_images: int, *,
     Used only by the tiling prescreen on fit_dev (unrelated to material purity —
     just part of the scoring split). Hash order picks the same images regardless
     of run, round or resume, and the picked ones keep their original order. None
-    if fraction is 0 or the subset would be max_share of N or more (no point in a
+    if fraction is None or the subset would be max_share of N or more (no point in a
     prescreen — a passing candidate is screened in full again, so a subset that
     is most of the split costs more than it saves; e.g. 20 of 22 fit_dev
     images)."""
     n_all = len(split.images)
-    if fraction <= 0 or n_all == 0:
+    if fraction is not None and fraction <= 0:
+        raise ValueError(f"fraction {fraction} — None turns the prescreen off")
+    if fraction is None or n_all == 0:
         return None
     n = max(int(min_images), math.ceil(fraction * n_all))
     if n >= n_all or n >= max_share * n_all:

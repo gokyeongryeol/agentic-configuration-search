@@ -68,7 +68,7 @@ def _spread_encode(cache):
 
 def test_gt_exemplars_kcenter_and_chosen_ids(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplars_per_class=2, kcenter_outlier_mad=0.0)
+    params = _params(exemplars_per_class=2, kcenter_outlier_mad=None)
     ex, chosen = mine.gt_exemplars(train, onto, cache, params,
                                    _spread_encode(cache), random.Random(0))
     for cid in cache.prompt_pool:
@@ -86,7 +86,7 @@ def test_gt_exemplars_prefetches_all_classes_in_one_call(train, onto, tmp_path):
     before the per-class calls — the real implementation embeds c1..cN in one
     worker run (one model load). The selection equals the one without prefetch."""
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplars_per_class=2, kcenter_outlier_mad=0.0)
+    params = _params(exemplars_per_class=2, kcenter_outlier_mad=None)
     base = _spread_encode(cache)
     prefetched = []
 
