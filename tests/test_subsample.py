@@ -55,9 +55,17 @@ def _emb(split, look):
 def test_small_or_disabled_is_untouched():
     sp = _split([[1], [1], [1]])
     emb = _emb(sp, {1: 0, 2: 0, 3: 0})
-    for cap in (0, 3, 10):
+    for cap in (None, 3, 10):                       # None = no cap (off)
         keep, rep = subsample.select_fit_train(sp, emb, max_images=cap, center_ratio=1.0)
         assert keep == [0, 1, 2] and rep["applied"] is False
+
+
+def test_zero_cap_is_not_off():
+    """A cap of 0 reads as "0 images" and is confused with "off" — off is None (null in config)."""
+    sp = _split([[1], [1], [1]])
+    for cap in (0, -1):
+        with pytest.raises(ValueError, match="None"):
+            subsample.select_fit_train(sp, {}, max_images=cap, center_ratio=1.0)
 
 
 def test_greedy_cover_takes_unseen_appearances_first():
@@ -270,6 +278,34 @@ def test_small_fit_train_needs_no_encoder(dataset_root, tmp_path):
 
 def test_config_validates_subsample():
     from agentic_configuration_search.config import ConfigError, config_from_dict
-    for bad in ({"max_images": -1}, {"center_ratio": 0.0}, {"center_ratio": 1.5}):
+    for bad in ({"max_images": 0}, {"max_images": -1}, {"center_ratio": 0.0},
+                {"center_ratio": 1.5}):
         with pytest.raises(ConfigError):
             config_from_dict({"dataset": "x", "subsample": bad})
+    with pytest.raises(ConfigError, match="null"):
+        config_from_dict({"dataset": "x", "subsample": {"max_images": 0}})
+    cfg = config_from_dict({"dataset": "x", "subsample": {"max_images": None}})
+    assert cfg.subsample.max_images is None
+
+
+def test_null_cap_turns_subsampling_off(dataset_root, tmp_path):
+    from agentic_configuration_search.core.data import load_dataset
+    n = len(load_dataset(dataset_root).fit_train.images)
+    loop = _loop(dataset_root, tmp_path / "run", None, max_images=None)
+    assert len(loop.ds.fit_train.images) == n
+    assert not (tmp_path / "run" / subsample.SUBSET_FILE).exists()
+
+
+def test_yaml_null_and_wrong_types(tmp_path):
+    """A real YAML null is None (off). Non-integers (a quoted "null", a float, true) are
+    stopped at config time with ConfigError — not later as a TypeError in arithmetic."""
+    from agentic_configuration_search.config import ConfigError, config_from_dict, load_config
+    p = tmp_path / "c.yaml"
+    p.write_text("dataset: x\nsubsample:\n  max_images: null\nrescorer:\n  max_train_rows: null\n")
+    cfg = load_config(p)
+    assert cfg.subsample.max_images is None and cfg.rescorer.max_train_rows is None
+    for bad in ("null", 400.0, True):
+        with pytest.raises(ConfigError):
+            config_from_dict({"dataset": "x", "subsample": {"max_images": bad}})
+        with pytest.raises(ConfigError):
+            config_from_dict({"dataset": "x", "rescorer": {"max_train_rows": bad}})

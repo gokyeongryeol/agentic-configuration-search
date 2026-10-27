@@ -74,9 +74,8 @@ while :; do
     sleep 20
 done
 
-echo "[scheduler] all done — generating reports"
+# each run writes its report (report.md) when it finishes — not redrawn here
+echo "[scheduler] all done"
 for ds in "${DATASETS[@]}"; do
-    [ -f "runs/$ds/run/history.jsonl" ] && \
-        .venv/bin/acs report "runs/$ds/run" > /dev/null && \
-        echo "report: runs/$ds/run/report.md"
+    [ -f "runs/$ds/run/report.md" ] && echo "report: runs/$ds/run/report.md"
 done

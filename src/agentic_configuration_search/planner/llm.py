@@ -1397,7 +1397,10 @@ class LLMPlanner:
                                         disabled_axes=self.disabled_axes,
                                         disabled_values=self.disabled_values,
                                         facts=self.facts)
-            candidates, stop = det["candidates"], det["stop"]
+            # ids are det_<i> — they do not clash with the dropped LLM rows (cand_<i>), so
+            # the proposal and the history map 1:1
+            candidates = [{**c, "id": f"det_{i}"} for i, c in enumerate(det["candidates"])]
+            stop = det["stop"]
             fallback = "deterministic"
 
         proposal = {"planner": "llm", "candidates": candidates, "stop": stop,

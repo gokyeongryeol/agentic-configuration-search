@@ -13,6 +13,7 @@ default.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from pathlib import Path
 
@@ -113,3 +114,24 @@ def build_hooks(cfg: Config, repo_root: Path, out_dir: Path, *,
         from ..infer import phrases as _phrases
         hooks["vlm_caption_fn"] = lambda rows: _phrases.vlm_caption(rows, chat)
     return hooks
+
+
+def regenerate_report(run_dir: Path, cfg: Config | None) -> Path:
+    """Report regeneration for `acs report` — the dataset comes from the config
+    (else run_summary's dataset)."""
+    from ..core.data import load_dataset
+    from ..diagnose import story
+    run_dir = Path(run_dir)
+    summary = json.loads((run_dir / "run_summary.json").read_text()) \
+        if (run_dir / "run_summary.json").exists() else {}
+    root = (cfg.dataset if cfg is not None else None) or summary.get("dataset")
+    ds = None
+    if root:
+        try:
+            ds = load_dataset(Path(root).resolve())
+        except Exception as exc:  # noqa: BLE001 — a missing or changed dataset still gets a report
+            log.warning("could not read the dataset (%s: %s) — drawing without the dataset "
+                        "section and example photos", type(exc).__name__, exc)
+    story.render_report(run_dir, ds=ds,
+                        small_ratio=cfg.diagnose.small_object_ratio if cfg else None)
+    return run_dir / story.REPORT_FILE

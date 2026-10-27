@@ -105,7 +105,7 @@ def test_trim_zero_mad_spread():
 
 def test_trim_off_keeps_everything():
     emb = np.array([[0., 0.], [0., 0.1], [9., 9.]])
-    assert list(embedder.trim_outliers(emb, 0.0)) == [0, 1, 2]
+    assert list(embedder.trim_outliers(emb, None)) == [0, 1, 2]
 
 
 def test_trim_never_goes_below_min_keep():
@@ -117,7 +117,7 @@ def test_trim_never_goes_below_min_keep():
 
 
 def test_trim_rejects_negative():
-    with pytest.raises(ValueError, match=">= 0"):
+    with pytest.raises(ValueError, match="> 0"):
         embedder.trim_outliers(np.zeros((4, 2)), -1.0)
 
 
@@ -129,7 +129,7 @@ def test_kcenter_trim_excludes_outliers_but_keeps_spread():
     emb = np.vstack([dense, outliers])
     outlier_ids = set(range(40, 46))
 
-    pure = embedder.kcenter_greedy(emb, 5, outlier_mad=0.0)
+    pure = embedder.kcenter_greedy(emb, 5, outlier_mad=None)
     trimmed = embedder.kcenter_greedy(emb, 5, outlier_mad=3.0)
 
     assert outlier_ids & set(pure)                        # plain k-center picks outliers
@@ -531,3 +531,10 @@ def test_hooks_encode_fn_prefetch_batches_classes_into_one_worker(tmp_path, monk
     assert h["encode_fn"](2, crops[2]).tolist() == [[1.0, 1.0]] * 3
     assert len(calls) == 1
     assert list((out_dir / "_cache").glob("embed_*.npz"))
+
+
+def test_trim_outliers_none_is_off_and_zero_is_rejected():
+    emb = np.random.default_rng(0).normal(size=(10, 4))
+    assert list(embedder.trim_outliers(emb, None)) == list(range(10))
+    with pytest.raises(ValueError, match="None"):
+        embedder.trim_outliers(emb, 0.0)

@@ -59,8 +59,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--resume", action="store_true",
                      help="continue from the round after history.jsonl (LLM proposals are replayed)")
     run.add_argument("--candidates", help="human-injected candidates yaml (hybrid loop)")
-    rep = sub.add_parser("report", help="run trajectory report — writes report.md")
+    rep = sub.add_parser("report", help="redraw the run report (report.md)")
     rep.add_argument("run_dir")
+    rep.add_argument("--config", help="config to find the dataset in (default: run_summary's "
+                                      "dataset)")
     ab = sub.add_parser("ab", help="compare two run trajectories (deterministic vs llm A/B)")
     ab.add_argument("run_a")
     ab.add_argument("run_b")
@@ -68,8 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "report":
-        from .diagnose.report import render_report
-        print(render_report(Path(args.run_dir)))
+        from .loop.hooks import regenerate_report
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(name)s %(levelname)s %(message)s")
+        path = regenerate_report(Path(args.run_dir),
+                                 load_config(args.config) if args.config else None)
+        print(path.read_text())
         return 0
     if args.cmd == "ab":
         import json as _json

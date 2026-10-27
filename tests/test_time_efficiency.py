@@ -208,6 +208,7 @@ def test_prescreen_config_defaults_and_validation():
     assert (s.prescreen_fraction, s.prescreen_min_images, s.prescreen_min_grid,
             s.prescreen_max_share) == (0.25, 20, 3, 0.5)
     for bad in ({"prescreen_fraction": -0.1}, {"prescreen_fraction": 1.5},
+                {"prescreen_fraction": 0}, {"prescreen_fraction": "0.25"},
                 {"prescreen_min_images": 0}, {"prescreen_min_grid": 1},
                 {"prescreen_max_share": 0.0}, {"prescreen_max_share": 1.5}):
         with pytest.raises(ConfigError):
@@ -226,8 +227,10 @@ def test_prescreen_subset_is_deterministic_fit_dev_only(dataset_root):
     assert a is not None and len(a.images) == 1
     assert [e.file_name for e in a.images] == [e.file_name for e in b.images]
     assert set(e.file_name for e in a.images) <= set(names)
-    # 0 is off · equal to the whole split is pointless, so None
-    assert prescreen_subset(dev, 0.0, 1, max_share=1.0) is None
+    # None is off (0 is refused) · equal to the whole split is pointless, so None
+    assert prescreen_subset(dev, None, 1, max_share=1.0) is None
+    with pytest.raises(ValueError, match="None"):
+        prescreen_subset(dev, 0.0, 1, max_share=1.0)
     assert prescreen_subset(dev, 0.5, len(names), max_share=1.0) is None
 
 
@@ -318,7 +321,7 @@ def test_prescreen_pass_keeps_full_screen_numbers(big_root, tmp_path,  # noqa: F
     monkeypatch.setattr(gateway, "infer_config", _tile_helps_infer(_gt_lookup(big_root)))
     plan = {1: [{"id": "t2", "axes": {"tiling": 2}, "rationale": "x"}]}
     recs = []
-    for name, frac in (("on", 0.5), ("off", 0.0)):
+    for name, frac in (("on", 0.5), ("off", None)):
         run_rounds(big_root, out_dir=tmp_path / name, planner="llm",
                    llm_chat=_llm_by_round(dict(plan)), rounds=1,
                    cfg=_prescreen_cfg(big_root, frac), **_fakes())
@@ -353,7 +356,7 @@ def test_unused_tiling_row_records_the_loss(big_root, tmp_path,  # noqa: F811
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     chat = _llm_by_round({1: [{"id": "t2", "axes": {"tiling": 2}, "rationale": "x"}]})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
-               rounds=1, cfg=_prescreen_cfg(big_root, 0.0), **_fakes())
+               rounds=1, cfg=_prescreen_cfg(big_root, None), **_fakes())
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["tiling_used"] is False and "prescreen" not in rec
     tf = rec["tiling_f"]
@@ -371,7 +374,7 @@ def test_candidate_rows_carry_wall_minutes(big_root, tmp_path,  # noqa: F811
                               {"id": "ex", "axes": {"exemplar": "base"},
                                "rationale": "y"}]})
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
-               rounds=1, cfg=_prescreen_cfg(big_root, 0.0), **_fakes())
+               rounds=1, cfg=_prescreen_cfg(big_root, None), **_fakes())
     rows = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}
     ev = rows["r1_ex"]["wall_min"]
     assert set(ev) == {"materialize", "screen", "holdout", "total"}

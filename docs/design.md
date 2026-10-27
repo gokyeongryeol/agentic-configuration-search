@@ -21,8 +21,9 @@ the run records this as `holdout_split` in `run_summary.json`.
 
 The three trainings (tail fine-tune, rescorer discriminator, crop classifier)
 read fit_train as is, so their time grows with its size. When fit_train is
-larger than `subsample.max_images` (400), only that many images are used for
-training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
+larger than `subsample.max_images` (500), only that many images are used for
+training (`null` turns it off — a cap of 0 is refused by config, since it reads as
+"0 images"; `fitting.subsample`, `fit_train_subset.json` in the run directory).
 
 - **Picked in the order that covers the appearances, not at random** (greedy
   set cover). The DINOv3 embeddings of GT crops are clustered per class with
@@ -44,10 +45,10 @@ training (`fitting.subsample`, `fit_train_subset.json` in the run directory).
   (key = fit_train fingerprint, settings and embedding model; a record that no
   longer matches fit_train picks again). The training reuse keys hold the
   fit_train fingerprint, so a changed subset also breaks reuse.
-- On datasets with many objects per image, 400 images can still mean many
+- On datasets with many objects per image, 500 images can still mean many
   boxes — the cap bounds images, not objects.
 - **The rescorer also caps its training rows** (`rescorer.max_train_rows`,
-  100,000). A row is one detection candidate, so many detections per image can
+  100,000; `null` for no cap). A row is one detection candidate, so many detections per image can
   exceed it even after the subset. TPs are rare and the core of the ranking
   signal, so they are kept first (if TPs alone exceed half the cap they are
   thinned in class proportion, but slots the FPs cannot fill go to the TPs —
@@ -64,7 +65,7 @@ Every round, apart from the axes:
 | step | split |
 |---|---|
 | diagnosis (planner input) | all of train inferred with the champion and split by cause (with samples); the holdout as aggregates only. Thresholds are the champion's holdout thresholds — planner input only, never fed into materials |
-| screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` to holdout |
+| screen | `fit_dev` — fixes the candidate's config, per-class thresholds and modality, and sends the top `screen.top_k` ordinary candidates to holdout (lora and classifier arms go to holdout on their own margin, outside `top_k`) |
 | adoption, saturation | holdout (`valid`, or `test` when there is no `valid`) — compared with the champion at holdout thresholds; adopted only if the paired-bootstrap lower bound is ≥ `gate.margin`, Δ > 0 and Δ ≥ `gate.min_delta` (0.005) |
 | final measurement | `test` (when `valid` was the holdout) — the settled champion, once, outside the loop (`scripts/predict.py --split test`) |
 
@@ -117,7 +118,7 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 
 | axis | materials / training | selection (`fit_dev`) | adoption (holdout) |
 |---|---|---|---|
-| `alias` | train: a few GT crops per class (the candidate's exemplars, or a k-center selection, default 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
+| `alias` | train: a few GT crops per class (the candidate's exemplars, or else a GT selection by `mine.exemplar_selection` — k-center by default — of `mine.exemplars_per_class`, 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
 | `exemplar` | train: `base` takes `exemplar_k` GT crops by k-center; `fn_arm` adds `fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
 | `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
 | `visual_negatives` | train: `visual_negative_k` mining-pass false-positive crops per class | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
@@ -136,7 +137,8 @@ The diagnosis comes first: it is of the champion at the start of the round
 (reused when the champion and config are unchanged — see below), and it is the
 planner's input for the same round.
 
-- **screen** passes only the top-K candidates to holdout. A candidate that
+- **screen** passes only the top-K ordinary candidates to holdout (lora and
+  classifier arms are judged on their own margin and are not counted in `top_k`). A candidate that
   changes only tiling and raises the grid above the champion's to ≥
   `screen.prescreen_min_grid` is first
   screened on a deterministic fit_dev subset (`screen.prescreen_fraction`,
@@ -215,7 +217,15 @@ planner's input for the same round.
   candidates are `carry_<original id>` (e.g. `carry_r1_cand_1`) — only carried
   candidates made by the loop (`source: carryover`) are exempt from the prefix.
   If the planner imitates a `carry_` id, `carry_` is stripped and the round
-  prefix added (the report also tells carried rows by source).
+  prefix added (carried rows are told by source, not by id shape). The deterministic
+  planner uses the same `cand_<i>` as the LLM planner. The id is the candidate's
+  material and arm folder name (`settings/<id>/`) as is — it is put in
+  folder-safe characters (`A-Za-z0-9_.-`) before deduping within the round, so a
+  unique id is a unique folder. When every LLM candidate is invalid and the round
+  is filled by the deterministic planner, candidates are `det_<i>` — they do not
+  clash with the dropped LLM rows (`cand_<i>`), so proposal and history ids map
+  1:1. Deterministic candidate rows carry their `remedy` (kind:axis=value, e.g.
+  `missed:exemplar=base`).
 - **candidate count**: the planner proposes up to `planner.max_candidates`
   (default 3) per round (and per re-ask) — the prompt, the response schema and
   the deterministic planner follow the same value. The range is 1–3 — larger
@@ -232,7 +242,9 @@ planner's input for the same round.
   skip only saves holdout time and does not change when the run stops.
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
-  previous round's are copied (`diagnosis_key.json`).
+  previous round's are copied (`diagnosis_key.json` — the champion's round, id,
+  materials, weights, artifact, blend λ, rescorer, holdout micro F(β) and
+  thresholds, and a hash of the config without `rounds` and `out_dir`).
 - **final champion diagnosis**: a round's diagnosis is of the champion at the
   start of the round, so when the last round adopts, the final champion's
   residual errors would be recorded nowhere. At the end of the run the final
@@ -312,7 +324,9 @@ planner's input for the same round.
   ordinary candidate; the arm grid's best stays in the lora decision. The lora arm grid (which lora λ wins) is chosen
   on the champion's classifier λ, and the classifier λ once on that winner —
   the two grids are not swept as a product, so the number of picks on fit_dev
-  matches an ordinary candidate's. The training cache key
+  matches an ordinary candidate's. The lora λ itself (weight interpolation) is
+  not re-chosen after adoption: rebuilding the weights, re-inferring and
+  refitting the layers below would all run again. The training cache key
   leaves the champion out — background crops come from the first training's
   champion, and the λ grid absorbs the drift. A tripwire is not cached.
   Resume and `scripts/predict.py` restore λ with the artifact; a champion with
@@ -399,16 +413,21 @@ runs/<dataset>/run/
   rounds/final/        # final champion diagnosis (diagnosis, diagnosis_key, crop_notes) + residual.json
   lora_cache/          # tail training output (tuned_tail.pt) per training key — reused within the run
   classifier_cache/    # crop classifier artifact per training key — reused within the run
-  report.md            # output of acs report
+  report.md            # run report (written at run end, redrawn by acs report)
+  report_assets/       # report figures (chart PNGs, photo JPEGs)
 ```
 
 - **Candidate ids** get an `r<round>_` prefix before recording; only carried
-  candidates keep `carry_<original id>` (see the round loop).
+  candidates keep `carry_<original id>` (see the round loop). The id is optional
+  in the LLM response — an empty one becomes `cand_<i>` (re-ask `reask<k>_<i>`),
+  and a clash gets `_2`, `_3`….
 - **History fields**: candidate rows carry `wall_min`, `reask`, `fit_dev_cmp`,
   `lost_values`, `plan`, `delta_reused` / `classifier_reused` (origin of a
   reused tail or classifier training) and `classifier_lambda` (the arm's best λ,
-  or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`); the
-  round's champion summary carries `classifier_lambda`; round rows carry
+  or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`),
+  `source` (carryover or human), `remedy` (deterministic candidates),
+  `prescreen` (the subset verdict) and `tiling_f` (tiling candidates' fit_dev
+  comparison); the round's champion summary carries `classifier_lambda`; round rows carry
   `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
   response's `expected_gain`, `cost_min` and `differs`; only a malformed field
   is dropped.
@@ -419,22 +438,43 @@ runs/<dataset>/run/
 
 ### Report
 
-`acs report <run_dir>` reads only the run's artifacts (no GPU) and writes
-`report.md`. A section whose artifacts are missing is noted in a line and
-skipped (older runs still render).
+`report.md` (`diagnose/story.py`) is a run report for readers without the
+technical background. It is written automatically at the end of a run and
+`acs report <run_dir> [--config c.yaml]` redraws it (no GPU, no LLM); figures go
+to `report_assets/`. The order is at a glance → the data (counts, sizes,
+crowding, representative photos) → attempts and the score chart by round → the
+remaining error patterns with example photos → data suggestions, with a
+glossary appendix at the end. Its material
+(trajectory, candidate attempts, the final diagnosis bundle) is read by
+`diagnose/report.py`.
 
-| section | contents |
-|---|---|
-| header, round trajectory, candidates tried | final holdout F(β) and Δ vs. baseline, the champion and adopted increment per round, per-candidate fit_dev, holdout, gate Δ, CI lower bound and outcome |
-| adoption path | increments rejected or skipped under an earlier champion that came back and were adopted after a champion change (re-adoptions — earlier outcome and Δ/CI) and how many were rejected again (by reason), holdout Δ per adopted increment, per-axis tries, adoptions and outcome distribution (axes never adopted), carry-over (`carry_*`) results |
-| time use | run and round wall clock (`dur_s`), minutes by stage (materialize, screen, holdout), by outcome and by axis with adopted Δ per hour (`wall_min`), pass cache hit rate, re-asks and empty rounds, whether the final diagnosis was reused |
-| FP/FN causes over rounds | the holdout counts by cause of the champion entering each round, and their changes |
-| residual misses | for the final champion (`rounds/final`; otherwise the last round's diagnosis with a warning): per-class FN/GT; FN/GT by size bucket (with px at the 640 px detector input side), cause × size, crowding (GT per image), border contact and elongation; condition terms from crop notes (class × cause); representative train misses (5 per class, filename, box, note) |
-| data collection suggestions | a one-line suggestion per class from GT count, miss rate, main cause, main size and condition terms (read as a method problem when below_threshold dominates); label quality flags (GT with a short side ≤ 3 px, duplicate GT, localization share) |
-
-Holdout is aggregate-only in every section — samples and filenames come only
-from train. The amount of data needed is not estimated (no learning curve is
-measured).
+- Technical terms reach it only through the `STRATEGY`, `CAUSE` and
+  `_OUTCOME_GROUPS` tables. A new axis, error cause or skip reason must be added
+  to them too (`test_story`).
+- Scores and counts are holdout aggregates; example photos come from train only.
+- Example captions are the VLM crop notes as written; without a note, a fixed
+  sentence built from the cause and size is used.
+- The score is the holdout score. The holdout is reused for adoption decisions,
+  so the report says scores "may come out a little better than on photos never
+  seen before", and warns when `holdout_split` is not valid (test as a
+  stand-in).
+- `rounds/final` counts as the final diagnosis only when the champion id in its
+  diagnosis key matches the current champion (after a resume, a failed final
+  diagnosis of the new champion leaves the old files behind). Otherwise the last
+  round's diagnosis stands in. It is stale only when the last round adopted
+  (otherwise it is the final champion's own diagnosis): then the summary and
+  sections 3 and 4 say so, and no "final" bars are drawn. A run whose final diagnosis failed does not use
+  `residual.json`. Without a holdout diagnosis, sections 3 and 4 are skipped.
+- Example photos are picked only from rows of train files, and captions are
+  numbered only for photos actually drawn. A photo that cannot be opened drops
+  only that photo.
+- The data suggestions split the remaining errors into "more photos are likely
+  to reduce" (not seen, too small to see, background taken for an object, taken
+  for another kind), "a decision-rule problem" (low confidence, duplicates, tile
+  fragments) and "check found areas and label rules" (area off target). If the
+  first is under 30% of the remaining errors, the decision rule and label rules
+  come first. The number of photos needed is not stated — no learning curve is
+  measured.
 
 ### Prediction
 
