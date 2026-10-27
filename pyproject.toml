@@ -13,7 +13,7 @@ authors = [{ name = "Superb AI", email = "contact@superb-ai.com" }]
 
 # GPU dependencies (torch, ultralytics, ...) are not declared — install them
 # separately in the worker venv and the run venv. The declared dependencies
-# below are MIT / Apache-2.0 / BSD. The package as a whole is AGPL-3.0 because
+# below are MIT / Apache-2.0 / BSD (and PSF-based for matplotlib). The package as a whole is AGPL-3.0 because
 # it imports ultralytics (AGPL-3.0) in-process — research baseline only, not to
 # be merged into product code.
 dependencies = [
@@ -22,6 +22,7 @@ dependencies = [
     "numpy>=1.24",       # BSD-3
     "pillow>=10.0",      # MIT-CMU
     "scikit-learn>=1.3", # BSD-3 — rescorer discriminator
+    "matplotlib>=3.7",   # matplotlib license (PSF-based, permissive) — run report figures
 ]
 
 [project.optional-dependencies]

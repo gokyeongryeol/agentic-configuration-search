@@ -33,7 +33,7 @@ import yaml
 
 from ..config import Config, config_from_dict
 from ..core.data import Dataset, load_dataset, prescreen_subset, subset_split
-from ..diagnose import describe, residual
+from ..diagnose import describe, residual, story
 from ..diagnose.errors import diagnose, size_profile
 from ..eval.evaluate import evaluate_on_holdout, gate
 from ..eval.runner import chosen_groups, infer_for_groups, setting_records
@@ -615,6 +615,14 @@ class Loop:
             info["error"] = f"{type(exc).__name__}: {exc}"
         info["dur_s"] = round(time.monotonic() - t0, 1)
         return info
+
+    def write_report(self) -> None:
+        """The run report (diagnose.story). Report-only, so a failure does not kill the run."""
+        try:
+            story.render_report(self.out_dir, ds=self.ds,
+                                small_ratio=self.cfg.diagnose.small_object_ratio)
+        except Exception:  # noqa: BLE001 — a report-only failure must not kill the run
+            log.exception("run report (%s) failed", story.REPORT_FILE)
 
     def _planner_chat(self):
         """Chat callable shared by the llm planner and crop notes — the injected
@@ -1765,8 +1773,8 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 if stop:
                     result.stopped = stop
                     break
-        # the final champion's diagnosis — material for the report's residual-miss
-        # analysis (rounds/final)
+        # the final champion's diagnosis — material for the report's remaining
+        # problems and data suggestions (rounds/final)
         final_diag = loop.final_diagnosis(champion, history)
 
     _write(loop.out_dir / "run_summary.json", {
@@ -1785,7 +1793,10 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
         "champion": {"id": champion.get("id"), "axes": champion.get("axes"),
                      "micro_f_beta": (champion.get("eval") or {}).get("micro_f_beta")},
         "final_diagnosis": final_diag,
+        # where report regeneration (acs report) finds the dataset again
+        "dataset": str(loop.ds.root.resolve()),
         "finished_at": datetime.now().isoformat(timespec="seconds")})
+    loop.write_report()
     result.history = history
     result.champion = champion
     return result
@@ -2180,7 +2191,8 @@ def _reask_record(c: dict) -> dict:
 def _source_record(c: dict) -> dict:
     """The source of carried and human candidates and the deterministic remedy
     (remedy: kind:axis=value) — shared by plain candidates and the lora and
-    classifier arms (the report's carry verdict reads only source)."""
+    classifier arms. Whether a row is carried is told by source, not by id shape
+    (carry_)."""
     return ({"source": c["source"]} if c.get("source") else {}) \
         | ({"remedy": c["remedy"]} if c.get("remedy") else {})
 

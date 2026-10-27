@@ -28,7 +28,7 @@ mine: {device: "cuda:1"}
 HF_HUB_OFFLINE=1 .venv/bin/acs run --config c.yaml             # → runs/<dataset>/run/
 .venv/bin/acs run --config c.yaml --resume                      # continue (replays saved proposals, no LLM calls)
 .venv/bin/acs run --config c.yaml --rounds 1 --candidates cands.yaml   # inject human candidates
-.venv/bin/acs report runs/<ds>/run                              # report.md
+.venv/bin/acs report runs/<ds>/run [--config c.yaml]            # redraw report.md
 .venv/bin/acs ab runs/a runs/b                                  # compare two runs
 .venv/bin/python scripts/predict.py runs/<ds>/run --config c.yaml --split test   # final measurement
 scripts/run_parallel.sh --rounds 10                             # demo datasets in parallel across GPUs
@@ -104,7 +104,7 @@ weights, classifier artifact) through controls the CLI wires in.
 ```
 runs/<dataset>/run/
   history.jsonl       round ledger (per-candidate axes, outcome, gate, wall_min)
-  run_summary.json    stop reason, final champion, holdout_split, fit_train (training images, subset record)
+  run_summary.json    stop reason, final champion, holdout_split, fit_train (training images, subset record), dataset
   fit_train_subset.json  fit_train subset (picked images, centers, coverage) — only when fit_train exceeds the cap
   champion.json       champion setting (axes, materials, weight paths, classifier blend λ)
   champion_eval.json  holdout evaluation, tau_test
@@ -112,7 +112,8 @@ runs/<dataset>/run/
   rounds/final/       final champion diagnosis + residual.json
   lora_cache/         tail training output — lora candidates with the same training inputs reuse it
   classifier_cache/   crop classifier artifact — trained once per run, later proposals reuse it
-  report.md           trajectory, adoption path, time, FP/FN trends, residual misses, data collection suggestions
+  report.md           run report without technical terms — data → how it improved → what is left → more data
+  report_assets/      report figures (chart PNGs, photo JPEGs)
 ```
 
 `predict.py` uses `tau_test` from `champion_eval.json`. Options are in the
@@ -143,7 +144,7 @@ Layers `core ← clients ← infer ← fitting ← eval ← diagnose ← planner
 | `infer/` | `gateway.py` (the single path for all detector inference), query and phrase assembly, embedder |
 | `fitting/` | material mining (`mine.py`), rescorer, tail fine-tune, crop classifier |
 | `eval/` | screen (fit_dev), holdout evaluation and the adoption gate (`evaluate.py`) |
-| `diagnose/` | FP/FN cause classification, VLM notes, residual analysis, `report.py` |
+| `diagnose/` | FP/FN cause classification, VLM notes, residual analysis, ledger readers (`report.py`), run report (`story.py`) |
 | `planner/` | axes schema, deterministic and LLM planners, tiling gate, axis ledger |
 | `loop/` | round orchestration (`runner.py`), materialize, per-axis round wiring |
 | `services/` · `workers/` | subprocess and server management · one-shot GPU workers (`ACS_VLLM_VENV`; DINOv3 worker CPU threads and loaders via `ACS_EMBED_THREADS`, `ACS_EMBED_LOADERS`, default min(8, cores), min(4, cores)) |

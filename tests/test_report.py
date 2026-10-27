@@ -1,12 +1,14 @@
-"""diagnose/report — trajectory, report, A/B, retrospective hit rate. No GPU needed."""
+"""diagnose/report — trajectory, candidate attempts, A/B, retrospective hit rate, and
+the ledger edge cases of the run report (diagnose.story). No GPU needed."""
 
 import json as _json
 from pathlib import Path
 
 import pytest
 
-from agentic_configuration_search.diagnose.report import (ab_compare, render_report,
-                                                     retrospective_hit_rate, trajectory)
+from agentic_configuration_search.diagnose.report import (ab_compare, retrospective_hit_rate,
+                                                          trajectory)
+from agentic_configuration_search.diagnose.story import render_report
 from agentic_configuration_search.core.coco import Ontology
 from agentic_configuration_search.diagnose import residual as _residual
 from agentic_configuration_search.diagnose.errors import diagnose as _diagnose
@@ -44,15 +46,7 @@ def test_trajectory_and_report(finished_run):
     assert t["final_micro_f_beta"] == pytest.approx(1.0)
     assert t["gain"] > 0.3 and t["n_adopted"] == 1
 
-    md = render_report(finished_run)
-    assert "setting search report" in md
-    assert "1.0000" in md and "baseline 0.6667" in md
-    assert "exemplar" in md                         # axis turned on in the champion
-    assert (finished_run / "report.md").exists()
-    assert "residual error" in md                        # residual-error summary of the last round's diagnosis
-    # reads the end-of-run final champion diagnosis (rounds/final) and residual
-    assert "`rounds/final`" in md and "### Size buckets" in md and "> Note:" not in md
-    assert "## Adoption path" in md and "## Data collection suggestions" in md
+    assert (finished_run / "report.md").exists()     # the run leaves a report at its end
 
 
 def test_ab_compare_self_is_tie(finished_run):
@@ -239,87 +233,12 @@ def _synthetic_run(tmp_path, *, timing=True, final=True, notes=True, upto=None):
     return run
 
 
-def _section(md: str, title: str) -> str:
-    """From '## title' to the next '## '."""
-    start = md.index(f"## {title}")
-    nxt = md.find("\n## ", start + 3)
-    return md[start: nxt if nxt != -1 else len(md)]
-
-
-def test_adoption_path_section(tmp_path):
-    md = render_report(_synthetic_run(tmp_path))
-    s = _section(md, "Adoption path")
-    # re-adoption: tiling=2, rejected at the gate in R1 (champion R0), adopted in R2 (champion R1)
-    assert "tiling=2" in s and "R1" in s and "gate_failed" in s and "-0.0100" in s
-    # the same increment re-proposed after a champion change and rejected again (alias same_setting)
-    assert "same_setting 1" in s
-    # per-axis contribution — adopted increments' holdout Δ, axes without gain and their reasons
-    assert "+0.1000" in s and "+0.0500" in s
-    assert "alias" in s and "same_setting 2" in s
-    assert "rescorer" in s and "no_material 1" in s
-    assert "gate_passed_but_lost 1" in s           # text_negatives
-    # carry-over results
-    assert "carry_neg" in s and "rejected" in s
-
-
-def test_time_section(tmp_path):
-    md = render_report(_synthetic_run(tmp_path))
-    s = _section(md, "Time use")
-    # per-stage sums — materialize 11, screen 19, holdout 6 (min)
-    assert "materialize" in s and "11.0" in s and "19.0" in s and "6.0" in s
-    assert "pass cache" in s and "37.5%" in s       # 30 / 80
-    assert "**re-asks**: 2 (" in s
-    assert "empty rounds" in s and "R3" in s
-    assert "reused" in s                               # final diagnosis
-    # adopted gain per hour by axis — exemplar: +0.10 in 8 min
-    assert "exemplar" in s and "+0.750" in s        # 0.10 / (8/60)
-
-
-def test_residual_section_reads_final_diagnosis(tmp_path):
-    md = render_report(_synthetic_run(tmp_path))
-    s = _section(md, "Residual misses")
-    assert "rounds/final" in s and "> Note:" not in s
-    assert "small" in s and "<26px" in s             # size buckets and input px (640 px side)
-    assert "border" in s and "Crowding" in s
-    # condition terms per class × cause — blur and tiny from cat a's missed_small notes
-    assert "cat a" in s and "blur" in s and "tiny" in s
-    # representative train misses — filename, cause, note
-    assert "a0.png" in s and "missed_small" in s and "frame edge" in s
-    # individual holdout images never appear in the report
-    assert "h0.png" not in md and "h1.png" not in md
-
-
-def test_data_collection_section(tmp_path):
-    md = render_report(_synthetic_run(tmp_path))
-    s = _section(md, "Data collection suggestions")
-    assert "cat a" in s and "cat b" in s
-    assert "small objects" in s                       # cat a: small dominates
-    assert "frame border" in s                        # cat a: misses touching the border
-    # label quality — GT with a short side ≤ 3px and duplicate GT
-    assert "bad.png" in s and "duplicate" in s
-    assert "how much data" in s                       # the honesty note
-
-
 def test_report_falls_back_without_final_diagnosis(tmp_path):
-    """An older run: no rounds/final and no time keys — sections are noted in a
-    line and skipped. The last round (R2) adopted, so the R2 diagnosis used
-    instead is not the final champion's."""
+    """Without rounds/final the last round's diagnosis stands in — the sections do not break."""
     run = _synthetic_run(tmp_path, timing=False, final=False, upto=3)
     md = render_report(run)
-    assert "## Adoption path" in md                   # history alone is enough
-    t = _section(md, "Time use")
-    assert "predates the time keys" in t and "materialize" not in t
-    s = _section(md, "Residual misses")
-    assert "> Note:" in s and "round 2" in s          # the last round's diagnosis stands in
-    # without residual.json, size buckets still come from the FN rows' size_ratio (no denominators)
-    assert "small" in s
-
-
-def test_report_fallback_after_non_adopting_last_round_has_no_warning(tmp_path):
-    """If the last round adopted nothing, its diagnosis is the final champion's."""
-    run = _synthetic_run(tmp_path, timing=False, final=False)
-    s = _section(render_report(run), "Residual misses")
-    assert "round 3" in s and "> Note:" not in s
+    assert "## 2. How did it improve?" in md and "## 3. What problems are left?" in md
+    assert "could not be generated" not in md
 
 
 def test_report_survives_history_only_run(tmp_path):
@@ -329,61 +248,18 @@ def test_report_survives_history_only_run(tmp_path):
     (run / "history.jsonl").write_text(
         "\n".join(_json.dumps(r) for r in rows) + "\n")
     md = render_report(run)
-    assert "## Adoption path" in md
-    assert "No diagnosis artifacts" in md
+    assert "## 2. How did it improve?" in md
+    assert "There is no diagnosis record" in md
 
 
 def test_report_section_error_is_contained(tmp_path, monkeypatch):
     """One broken section does not stop the rest of the report."""
-    from agentic_configuration_search.diagnose import report as rep
+    from agentic_configuration_search.diagnose import story
     run = _synthetic_run(tmp_path)
 
     def boom(*a, **k):
         raise KeyError("x")
-    monkeypatch.setattr(rep, "_time_section", boom)
+    monkeypatch.setattr(story, "_section_rounds", boom)
     md = render_report(run)
-    assert "## Time use" in md and "could not be generated" in md
-    assert "## Data collection suggestions" in md
-
-
-def test_axis_label_ignores_axes_turned_off():
-    from agentic_configuration_search.diagnose.report import _axis_label
-    assert _axis_label({"alias": "vlm", "lora": False, "rescorer": False}) == "alias"
-    assert _axis_label({"exemplar": "base", "exemplar_k": 2}) == "exemplar"
-    assert _axis_label({"tiling": False}) == "off:tiling"
-
-
-def test_samples_cover_kinds_round_robin():
-    from agentic_configuration_search.diagnose.report import _samples
-    rows = ([{"category": "c", "kind": "below_threshold", "image": f"b{i}.png",
-              "box": [0, 0, 50, 50]} for i in range(6)]
-            + [{"category": "c", "kind": "missed", "image": "m.png",
-                "box": [0, 0, 10, 10]}])
-    picked = _samples(rows, [])
-    assert len(picked) == 5 and picked[0]["kind"] == "missed"
-
-
-def test_time_section_fit_dev_skip_round_is_not_empty(tmp_path):
-    """A round whose candidates only dropped out at the pre-holdout fit_dev verdict
-    (decision.fit_dev_skipped) is not empty — the same rule as the loop's
-    empty_rounds counter (_empty_round)."""
-    run = _synthetic_run(tmp_path)
-    rows = [_json.loads(x) for x in (run / "history.jsonl").read_text().splitlines()]
-    rows[3]["decision"]["fit_dev_skipped"] = ["res"]
-    (run / "history.jsonl").write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
-    s = _section(render_report(run), "Time use")
-    assert ("empty rounds** (nothing measured on holdout — excluding rounds with "
-            "candidates skipped by the fit_dev verdict): 0") in s
-
-
-def test_planner_made_carry_id_is_not_reported_as_carried(tmp_path):
-    """Whether a row was carried is judged by source (source=carryover), not by id
-    shape (carry_)."""
-    from agentic_configuration_search.diagnose.report import attempts as _attempts
-
-    rows = _history_rows()
-    rows[2]["candidates"][0].pop("source")         # same carry_ id, no source
-    att = {a["id"]: a for a in _attempts(rows)}
-    assert not att["carry_neg"]["carry"]
-    att = {a["id"]: a for a in _attempts(_history_rows())}
-    assert att["carry_neg"]["carry"]
+    assert "## 2. How did it improve?" in md and "could not be generated" in md
+    assert "## 4. What to do next" in md

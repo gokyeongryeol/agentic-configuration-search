@@ -216,7 +216,7 @@ planner's input for the same round.
   candidates are `carry_<original id>` (e.g. `carry_r1_cand_1`) — only carried
   candidates made by the loop (`source: carryover`) are exempt from the prefix.
   If the planner imitates a `carry_` id, `carry_` is stripped and the round
-  prefix added (the report also tells carried rows by source). The deterministic
+  prefix added (carried rows are told by source, not by id shape). The deterministic
   planner uses the same `cand_<i>` as the LLM planner. The id is the candidate's
   material and arm folder name (`settings/<id>/`) as is — it is put in
   folder-safe characters (`A-Za-z0-9_.-`) before deduping within the round, so a
@@ -408,7 +408,8 @@ runs/<dataset>/run/
   rounds/final/        # final champion diagnosis (diagnosis, diagnosis_key, crop_notes) + residual.json
   lora_cache/          # tail training output (tuned_tail.pt) per training key — reused within the run
   classifier_cache/    # crop classifier artifact per training key — reused within the run
-  report.md            # output of acs report
+  report.md            # run report (written at run end, redrawn by acs report)
+  report_assets/       # report figures (chart PNGs, photo JPEGs)
 ```
 
 - **Candidate ids** get an `r<round>_` prefix before recording; only carried
@@ -428,22 +429,41 @@ runs/<dataset>/run/
 
 ### Report
 
-`acs report <run_dir>` reads only the run's artifacts (no GPU) and writes
-`report.md`. A section whose artifacts are missing is noted in a line and
-skipped (older runs still render).
+`report.md` (`diagnose/story.py`) is a run report for readers without the
+technical background. It is written automatically at the end of a run and
+`acs report <run_dir> [--config c.yaml]` redraws it (no GPU, no LLM); figures go
+to `report_assets/`. The order is at a glance → the data (counts, sizes,
+crowding, representative photos) → attempts and the score chart by round → the
+remaining error patterns with example photos → data suggestions. Its material
+(trajectory, candidate attempts, the final diagnosis bundle) is read by
+`diagnose/report.py`.
 
-| section | contents |
-|---|---|
-| header, round trajectory, candidates tried | final holdout F(β) and Δ vs. baseline, the champion and adopted increment per round, per-candidate fit_dev, holdout, gate Δ, CI lower bound and outcome |
-| adoption path | increments rejected or skipped under an earlier champion that came back and were adopted after a champion change (re-adoptions — earlier outcome and Δ/CI) and how many were rejected again (by reason), holdout Δ per adopted increment, per-axis tries, adoptions and outcome distribution (axes never adopted), carry-over (`carry_*`) results |
-| time use | run and round wall clock (`dur_s`), minutes by stage (materialize, screen, holdout), by outcome and by axis with adopted Δ per hour (`wall_min`), pass cache hit rate, re-asks and empty rounds, whether the final diagnosis was reused |
-| FP/FN causes over rounds | the holdout counts by cause of the champion entering each round, and their changes |
-| residual misses | for the final champion (`rounds/final`; otherwise the last round's diagnosis with a warning): per-class FN/GT; FN/GT by size bucket (with px at the 640 px detector input side), cause × size, crowding (GT per image), border contact and elongation; condition terms from crop notes (class × cause); representative train misses (5 per class, filename, box, note) |
-| data collection suggestions | a one-line suggestion per class from GT count, miss rate, main cause, main size and condition terms (read as a method problem when below_threshold dominates); label quality flags (GT with a short side ≤ 3 px, duplicate GT, localization share) |
-
-Holdout is aggregate-only in every section — samples and filenames come only
-from train. The amount of data needed is not estimated (no learning curve is
-measured).
+- Technical terms reach it only through the `STRATEGY`, `CAUSE` and
+  `_OUTCOME_GROUPS` tables. A new axis, error cause or skip reason must be added
+  to them too (`test_story`).
+- Scores and counts are holdout aggregates; example photos come from train only.
+- Example captions are the VLM crop notes as written; without a note, a fixed
+  sentence built from the cause and size is used.
+- The score is the holdout score. The holdout is reused for adoption decisions,
+  so the report says scores "may come out a little better than on photos never
+  seen before", and warns when `holdout_split` is not valid (test as a
+  stand-in).
+- `rounds/final` counts as the final diagnosis only when the champion id in its
+  diagnosis key matches the current champion (after a resume, a failed final
+  diagnosis of the new champion leaves the old files behind). Otherwise the last
+  round's diagnosis stands in (stale): the summary and sections 3 and 4 say so,
+  and no "final" bars are drawn. A run whose final diagnosis failed does not use
+  `residual.json`. Without a holdout diagnosis, sections 3 and 4 are skipped.
+- Example photos are picked only from rows of train files, and captions are
+  numbered only for photos actually drawn. A photo that cannot be opened drops
+  only that photo.
+- The data suggestions split the remaining errors into "more photos are likely
+  to reduce" (not seen, too small to see, background taken for an object, taken
+  for another kind), "a decision-rule problem" (low confidence, duplicates, tile
+  fragments) and "check found areas and label rules" (area off target). If the
+  first is under 30% of the remaining errors, the decision rule and label rules
+  come first. The number of photos needed is not stated — no learning curve is
+  measured.
 
 ### Prediction
 
