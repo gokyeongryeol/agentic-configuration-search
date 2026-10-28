@@ -72,7 +72,7 @@ def test_crop_notes_batches_and_isolates_failure(dataset_root, tmp_path):
     seen = []
 
     def chat(messages, **kw):
-        idx = [p["text"] for p in messages[0]["content"]
+        idx = [p["text"] for p in messages[-1]["content"]
                if p["type"] == "text" and p["text"].startswith("crop ")]
         seen.append(len(idx))
         if len(seen) == 1:
@@ -103,7 +103,7 @@ def test_crop_notes_artifact_and_replay(dataset_root, tmp_path):
     assert notes and notes[0]["note"] == "반사광으로 보인다"
     assert notes[0]["kind"] == "background" and notes[0]["image"] == img
     # multimodal message: one image part + data URI
-    parts = calls[0][0]["content"]
+    parts = calls[0][-1]["content"]          # the user message after the system one
     uris = [p for p in parts if p.get("type") == "image_url"]
     assert len(uris) == 1
     assert uris[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
@@ -140,3 +140,37 @@ def test_crop_notes_empty_detail_skips_chat(dataset_root, tmp_path):
                                 lambda m, **k: calls.append(1),
                                 tmp_path / "crop_notes.json")
     assert notes is None and calls == []
+
+
+def test_describe_prompt_defines_every_error_kind():
+    """The description prompt defines every kind the diagnosis emits, and says what class= means and what not to do."""
+    from agentic_configuration_search.core.metrics import FN_KINDS, FP_KINDS
+    from agentic_configuration_search.diagnose import describe
+
+    low = " ".join(describe.SYSTEM.lower().split())
+    for kind in FP_KINDS + FN_KINDS:
+        assert f"{kind} =" in low, kind
+    assert "class is the class the detector predicted" in low
+    assert "do not restate the error kind" in low
+    assert "upscaling is ours" in low
+    assert "train split" not in low
+
+
+def test_describe_sends_system_and_exact_schema():
+    from agentic_configuration_search.diagnose import describe
+
+    seen = {}
+
+    def chat(messages, **kw):
+        seen["messages"], seen["schema"] = messages, kw["schema"]
+        return {"notes": [{"crop": 0, "note": "a red cap"}, {"crop": 1, "note": "a cup"}]}
+    batch = [{"crop": 0, "kind": "background", "category": "cat a"},
+             {"crop": 1, "kind": "missed", "category": "cat b"}]
+    out, _raw, err = describe._describe_batch(chat, batch, ["data:,a", "data:,b"])
+    assert err is None and out == {0: "a red cap", 1: "a cup"}
+    assert seen["messages"][0] == {"role": "system", "content": describe.SYSTEM}
+    notes = seen["schema"]["schema"]["properties"]["notes"]
+    assert notes["minItems"] == notes["maxItems"] == 2
+    assert notes["items"]["properties"]["crop"]["enum"] == [0, 1]
+    assert notes["items"]["properties"]["note"]["maxLength"] <= 200
+    assert notes["items"]["additionalProperties"] is False

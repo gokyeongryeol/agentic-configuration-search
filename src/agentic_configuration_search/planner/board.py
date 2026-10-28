@@ -241,6 +241,9 @@ def board_lines(history: list[dict], values: dict, status, *, disabled=(),
         else:
             out.append(f"Clearly lost under this champion (not prescreened on this run): "
                        f"{ev}.")
+    doc = _axis_doc_line(values, disabled)
+    if doc:
+        out.append(doc)
     src = _source_line(values, disabled)
     if src:
         out.append(src)
@@ -248,6 +251,27 @@ def board_lines(history: list[dict], values: dict, status, *, disabled=(),
         out.append("Disabled on this dataset (never turn these on; the champion keeps any "
                    "it already has): " + ", ".join(banned))
     return out
+
+
+# What each axis does — by name alone, base vs fn_arm is chosen from the record
+# only. The negative axes are explained by _source_line, tiling by the prompt's
+# TILING_RULE
+AXIS_DOC = {
+    "exemplar": ('exemplar = visual example prompts from ground-truth crops ("base" = '
+                 'typical crops; "fn_arm" = base plus crops of objects the detector missed)'),
+    "alias": ('alias = one extra text phrase per class, mined from captions of '
+              'ground-truth crops ("vlm" = a vision LLM looks at the crops and names them)'),
+    "rescorer": "rescorer = per-class score recalibration learned on fit_train",
+    "lora": "lora = fine-tunes the detector itself",
+    "crop_classifier": "crop_classifier = re-classifies detected boxes with a trained crop "
+                       "classifier",
+}
+
+
+def _axis_doc_line(values: dict, disabled=()) -> str:
+    """One line on what each axis that is not off does."""
+    docs = [doc for a, doc in AXIS_DOC.items() if a in values and a not in disabled]
+    return ("What the axes do: " + "; ".join(docs) + ".") if docs else ""
 
 
 def _source_line(values: dict, disabled=()) -> str:

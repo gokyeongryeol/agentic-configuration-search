@@ -53,7 +53,9 @@ def _fakes():
 
 
 def _materialize(dataset_root, out_dir):
-    cfg = config_from_dict({"dataset": str(dataset_root)})
+    # the fixture GT boxes are 20px — the minimum side goes below that so the alias
+    # caption source is not empty
+    cfg = config_from_dict({"dataset": str(dataset_root), "mine": {"caption_min_side": 16}})
     ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
     return materialize(cfg, ds, AXES, out_dir, seed=0, **_fakes())
 

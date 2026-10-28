@@ -77,7 +77,7 @@ def _fakes():
                                  for r in rows},
         refine_alias_fn=lambda name, cn, pool, others: {"alias": None,
                                                         "reason": "none"},
-        refine_negatives_fn=lambda name, cn, pool, mk: {"keep": [],
+        refine_negatives_fn=lambda name, cn, pool, mk, src: {"keep": [],
                                                         "rejected": []},
         client=object())
 

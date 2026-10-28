@@ -184,3 +184,19 @@ def crop_bounds(size, bbox_xyxy, padding: float = 1.0) -> tuple[int, int, int, i
 def crop_image(image: Image.Image, bbox_xyxy, padding: float = 1.0) -> Image.Image:
     """Crop a bbox (expanded by the padding factor, clamped to image bounds)."""
     return image.crop(crop_bounds(image.size, bbox_xyxy, padding))
+
+
+MIN_VLM_CROP_PX = 96     # lower bound on the short side of a crop sent to the VLM —
+                         # error and GT crops are often tens of px, too small as is
+                         # for the VLM to make out the shape
+
+
+def upscale_for_vlm(crop: Image.Image, min_px: int = MIN_VLM_CROP_PX) -> Image.Image:
+    """Upscale keeping the aspect ratio when the short side is below min_px — shared by every crop sent to a VLM."""
+    w, h = crop.size
+    short = min(w, h)
+    if short <= 0 or short >= min_px:
+        return crop
+    scale = min_px / short
+    return crop.resize((max(1, round(w * scale)), max(1, round(h * scale))),
+                       Image.LANCZOS)

@@ -281,6 +281,12 @@ class MineCfg:
     visual_negative_exclude_gt_iom: float = 0.7
     embedder_model: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"  # gated — HF_TOKEN, or cache + HF_HUB_OFFLINE=1
     device: str = "cuda:0"                # device for the embedding and crop-classifier workers
+    # Alias caption source — this many GT crops per class, apart from the served
+    # exemplars (same selection rule as exemplars); crops whose short side is below
+    # caption_min_side px are left out. On small crops the captioner gives no
+    # phrase or a wrong one
+    caption_crops_per_class: int = 6
+    caption_min_side: int = 32
     text_negatives_max_per_class: int = 1
     text_aliases: dict = field(default_factory=dict)  # manual aliases — always override generated ones
 
@@ -411,6 +417,12 @@ def _validate(cfg: Config) -> None:
                           f"use null (no cap) ({cfg.subsample.max_images})")
     if not (0.0 < cfg.subsample.center_ratio <= 1.0):
         raise ConfigError(f"subsample.center_ratio: outside (0,1] ({cfg.subsample.center_ratio})")
+    if cfg.mine.caption_crops_per_class < 1:
+        raise ConfigError("mine.caption_crops_per_class: must be at least 1 "
+                          f"({cfg.mine.caption_crops_per_class})")
+    if cfg.mine.caption_min_side < 2:
+        raise ConfigError("mine.caption_min_side: must be at least 2 — the smallest "
+                          f"croppable side ({cfg.mine.caption_min_side})")
     if cfg.rescorer.fit_threads < 1:
         raise ConfigError(f"rescorer.fit_threads: must be >= 1 ({cfg.rescorer.fit_threads})")
     if cfg.rescorer.max_train_rows is not None and cfg.rescorer.max_train_rows < 1:

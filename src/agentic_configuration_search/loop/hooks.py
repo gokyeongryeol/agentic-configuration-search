@@ -73,9 +73,9 @@ def build_hooks(cfg: Config, repo_root: Path, out_dir: Path, *,
                 llm_base, cfg.planner.model, name, cn, pool,
                 other_captions=others))
         hooks["refine_negatives_fn"] = (
-            lambda name, cn, pool, mk: phrases.refine_negatives(
+            lambda name, cn, pool, mk, src: phrases.refine_negatives(
                 llm_base, cfg.planner.model, name, cn, pool,
-                max_keep=mk))
+                max_keep=mk, source=src))
 
     from ..infer import embedder
 

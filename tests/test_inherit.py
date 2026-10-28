@@ -39,7 +39,9 @@ def test_inherit_plan_keeps_unchanged_axes():
 
 def test_inherited_materials_are_byte_identical(dataset_root, tmp_path):
     """Carried-over materials are byte-identical to the parent, and no re-mining happens."""
-    cfg = config_from_dict({"dataset": str(dataset_root)})
+    # the fixture GT boxes are 20px — the minimum side goes below that so the alias
+    # caption source is not empty
+    cfg = config_from_dict({"dataset": str(dataset_root), "mine": {"caption_min_side": 16}})
     ds = load_dataset(dataset_root, seed=0, fit_train_ratio=0.8)
     calls = {"encode": 0, "caption": 0}
 

@@ -125,6 +125,50 @@ def gt_exemplars(train: Split, ontology: Ontology, cache: CropCache, params,
     return exemplars, chosen_ann_ids
 
 
+def caption_sources(train: Split, ontology: Ontology, cache: CropCache, params,
+                    encode_fn, rng) -> tuple[dict[str, list[PromptBox]], dict]:
+    """Alias caption source — params.caption_crops_per_class GT crops per class.
+
+    Apart from the served exemplars (with exemplar_base_per_class=1 each class has
+    a single crop). Crops whose short side is below params.caption_min_side px are
+    left out, and the rest are picked by the same rule as exemplars (embeddings for
+    kcenter/mean, rng for random). A class with no large crop has no source.
+    Returns (sources, {class: {pool, large_enough, chosen}})."""
+    img_by_id = {e.id: e for e in train.images}
+    src: dict[str, list[PromptBox]] = {}
+    report: dict[str, dict] = {}
+
+    def large(a):
+        return min(a.bbox_xyxy[2] - a.bbox_xyxy[0],
+                   a.bbox_xyxy[3] - a.bbox_xyxy[1]) >= params.caption_min_side
+    prefetch = getattr(encode_fn, "prefetch", None)
+    if prefetch is not None and params.exemplar_selection != "random":
+        # all classes before the per-class calls (as in gt_exemplars) — the full
+        # crop paths go in, so the cache entries are the ones exemplar selection uses
+        wanted = {cid: cache.paths[cid] for cid, anns in sorted(cache.prompt_pool.items())
+                  if any(large(a) for a in anns)}
+        if wanted:
+            prefetch(wanted)
+    for cid, anns in sorted(cache.prompt_pool.items()):
+        name = ontology.id_to_name[cid]
+        ok = [j for j, a in enumerate(anns) if large(a)]
+        k = min(params.caption_crops_per_class, len(ok))
+        report[name] = {"pool": len(anns), "large_enough": len(ok), "chosen": k}
+        if not k:
+            continue
+        if params.exemplar_selection == "random":
+            picked = embedder.select_indices("random", k, len(ok), rng=rng)
+        else:
+            emb = np.asarray(encode_fn(cid, cache.paths[cid]))[ok]
+            picked = embedder.select_indices(params.exemplar_selection, k, len(ok),
+                                             embeddings=emb,
+                                             outlier_mad=params.kcenter_outlier_mad)
+        src[name] = [PromptBox(class_name=name,
+                               image=str(train.image_path(img_by_id[anns[ok[j]].image_id])),
+                               bbox_xyxy=anns[ok[j]].bbox_xyxy) for j in picked]
+    return src, report
+
+
 # -------------------------------------------------------- FP/FN pool mining
 
 def mine_pools(train: Split, ontology: Ontology, dets_by_image: list, *,
@@ -374,6 +418,9 @@ def alias_candidates(pools: dict[str, list[str]], class_names: list[str],
             continue
         pool = pools.get(name, [])
         if not pool:
+            # the captioner gave no phrase — skipping silently hides why there is no material
+            report["rejected"][name] = ("empty caption pool (no captioner answer, or "
+                                        "nothing left after normalization)")
             continue
         report["pools"][name] = dict(Counter(pool).most_common())
         others = {n: p for n, p in pools.items() if n != name and p}
@@ -400,11 +447,13 @@ def alias_candidates(pools: dict[str, list[str]], class_names: list[str],
 
 
 def text_negative_candidates(pools: dict[str, list[str]], class_names: list[str],
-                             refine_fn, max_keep: int) -> tuple[dict[str, list[str]], dict]:
+                             refine_fn, max_keep: int,
+                             source: str) -> tuple[dict[str, list[str]], dict]:
     """Negative-crop caption pools -> per-class suppression phrase **candidates** (adoption is the loop gate's call).
 
-    refine_fn(name, class_names, pool, max_keep) -> {"keep", "rejected"} —
-    safety filters (rules 1-4) are applied by phrases.refine_negatives.
+    refine_fn(name, class_names, pool, max_keep, source) -> {"keep", "rejected"} —
+    safety filters (rules 1-4) are applied by phrases.refine_negatives. source is
+    where the pools came from (the text_negatives value).
     """
     report: dict = {"pools": {}, "keep": {}, "rejected": {}}
     mined: dict[str, list[str]] = {}
@@ -413,7 +462,7 @@ def text_negative_candidates(pools: dict[str, list[str]], class_names: list[str]
         if not pool:
             continue
         report["pools"][name] = dict(Counter(pool).most_common())
-        refined = refine_fn(name, class_names, pool, max_keep)
+        refined = refine_fn(name, class_names, pool, max_keep, source)
         report["keep"][name] = refined.get("keep", [])
         report["rejected"][name] = refined.get("rejected", [])
         if refined.get("keep"):

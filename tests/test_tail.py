@@ -166,7 +166,7 @@ def _fakes():
                                  for r in rows},
         refine_alias_fn=lambda name, cn, pool, others: {"alias": pool[0],
                                                         "reason": "t"},
-        refine_negatives_fn=lambda name, cn, pool, mk: {"keep": pool[:1],
+        refine_negatives_fn=lambda name, cn, pool, mk, src: {"keep": pool[:1],
                                                         "rejected": []},
         client=object())
 

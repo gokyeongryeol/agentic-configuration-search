@@ -462,7 +462,6 @@ def _constraint_lines(disabled, status) -> list[str]:
              ("- Do not turn lora and crop_classifier on together in one candidate "
               "(skipped=\"compound_server_state\"); add one at a time.")
              if len(state) == 2 else None,
-             "- Never repeat an exact combination already tried.",
              "- A tiling grid folded under the current champion (see the Axis board) is "
              "dropped as skipped=\"tiling_blocked\"."
              if "tiling" not in disabled else None]
@@ -885,6 +884,7 @@ candidate was dropped):
 {glossary}
 {older}
 ## Diagnosis digest
+{error_kinds}
 Error kinds this round (train + held-out) and the axes you can propose now for them.
 HEURISTIC hints, not rules: a count says how much is at stake if the axis
 works, not that it will — weigh it against per-class counts and the samples.
@@ -910,14 +910,23 @@ this time; otherwise "") and a short "rationale"."""
 TILING_RULE = """- "tiling" is a grid g: every image is also cut into g x g tiles and each tile
   is detected at magnification (g-1)(1-overlap)+1 (1.5x at g=2, 2x at g=3 with
   the default overlap 0.5). Cost: 1 + g^2 detector passes per image. Pick the
-  first grid from the missed-small sizes in the diagnosis (shown while a larger grid can
-  be proposed and tiling is not OFF): the grid whose
+  first grid from the missed-small sizes in the diagnosis: the grid whose
   magnification brings the typical missed object to a detectable size, no
   larger. Raise g only when the previous grid was used and helped while
   small-object misses remain; a grid the screen did not use folds that grid and
   larger ones until the champion changes (the Axis board shows the fold and a
   one-time exception).
 """
+
+# meaning of the error kinds the diagnosis digest and detail use — all of
+# core.metrics FP_KINDS and FN_KINDS
+ERROR_KINDS = (
+    "Error kinds: background = a false detection where no object of interest is; "
+    "class_confusion = detected as the wrong class; localization = right class, but the "
+    "box misses the object; duplicate = an extra box on an already-detected object; "
+    "tiling_artifact = a false detection from the tiled passes only; missed = a "
+    "ground-truth object not detected at all; missed_small = a small object not "
+    "detected; below_threshold = detected, but scored below the class threshold.")
 
 # explanations carried only when a history row has that field — next to the data, only what is needed
 GLOSSARY = (
@@ -1249,6 +1258,7 @@ class LLMPlanner:
                     tiling_rule=TILING_RULE if "tiling" not in self.disabled_axes else "",
                     older=("Earlier rounds, one line each:\n" + "\n".join(older) + "\n"
                            if older else ""),
+                    error_kinds=ERROR_KINDS,
                     digest="\n".join(digest) or "- (no errors observed)",
                     small_block=small,
                     diagnosis=diag_text,

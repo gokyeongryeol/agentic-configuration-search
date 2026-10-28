@@ -279,12 +279,12 @@ def test_alias_manual_priority_and_conflict():
 def test_text_negative_candidates_keep_flow():
     pools = {"cat a": ["red herring", "red herring"], "cat b": []}
 
-    def refine_fn(name, class_names, pool, max_keep):
-        assert max_keep == 5
+    def refine_fn(name, class_names, pool, max_keep, source):
+        assert max_keep == 5 and source == "fp_crop"   # the source reaches the refiner
         return {"keep": ["red herring"], "rejected": []}
 
     mined, report = mine.text_negative_candidates(pools, ["cat a", "cat b"],
-                                                  refine_fn, max_keep=5)
+                                                  refine_fn, max_keep=5, source="fp_crop")
     assert mined == {"cat a": ["red herring"]}
     assert "cat b" not in report["pools"]          # empty pool is skipped
 
