@@ -190,9 +190,8 @@ class Rescorer:
         d = json.loads(path.read_text())
         if "alphas" not in d:
             raise ValueError(
-                f"{path} is a legacy (single-alpha) artifact; the rescorer now uses "
-                "per-class α — "
-                "re-fit the rescorer by rerunning the loop")
+                f"{path} has no per-class α (alphas) — re-fit the rescorer by "
+                "rerunning the loop")
         got = d.get("fingerprint") or {}
         if expect is not None and got != expect:
             raise ValueError(

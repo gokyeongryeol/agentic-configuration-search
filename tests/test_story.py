@@ -28,7 +28,7 @@ def test_vocab_covers_every_axis_error_kind_and_skip_reason():
     assert set(AXES) - story._QUANTITY_KEYS <= set(story.STRATEGY)
     assert set(metrics.FP_KINDS) | set(metrics.FN_KINDS) <= set(story.CAUSE)
     from agentic_configuration_search.loop import runner
-    from agentic_configuration_search.planner import llm
+    from agentic_configuration_search.planner.axis_status import UNMEASURED
     reasons = set()
     for p in PKG.rglob("*.py"):
         text = p.read_text()
@@ -37,7 +37,7 @@ def test_vocab_covers_every_axis_error_kind_and_skip_reason():
         reasons |= set(re.findall(r'_drop\(\w+, \w+, "(\w+)"', text))   # planner.axes
     assert {"no_change", "max_candidates", "invalid_axes", "same_setting"} <= reasons, \
         "the skip-reason regex no longer matches the code"
-    reasons |= set(llm._UNMEASURED) | set(runner.NOOP_SKIPS) | set(runner.FIT_DEV_SKIPS)
+    reasons |= set(UNMEASURED) | set(runner.NOOP_SKIPS) | set(runner.FIT_DEV_SKIPS)
     reasons |= {"gate_failed", "gate_passed_but_lost", "screen_top_k", "adopted"}
     missing = reasons - set(story._OUTCOME_GROUPS)
     assert not missing, f"skip reasons missing from the plain-word table: {missing}"

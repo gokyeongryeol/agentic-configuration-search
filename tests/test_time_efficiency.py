@@ -174,13 +174,14 @@ def test_blocked_tiling_is_dropped_before_materialize(big_root, tmp_path,  # noq
 
 
 def test_prompt_states_tiling_cost_and_fold_rule():
-    from agentic_configuration_search.planner.llm import PROMPT
+    from agentic_configuration_search.planner.axis_status import AxisStatus
+    from agentic_configuration_search.planner.llm import TILING_RULE, _constraint_lines
 
-    assert "1 + g^2" in PROMPT
-    assert "tiling_blocked" in PROMPT
-    flat = " ".join(PROMPT.split())
-    assert "fold the axis" in flat and "used and helped" in flat
+    flat = " ".join(TILING_RULE.split())
+    assert "1 + g^2" in flat and "used and helped" in flat
+    assert "folds that grid and larger ones" in flat
     assert "first grid from the missed-small sizes" in flat
+    assert any("tiling_blocked" in l for l in _constraint_lines((), AxisStatus(2)))
 
 
 def test_small_block_reports_missed_small_input_px_and_grid_magnification():
@@ -385,7 +386,8 @@ def test_candidate_rows_carry_wall_minutes(big_root, tmp_path,  # noqa: F811
 
 
 def test_compact_history_and_prompt_show_cost():
-    from agentic_configuration_search.planner.llm import _compact_history, _cost_lines
+    from agentic_configuration_search.planner.board import _cost_cell, axis_costs
+    from agentic_configuration_search.planner.llm import _compact_history
 
     cands = [{**_row("t2", 2, used=False, skipped="axis_unused"),
               "wall_min": {"materialize": 1.0, "screen": 50.0, "total": 51.0},
@@ -399,10 +401,11 @@ def test_compact_history_and_prompt_show_cost():
     row = _compact_history(hist)[1]["candidates"][0]
     assert row["wall_min"] == 51.0
     assert row["tiling_f"] == {"tiled": 0.4, "untiled": 0.5}
-    lines = _cost_lines(hist)
-    assert lines[0].startswith("- tiling=4: median 144 min")   # most expensive first
-    assert any(x.startswith("- exemplar: median 12 min") for x in lines)
-    assert _cost_lines([_entry(0, 0, [])]) == []                # no block before anything is recorded
+    costs = axis_costs(hist)
+    assert _cost_cell("tiling", costs) == \
+        "g2 51 (n=1, max 51), g4 144 (n=1, max 144)"            # per grid
+    assert _cost_cell("exemplar", costs) == "12 (n=1, max 12)"
+    assert axis_costs([_entry(0, 0, [])]) == {}                 # nothing before anything is recorded
 
 
 # --- T5: material summary on same_setting rows ---------------------------------
@@ -478,26 +481,25 @@ def test_history_rows_carry_round_pass_cache_counts(big_root, tmp_path,  # noqa:
 
 # --- folded-axis hints -----------------------------------------------------------
 
-def test_folded_axis_lines_under_current_champion():
-    from agentic_configuration_search.planner.llm import _folded_axis_lines
+def test_board_folds_tiling_only():
+    """"Folding" is for tiling grids only — other axes left unused repeatedly are handled by the axis status (OFF)."""
+    from agentic_configuration_search.planner.axes import axis_values
+    from agentic_configuration_search.planner.axis_status import axis_status
+    from agentic_configuration_search.planner.board import board_lines
 
     ex = {"id": "e1", "axes": validate_axes({"exemplar": "base"}),
           "skipped": "axis_unused", "unused_axes": ["exemplar"]}
-    ex2 = {"id": "e2", "axes": validate_axes({"exemplar": "fn_arm"}),
-           "skipped": "axis_unused", "unused_axes": ["exemplar"]}
     t2 = _row("t2", 2, used=False, skipped="axis_unused")
-    # once is not a fold (tiling is folded by the gate)
-    one = _folded_axis_lines([_entry(0, 0, []), _entry(1, 0, [ex])])
-    assert one == []
-    hist = [_entry(0, 0, []), _entry(1, 0, [ex, t2]), _entry(2, 0, [ex2])]
-    lines = _folded_axis_lines(hist)
-    assert any(x.startswith("- exemplar: screened and not used by 2") and "fn_arm" in x
-               for x in lines)
-    assert any("tiling: grid >= 2 is folded" in x for x in lines)
-    assert sum("tiling" in x for x in lines) == 1
+    hist = [_entry(0, 0, []), _entry(1, 0, [ex, t2])]
+    rows = {l.split(" | ")[0]: l.split(" | ")
+            for l in board_lines(hist, axis_values(), axis_status(hist, 2)) if " | " in l}
+    assert "grid >= 2 folded" in rows["tiling"][6] and rows["tiling"][2] == "-"
+    assert "folded" not in rows["exemplar"][6]
     # a champion change starts over
-    moved = hist + [_entry(3, 3, [], champ_axes={"alias": "vlm"})]
-    assert _folded_axis_lines(moved) == []
+    moved = hist + [_entry(2, 2, [], champ_axes={"alias": "vlm"})]
+    rows = {l.split(" | ")[0]: l.split(" | ")
+            for l in board_lines(moved, axis_values(), axis_status(moved, 2)) if " | " in l}
+    assert "folded" not in rows["tiling"][6]
 
 
 def test_prescreen_is_only_for_grid_increases(monkeypatch):

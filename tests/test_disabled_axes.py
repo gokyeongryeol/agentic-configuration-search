@@ -131,8 +131,9 @@ def test_llm_prompt_omits_disabled_values(tmp_path):
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path,
                disabled_values={"exemplar": ("fn_arm",)}).propose([], _diag({}))
-    assert "- exemplar: one of ['none', 'base']" in seen["prompt"]
-    assert "never turn these on" in seen["prompt"] and "exemplar='fn_arm'" in seen["prompt"]
+    row = next(l for l in seen["prompt"].splitlines() if l.startswith("exemplar | "))
+    assert "fn_arm" not in row.split(" | ")[2] and "base" in row.split(" | ")[2]
+    assert "never turn these on" in seen["prompt"] and "exemplar=fn_arm" in seen["prompt"]
 
 
 def test_loop_rejects_unknown_disabled_value(dataset_root, tmp_path):

@@ -51,7 +51,7 @@ def encode_crops_many(repo_root: Path, jobs: list[tuple[list[Path], Path]], mode
     """Embed several crop groups with **one worker run** (one model load).
 
     jobs: [(crop_paths, log_path)] — each job leaves a manifest and .npy named by
-    its log_path stem (for post-hoc analysis, the same names as before). The
+    its log_path stem (for post-hoc analysis). The
     worker log goes to the first job's log_path; the other jobs' logs point to
     it. Returns (N_j, D) L2-normalized arrays in input order — an empty job is
     not sent to the worker and is (0, 1).

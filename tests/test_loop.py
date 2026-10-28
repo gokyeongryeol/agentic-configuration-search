@@ -262,12 +262,11 @@ def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
     from agentic_configuration_search.loop import runner as runner_mod
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
-    # Non-ASCII (Korean) note on purpose: the prompt JSON must use ensure_ascii=False.
     monkeypatch.setattr(runner_mod.describe, "crop_notes",
                         lambda split, diag, chat, out: [
                             {"crop": 0, "kind": "background", "category_id": 1,
                              "image": "x.png", "box": [1, 2, 3, 4],
-                             "note": "반사광으로 보인다"}])
+                             "note": "looks like a glare reflection"}])
     seen = {}
 
     def chat(messages, **kw):
@@ -276,7 +275,7 @@ def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=chat, rounds=1, **_fakes())
-    assert "crop_notes" in seen["prompt"] and "반사광" in seen["prompt"]
+    assert "glare reflection" in seen["prompt"]          # the note column of the sample table
 
 
 def test_resume_honors_saturation_and_writes_summary(big_root, tmp_path,
@@ -442,8 +441,8 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
     assert "r1_ok_tiling" in rec and rec["r1_ok_tiling"].get("skipped") != "invalid_axes"
 
 
-def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
-    """The drop reason must reach the next round's prompt to break the repetition."""
+def test_invalid_axes_reason_reaches_next_prompt(big_root, tmp_path, monkeypatch):
+    """The drop reason (English reason) must reach the next round's prompt to break the repetition."""
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     prompts: list = []
 
@@ -462,7 +461,8 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     planner_prompts = [p for p in prompts if "Round history" in p]
     assert len(planner_prompts) >= 2
     assert "invalid_axes" in planner_prompts[1]
-    assert "exemplar_fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
+    assert "exemplar_fn_k applies only with exemplar=fn_arm" in planner_prompts[1], \
+        "the violation (reason) must be carried too, or the repetition does not stop"
 
 
 def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
@@ -919,7 +919,7 @@ def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_pa
 
 
 def test_compact_history_and_prompt_carry_neg_eta():
-    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history, _glossary
     from agentic_configuration_search.planner.axes import validate_axes
 
     b = validate_axes({})
@@ -930,7 +930,7 @@ def test_compact_history_and_prompt_carry_neg_eta():
                              "neg_eta_grid": [0.25, 0.5, 0.75]}]}]
     row = _compact_history(hist)[1]["candidates"][0]
     assert row["neg_eta_used"] == [0.25] and row["neg_eta_grid"] == [0.25, 0.5, 0.75]
-    assert "neg_eta_used" in PROMPT
+    assert "neg_eta_used" in _glossary([{"candidates": [row]}])   # explained when a row has it
 
 
 def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,
@@ -1091,8 +1091,9 @@ def test_candidate_turning_off_lora_is_skipped_not_adopted(big_root, tmp_path,
 
 
 def test_prompt_says_detector_state_axes_stay_on():
-    from agentic_configuration_search.planner.llm import PROMPT
-    assert "detector_state_off" in PROMPT
+    from agentic_configuration_search.planner.llm import _constraint_lines
+    from agentic_configuration_search.planner.axis_status import AxisStatus
+    assert any("detector_state_off" in l for l in _constraint_lines((), AxisStatus(2)))
 
 
 def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path,
@@ -1167,7 +1168,7 @@ def test_skipped_unused_exemplar_keeps_modality_scores(big_root, tmp_path,
 
 def test_compact_history_and_prompt_carry_modality_scores():
     from agentic_configuration_search.planner.axes import validate_axes
-    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history, _glossary
 
     b = validate_axes({})
     hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
@@ -1179,7 +1180,7 @@ def test_compact_history_and_prompt_carry_modality_scores():
     assert row["modality"] == {"text_won": 1, "semantic_won": 0,
                                "closest_text_margin": 0.2}
     assert "modality_f" not in row          # the full per-class record stays in the history file
-    assert "closest_text_margin" in PROMPT
+    assert "closest_text_margin" in _glossary([{"candidates": [row]}])
 
 
 def test_modality_summary_size_does_not_grow_with_classes():

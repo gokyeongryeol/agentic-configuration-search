@@ -90,7 +90,9 @@ _OUTCOME_ALIASES = {
         "fit_dev_identical", "same_setting", "champion_combo", "combo_tried",
         "carried_duplicate", "duplicate_axes", "no_change"),
     "not actually used on this data, so skipped": ("axis_unused", "tiling_blocked"),
-    "the material it needs was not found, so skipped": ("no_material",),
+    "turned off for this run after several tries without effect, so skipped": (
+        "axis_retired",),
+    "the material or training data it needs was short, so skipped": ("no_material",),
     "more than one round can test, so skipped": ("max_candidates",),
     "turned off for this run, so skipped": ("axis_disabled", "disabled_axes"),
     "the proposal was malformed, so skipped": ("invalid_axes",),

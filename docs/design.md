@@ -190,10 +190,14 @@ planner's input for the same round.
   screen: `tiling_blocked`, `axis_unused`, `same_setting`, `no_material`, …),
   the round is not closed — the planner is asked again within the same round
   (`planner.max_reasks`, default 1, 0 = off). The follow-up carries each
-  candidate's rejection reason, note and served material; diagnosis and
-  champion are reused. Re-asked candidates go through the same filters, screen
-  and holdout and stay in the same round's history as `reask: k`. LLM planner
-  only (the deterministic planner is not re-asked).
+  candidate's skip code with an English reason and the served material;
+  diagnosis and champion are reused. Re-asked candidates go through the same
+  filters, screen and holdout and stay in the same round's history as
+  `reask: k` — only the axis status (`axis_retired`) counts from the round's
+  start, to match the re-ask prompt's axis board. If the re-ask call fails, the
+  failure is kept in `proposal_reask<k>.json` and the round closes (the
+  remaining `max_reasks` are not used). LLM planner only (the deterministic
+  planner is not re-asked).
 - **combination dedup**: an axes combination already tried in the run is
   dropped as `combo_tried`, except one that failed with `skipped: error` (OOM,
   worker failure — not a measurement): it is allowed once more
@@ -340,22 +344,38 @@ planner's input for the same round.
   this is the planner's only input. Holdout is exposed as aggregates only.
 - Candidate axes are read as an increment over the current champion. The LLM
   planner and human candidates list only the axes they change; omitted axes
-  keep the champion's value (turning one off takes an explicit `false`).
-  Filling them from the baseline would evaluate the champion with its axes
-  silently off.
+  keep the champion's value (turning one off takes its off value — `"none"` for
+  exemplar, `false` for the others).
 - The LLM planner (vLLM, guided JSON) only proposes — the holdout gate decides.
   Prompts and responses are saved, so `--resume` replays them without the LLM
-  (same-round re-asks too, `proposal_reask<k>.json`).
-  The prompt is rebuilt every round; when it exceeds the estimated-token budget
-  (server context − output cap), the history window shrinks first. Response
-  length is bounded by the schema (rationale, id, candidate count). A reply
-  that does not parse as JSON is asked once more (one-off degeneration); if it
-  still fails, the round falls back to deterministic, and the warning and the
-  proposal's `error` keep the finish reason (`finish_reason`), the token count
-  and the head and tail of the reply. One call
-  per round, plus at most one follow-up in the same conversation when the
-  planner repeats carried candidates: those are dropped as
-  `carried_duplicate` and the freed slots are asked for again.
+  (same-round re-asks too, `proposal_reask<k>.json`). Response length is
+  bounded by the schema (rationale, id, candidate count). A reply that does not
+  parse as JSON is asked once more (one-off degeneration); if it still fails,
+  the round falls back to deterministic, and the warning and the proposal's
+  `error` keep the finish reason, the token count and the head and tail of the
+  reply. Fallback candidates carry `source: fallback`, and `run_summary.json`
+  lists the fallback rounds with their reason (`planner_fallbacks` — it should
+  be empty). One call per round, plus at most one follow-up in the same
+  conversation when the planner repeats carried candidates: those are dropped
+  as `carried_duplicate` and the freed slots are asked for again.
+- **The prompt is English only.** A candidate row's `note` is a sentence for
+  people and is not carried; a skip reaches the prompt as its code and an
+  English `reason` built from structured fields (`planner.llm._REASON` — the
+  arm verdict numbers in `arm_gate`, the violated rule of an invalid candidate
+  in `invalid`, the empty axis, the exception type, the prescreen size). A new
+  skip code needs a reason there too (a test blocks it). `dataset_notes` should
+  be English; the planner logs a warning otherwise. The stored key `test`
+  (holdout) is carried as `held_out` (`held_out_micro_f_beta`, the error
+  detail's `held_out`).
+- **Prompt budget.** The budget is the planner server's context minus the
+  output cap and template slack — the context the attached server reports
+  (`/v1/models`), else `planner.launch.max_model_len` (32768). When the prompt is
+  over, the budget ladder shrinks it in order: history window 3 → 2 → 1, then
+  half the diagnosis samples, then no samples, then window 0 — the last round's
+  detail is worth more than the samples, since why the last candidates lost is
+  the most direct evidence for the next proposal. The step used is kept in the
+  proposal (`budget`). If even the last step is over, the prompt is not sent and
+  the round falls back with a `PromptOverBudget` reason.
 - The other paths on the same vLLM follow the same rule: negative and alias
   phrase refinement, the VLM crop captioner and the FP/FN crop notes ask once
   more on an unparseable reply, and if that fails too each takes its own
@@ -363,34 +383,119 @@ planner's input for the same round.
   notes). Crop notes are a diagnostic signal only and never decide anything.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
-- The prompt is organized in sections.
-
-  | Section | Content |
-  |---|---|
-  | Rules | axis increment rules; how to read the gate, `fit_dev_cmp`, the tiling fold and skip reasons |
-  | Budget | rounds left, stop counters (rounds without adoption vs `saturation.rounds`, empty rounds in a row vs `saturation.empty_rounds`), per-axis median of observed wall clock per candidate (axes not yet observed get a static note — tiling 1+g² passes, tail and classifier training, rescorer refit) |
-  | Current champion | axes on, holdout and fit_dev micro F, adoption round, passes per image |
-  | Axis ledger | per (axis=value) under the current champion: tries (alone), best fit_dev Δ (upper bound), best holdout Δ (lower bound — shown only), status (clearly-lost (prescreened), near-miss, folded, unused, no_material, …), minutes spent. Below it, one line of combinations already tried |
-  | Allowed moves | tiling fold and a grid opened once by the near-miss exception, folded axes, axes with empty material, prescreened values with their evidence, carried candidates, untried axes (below) |
-  | Round history | the last 3 rounds in per-candidate detail (JSON), earlier rounds one line each (adopted increment and Δ, or no adoption and the number of candidates) |
-  | Diagnosis digest | counts per cause (train, holdout) and the axes that target it, missed-small sizes, per-class aggregates and samples |
-  | Response | per candidate `axes`, `expected_gain` (expected holdout Δ), `cost_min` (expected minutes), `differs` (for a variant of a clearly-lost value, what is different) and `rationale` |
-
-  **Untried axes are suggested first (guidance only, nothing is blocked).**
-  Allowed moves carries an "Untried axes under the current champion" line —
-  function axes that are not disabled, still have a value to turn on besides
-  the champion's, and were never measured under the current champion (a
-  quantity-axis variant counts for its function axis; rows dropped without
-  being measured do not count) — and, among them, axes never proposed in the
-  whole run. One rule sentence: while untried axes remain, prefer one over
+- **Prompt sections.** Objective → Hard constraints (conditions whose breach
+  drops a candidate without evaluation — visual_negatives without an exemplar,
+  turning a detector-state axis off, turning lora and crop_classifier on
+  together, repeating a combination, a folded tiling grid, OFF axes; lines
+  about disabled axes are left out) → Rules (general rules only — the tiling
+  grid, its cost and how to pick the first grid only when tiling is not
+  disabled) → Budget (rounds left, stop counters) → Current champion → Axis
+  board → Round history (the last `MAX_HISTORY` = 3 rounds in detail, earlier
+  rounds one line each; explanations of the detail rows' fields — fit_dev_cmp,
+  tiling_used, unused_axes, modality, neg_eta_used, same_as,
+  gate_passed_but_lost, lost_values, wall_min, material — follow right below,
+  only for fields present in some row) → Diagnosis digest (per cause, this
+  round's count in train and held-out and the axis=values that can be proposed
+  now for it — left out: disabled axes, values the data blocks, values the
+  champion already uses, OFF axes, values with empty material under the current
+  champion, tiling grids at or below the champion's or folded, and
+  visual_negatives without an exemplar champion. A cause whose remedies are all
+  left out says "no axis to propose now"; only a cause with no remedy at all is
+  "not addressable by a setting") → the missed-small block (only when a grid
+  larger than the champion's can be proposed, listing those grids) → error
+  detail tables (per-class aggregates per split — gt, miss rate, FN and FP by
+  cause — and train error samples — cause, class, score or size, box size, crop
+  note) → Dataset notes (when `dataset_notes` is set) → Response. The filter
+  blocks every tried combination; the prompt carries only what is worth
+  proposing again.
+- **Axis board (`planner/board.py`).** One row per function axis gathers the
+  facts for deciding, so the same fact is not repeated in other words across
+  sections. Columns: status (ON · OPEN · PROBE · OFF — see axis retirement
+  below — and BLOCKED or "PROBE (nothing to propose now)" when nothing can be
+  proposed now), propose (the values and quantity keys that may be proposed
+  now — values the data blocks, folded tiling grids, the champion's value and
+  values with empty material under the current champion are left out), run (the
+  whole-run record, round × axis), champion (the best fit_dev / held-out Δ and
+  status per value under the current champion — `planner.ledger`; k variants of
+  the champion's value and narrow losses first, numbers for the first two and
+  names and status for the rest), min (median, count and max of observed
+  minutes per candidate — per grid for tiling; axes not observed yet get facts
+  in the note) and note (constraints of that axis alone — detector state,
+  needs exemplar, folded, too little data, OFF axes only together with a non-OFF
+  axis, every remaining value mined empty or untrained). The legend states the
+  off value per axis and when a value with empty material may be proposed
+  again. Below the table come only details the rows point to — the evidence for
+  the one-time tiling exception, prescreened values, the negative-source
+  explanation, disabled axes and values, the axis retirement rule, the combos
+  tried under the current champion (those under it, and earlier ones that do not
+  turn the current champion's axes off) and carried candidates. axis_status,
+  ledger and gates decide; the board only presents.
+- **Untried axes are suggested first (guidance only, nothing is blocked).** An
+  axis whose run column says "never tried in this run" (axes that cannot be
+  proposed alone now — BLOCKED, or visual_negatives without an exemplar
+  champion — say "not tried" instead and are not targets) is preferred over
   another variant of an already-tried value unless the diagnosis gives a
-  concrete reason. With few candidates per round the order is the budget. The
-  deterministic planner is unchanged.
-
-  If the response's `expected_gain`, `cost_min` or `differs` is missing or
+  concrete reason (one sentence in the Rules). The basis is the axis status's
+  try count (a quantity variant counts for its function axis; rows dropped
+  without being measured do not count). With few candidates per round the order
+  is the budget. The deterministic planner is unchanged.
+- If the response's `expected_gain`, `cost_min` or `differs` is missing or
   malformed only that field is dropped — the candidate is neither discarded
   nor sent to the deterministic planner. They are recorded as the candidate
   row's `plan`.
+
+### Axis retirement — turning off axes without effect during a run
+
+The axis ledger looks only under the current champion and resets when the
+champion changes, so the same axis is retried from scratch under every
+champion and an axis that lost several times on holdout keeps taking slots.
+`planner/axis_status.py` decides a status per function axis (ON · OPEN · OFF ·
+PROBE) from the **whole run's** history (`search.axis_retire_after`, default 2;
+`null` records only and turns nothing off).
+
+- **Each round counts once per axis** (quantity axes fold into their function
+  axis). If any candidate that changed the axis that round wins, it is a
+  success; if its measured outcomes are all failures, one failure — three
+  variants losing in one round are still one. A tie between failure kinds takes
+  a fixed order (held-out > fit_dev > arm > equal > unused), so the same history
+  gives the same status.
+  - Failure: the held-out gate failed, clearly lost on fit_dev (`fit_dev_lost`,
+    `lost_value_prescreen`), equal to the champion (`fit_dev_identical`, and
+    `same_setting` with `same_as: champion`), the arm's own verdict
+    (`rescorer_identity`, `lora_gate`, `classifier_gate` — that arm axis only),
+    the setting did not use the axis (`unused_axes` — the unused axis only; the
+    row's other axes take the row's outcome).
+  - A combination's outcome goes to every axis it changed. Which one is to
+    blame cannot be told apart, but retirement needs consecutive failures, so
+    an axis that wins once comes back.
+  - Success (streak back to 0): adopted, or passed the gate but lost.
+  - Not counted: **no material** (`no_material` and `empty_axis` — including
+    the classifier and tail fine-tune tripwires; a problem of the value), a
+    setting equal to a sibling's or an earlier candidate's (`same_as: sibling|tried`),
+    outside screen's top K, and unmeasured drops. A candidate that only turns an
+    axis off does not try it.
+- After `axis_retire_after` failures in a row the axis is OFF. A candidate whose
+  changed function axes are **all** OFF is recorded as `axis_retired` by the
+  shared filter without evaluation; a combination with an open axis is not
+  blocked.
+- When the champion changes, OFF axes reopen once as PROBE — one more failure
+  turns them OFF again. Axes the champion has on are ON.
+- **LLM planner only.** The deterministic planner is the A/B control and stays
+  as is. Human and carried candidates are not blocked, for the same reason as
+  the tiling fold, and neither are the deterministic fallback candidates of a
+  round where the LLM failed (`source: fallback`) — a safety net that knows
+  nothing of OFF, so blocking them would make an empty round.
+- `same_as` (champion, sibling, tried) on same-setting rows reaches the prompt
+  too, so the planner can read which ones counted as failures.
+- `axis_retired` rows are not tried combinations (`tried_combos`, the prompt's
+  combo list) — they were not measured, so the combination can be proposed again
+  once the axis reopens.
+- It reads held-out gate results. "What to try next" is within what the holdout
+  may change (the core invariant); it never touches materials or thresholds.
+- `scripts/planner_replay.py` measures the effect: for each round of a recorded
+  run it asks the planner again with and without OFF (vLLM only, no detector)
+  and compares the proposals on OFF axes, hygiene failures and hits on the
+  adopted candidate.
 
 ## Outputs reference
 
@@ -422,6 +527,8 @@ runs/<dataset>/run/
   in the LLM response — an empty one becomes `cand_<i>` (re-ask `reask<k>_<i>`),
   and a clash gets `_2`, `_3`….
 - **History fields**: candidate rows carry `wall_min`, `reask`, `fit_dev_cmp`,
+  `same_as` (same_setting rows), `arm_gate` (arm verdict numbers), `invalid`
+  (the violated rule of an invalid candidate),
   `lost_values`, `plan`, `delta_reused` / `classifier_reused` (origin of a
   reused tail or classifier training) and `classifier_lambda` (the arm's best λ,
   or the λ an ordinary candidate re-chose, with `classifier_lambda_grid`),

@@ -53,7 +53,7 @@ def run_tail_candidate(cfg, ds, base_axes: dict, materials, out_dir: Path, *,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if len(ds.fit_train.images) < cfg.lora.min_images:
-        dec = {"adopted": False,
+        dec = {"adopted": False, "tripwire": True,
                "reason": f"fit_train {len(ds.fit_train.images)} images < "
                          f"min_images {cfg.lora.min_images} — training skipped"}
         _write(out_dir, dec, [])

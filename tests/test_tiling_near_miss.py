@@ -353,11 +353,14 @@ def test_config_knobs_defaults_and_validation():
 # --- prompt -----------------------------------------------------------------------
 
 def test_prompt_rule_paragraph_states_the_exception():
-    from agentic_configuration_search.planner.llm import PROMPT
+    from agentic_configuration_search.planner.axis_status import AxisStatus
+    from agentic_configuration_search.planner.llm import (TILING_RULE, _constraint_lines,
+                                                          _glossary)
 
-    flat = " ".join(PROMPT.split())
-    assert "gap_ub" in flat and "exactly once" in flat
-    assert "tiling_blocked" in flat
+    flat = " ".join(TILING_RULE.split())
+    assert "one-time exception" in flat                      # the evidence is below the axis board
+    assert "gap_ub" in _glossary([{"candidates": [{"tiling_used": False}]}])
+    assert any("tiling_blocked" in l for l in _constraint_lines((), AxisStatus(2)))
 
 
 def test_small_block_reports_champion_tp_floor():
@@ -373,11 +376,16 @@ def test_small_block_reports_champion_tp_floor():
     assert "median" in text and "champion TP" not in text
 
 
-def test_llm_folded_lines_carry_the_exception():
-    from agentic_configuration_search.planner.llm import _folded_axis_lines
+def test_axis_board_carries_the_exception():
+    from agentic_configuration_search.planner.axes import axis_values
+    from agentic_configuration_search.planner.axis_status import axis_status
+    from agentic_configuration_search.planner.board import board_lines
 
     hist = [_entry(0, 0, []), _entry(1, 0, [_unused("t2", 2)])]
-    assert any("ONCE" in ln for ln in _folded_axis_lines(hist))
+    lines = board_lines(hist, axis_values(), axis_status(hist, 2))
+    row = next(l for l in lines if l.startswith("tiling | "))
+    assert "open ONCE" in row
+    assert any(l.startswith("Tiling exception: grid 3 is open ONCE") for l in lines)
 
 
 # --- tiling_f of an adopted tiling candidate ----------------------------------------

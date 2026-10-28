@@ -111,7 +111,8 @@ def run_classifier_candidate(cfg, ds, base_axes: dict, materials, out_dir: Path,
                  lam, f, f - base_f)
 
     best = max(grid[1:], key=lambda g: (g["delta"], -g["lam"]))
-    dec = {"counts": counts, "lam": best["lam"], "delta": best["delta"]}
+    dec = {"counts": counts, "lam": best["lam"], "delta": best["delta"],
+           "margin": cc.margin}
     if source is not None:
         dec["classifier_reused"] = source
     if best["delta"] > cc.margin:

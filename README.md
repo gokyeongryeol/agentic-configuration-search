@@ -32,6 +32,7 @@ HF_HUB_OFFLINE=1 .venv/bin/acs run --config c.yaml             # → runs/<datas
 .venv/bin/acs ab runs/a runs/b                                  # compare two runs
 .venv/bin/python scripts/predict.py runs/<ds>/run --config c.yaml --split test   # final measurement
 .venv/bin/python scripts/ablate.py runs/<ds>/run --config c.yaml --gpu 4 --out ablate/<ds>.json   # marginal contribution per component
+.venv/bin/python scripts/planner_replay.py runs/<ds>/run --config c.yaml --out replay/<ds>.json     # planner proposals with vs without axis retirement
 scripts/run_parallel.sh --rounds 10                             # demo datasets in parallel across GPUs
 ```
 
@@ -89,8 +90,10 @@ details in the [axis reference](docs/design.md#axis-reference).
 | `dataset` · `rounds` · `beta` | required · 10 · 1.0 | dataset, round cap, β of F(β) |
 | `planner.kind` | `llm` | the vLLM planner. `deterministic` is the rule planner (A/B control, environments without an LLM) |
 | `planner.max_candidates` | 3 | candidates per round (1–3) |
-| `dataset_notes` | `""` | dataset description carried verbatim in the LLM prompt |
+| `dataset_notes` | `""` | dataset description carried verbatim in the LLM prompt (English — the prompt is English only) |
 | `search.disabled_axes` | `[]` | axes not to search |
+| `search.axis_retire_after` | 2 | LLM planner: an axis with this many rounds in a row without effect turns OFF until the champion changes. null = record only |
+| `planner.launch.max_model_len` | 32768 | planner server context — the basis of the prompt budget (the value an attached server reports wins) |
 | `gate.min_delta` | 0.005 | minimum Δ for adoption |
 | `saturation.rounds` | 5 | stagnant rounds before stopping |
 | `detector.device` · `mine.device` · `lora.device` | `cuda:0` · `cuda:0` · `cuda:0` | GPU placement (keep off the planner's GPU) |
@@ -105,7 +108,7 @@ weights, classifier artifact) through controls the CLI wires in.
 ```
 runs/<dataset>/run/
   history.jsonl       round ledger (per-candidate axes, outcome, gate, wall_min)
-  run_summary.json    stop reason, final champion, holdout_split, fit_train (training images, subset record), dataset
+  run_summary.json    stop reason, final champion, holdout_split, fit_train (training images, subset record), final_diagnosis, planner_fallbacks (rounds where the LLM planner fell back to deterministic, with the reason — should be empty), dataset
   fit_train_subset.json  fit_train subset (picked images, centers, coverage) — only when fit_train exceeds the cap
   champion.json       champion setting (axes, materials, weight paths, classifier blend λ)
   champion_eval.json  holdout evaluation, tau_test
@@ -127,7 +130,10 @@ runs/<dataset>/run/
 - Do not take down the vLLM planner server (GPU 3, port 8104). Start it with
   `scripts/start_vllm.sh`; check it with `curl 127.0.0.1:8104/health`. When
   sharing the GPU, lower its preallocation with e.g. `--gpu-mem 0.5` (default
-  0.9; 27B-FP8 weights are ~29 GB, so 0.5 ≈ 40 GB is near the floor).
+  0.9; 27B-FP8 weights are ~29 GB, so 0.5 ≈ 40 GB is near the floor — one
+  32k-context request's KV cache is ~9 GB). The context is `--max-len` (default
+  32768, the same as `planner.launch.max_model_len`); a run sets its prompt
+  budget from the context the attached server reports.
 - `scripts/run_parallel.sh` runs with `--resume` inside, so it is safe to
   restart. Logs go to `runs/_log_<ds>.txt`.
 - Deleting `runs/`: on NFS an open fd blocks it. Stop monitors, mv, then rm.
@@ -146,7 +152,7 @@ Layers `core ← clients ← infer ← fitting ← eval ← diagnose ← planner
 | `fitting/` | material mining (`mine.py`), rescorer, tail fine-tune, crop classifier |
 | `eval/` | screen (fit_dev), holdout evaluation and the adoption gate (`evaluate.py`) |
 | `diagnose/` | FP/FN cause classification, VLM notes, residual analysis, ledger readers (`report.py`), run report (`story.py`) |
-| `planner/` | axes schema, deterministic and LLM planners, tiling gate, axis ledger |
+| `planner/` | axes schema, deterministic and LLM planners, tiling gate, axis ledger, axis status and axis board |
 | `loop/` | round orchestration (`runner.py`), materialize, per-axis round wiring |
 | `services/` · `workers/` | subprocess and server management · one-shot GPU workers (`ACS_VLLM_VENV`; DINOv3 worker CPU threads and loaders via `ACS_EMBED_THREADS`, `ACS_EMBED_LOADERS`, default min(8, cores), min(4, cores)) |
 

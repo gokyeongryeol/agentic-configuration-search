@@ -11,10 +11,9 @@ Encoding: pooler_output, else the CLS token → L2 normalization, in mini-batche
 
 One run takes **several manifests (jobs)** — the model is loaded once. DataLoader
 worker processes decode and preprocess crops ahead of time (overlapping the GPU
-forward), and batches come in plan order. Batches never cross a manifest
-boundary and are cut every BATCH from 0 within each manifest, so the forward
-runs on the same input tensors as before (one worker run per manifest) — the
-output does not change.
+forward), and batches come in plan order. Batches are cut every BATCH from 0
+within each manifest — they never mix jobs, so a manifest gets the same batches
+and the same forward whatever jobs run with it (the output is the same).
 """
 
 from __future__ import annotations
@@ -55,9 +54,8 @@ def read_jobs(path: str) -> list[tuple[str, str]]:
 
 class _CropBatches:
     """map-style dataset: index i = the i-th batch of the plan. Opens crops,
-    converts them to RGB and calls the processor per batch — the same call as
-    the old worker, so the same tensors come out. (It does not subclass torch
-    Dataset — DataLoader only uses __getitem__/__len__.)"""
+    converts them to RGB and calls the processor per batch. (It does not
+    subclass torch Dataset — DataLoader only uses __getitem__/__len__.)"""
 
     def __init__(self, jobs_paths, processor, batch, return_tensors="pt"):
         self.jobs_paths = jobs_paths

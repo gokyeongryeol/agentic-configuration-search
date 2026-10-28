@@ -32,7 +32,7 @@ def test_vllm_server_command():
     assert cmd[0] == str(external.VLLM_VENV / "bin" / "vllm")
     assert cmd[1:3] == ["serve", CFG.planner.model]
     assert "--gpu-memory-utilization" in cmd and "0.9" in cmd
-    assert "--max-model-len" in cmd and "16384" in cmd
+    assert "--max-model-len" in cmd and "32768" in cmd
     assert srv.env()["CUDA_VISIBLE_DEVICES"] == str(CFG.planner.launch.gpu)
     assert srv.env()["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert srv.health_url().endswith("/health")

@@ -85,6 +85,10 @@ def tried_combos(history: list[dict]) -> set[tuple]:
     errors: dict[tuple, int] = {}
     for entry in history:
         for c in entry.get("candidates", []):
+            # rows dropped by axis retirement were not measured — the combination
+            # must be proposable again once the axis reopens
+            if c.get("skipped") == "axis_retired":
+                continue
             keys = set()
             # requested_axes: the original request of a candidate relabelled
             # after measurement — the requested combination was tried too
@@ -95,7 +99,7 @@ def tried_combos(history: list[dict]) -> set[tuple]:
                 try:
                     axes = validate_axes(axes)
                 except ValueError:
-                    pass                  # old-format record — key it as-is
+                    pass                  # a record that does not validate — key it as-is
                 keys.add(tuple(sorted(axes.items())))
             for key in keys:
                 if c.get("skipped") == "error":

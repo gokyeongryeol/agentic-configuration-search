@@ -124,11 +124,11 @@ def test_fingerprint_mismatch_is_explicit_error(tmp_path):
             "ds-a", _Ont([(1, "a"), (2, "b")])))
 
 
-def test_legacy_scalar_alpha_artifact_rejected(tmp_path):
+def test_scalar_alpha_artifact_rejected(tmp_path):
     import json
     p = tmp_path / "rescorer.json"
     p.write_text(json.dumps({"alpha": 0.5, "model_file": "rescorer.pkl"}))
-    with pytest.raises(ValueError, match="is a legacy"):
+    with pytest.raises(ValueError, match="no per-class α"):
         Rescorer.load(p)
 
 

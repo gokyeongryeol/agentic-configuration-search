@@ -8,7 +8,6 @@ from agentic_configuration_search.config import config_from_dict
 from agentic_configuration_search.core.data import load_dataset
 from agentic_configuration_search.diagnose.story import strategy_label
 from agentic_configuration_search.loop.materialize import materialize
-from agentic_configuration_search.planner import llm
 from agentic_configuration_search.planner.axes import (AXES, NEGATIVE_AXES, DatasetFacts,
                                                        axis_values, validate_axes)
 from tests.test_materialize_purity import _fakes, _shuffle_holdout_gt
@@ -73,11 +72,12 @@ def test_report_label_names_the_source():
 
 
 def test_prompt_explains_only_open_sources():
-    two = llm._source_doc(axis_values(DatasetFacts(n_classes=2)))
-    one = llm._source_doc(axis_values(DatasetFacts(n_classes=1)))
+    from agentic_configuration_search.planner.board import _source_line
+    two = _source_line(axis_values(DatasetFacts(n_classes=2)))
+    one = _source_line(axis_values(DatasetFacts(n_classes=1)))
     assert "gt_crop" in two and "visual_negatives" in two
     assert "gt_crop" not in one and "fp_crop" in one
-    assert llm._source_doc(axis_values(), disabled=NEGATIVE_AXES) == ""
+    assert _source_line(axis_values(), disabled=NEGATIVE_AXES) == ""
 
 
 def test_remedy_covers_the_cause_specific_visual_sources():

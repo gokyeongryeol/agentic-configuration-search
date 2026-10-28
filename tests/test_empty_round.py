@@ -360,7 +360,7 @@ def test_diagnosis_is_reused_while_the_champion_is_unchanged(big_root, tmp_path,
     assert (r2 / "crop_notes.json").exists() or not (r1 / "crop_notes.json").exists()
     assert len(notes) == n_notes                          # the notes are not called again either
     # the planner gets the same diagnosis
-    assert "per_class" in calls[1][-1]["content"]
+    assert "Per class" in calls[1][-1]["content"]
 
 
 def test_diagnosis_is_recomputed_after_adoption_or_config_change(big_root, tmp_path,  # noqa: F811
@@ -391,3 +391,26 @@ def test_diagnosis_is_recomputed_after_adoption_or_config_change(big_root, tmp_p
                         screen=keep),
                resume=True, **_fakes())
     assert len(n_diag) == 4
+
+
+def test_failed_reask_closes_the_round(tmp_path):
+    """A failed re-ask call is None — the round closes even with max_reasks left. The
+    failure record stays as an artifact, and resume replays the same verdict without a call."""
+    from agentic_configuration_search.planner.llm import LLMPlanner
+
+    n = []
+
+    def chat(messages, **kw):
+        n.append(1)
+        if len(n) > 1:
+            raise RuntimeError("server down")
+        return _cands(("a", {"alias": "vlm"}))
+    p = LLMPlanner(chat=chat, artifact_dir=tmp_path)
+    p.propose([], {})
+    assert p.reask([], {}, [], k=1, taken={"a"}) is None and len(n) == 2
+    assert "server down" in json.loads(p.reask_path(1).read_text())["error"]
+
+    def boom(messages, **kw):
+        raise AssertionError("the replay called the LLM")
+    assert LLMPlanner(chat=boom, artifact_dir=tmp_path).reask(
+        [], {}, [], k=1, taken={"a"}) is None

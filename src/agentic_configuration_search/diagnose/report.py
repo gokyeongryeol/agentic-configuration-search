@@ -94,6 +94,8 @@ def _outcome(c: dict, evaluated: dict) -> str:
     holdout, or outside screen's top K."""
     if c.get("adopted"):
         return "adopted"
+    if c.get("empty_axis"):
+        return "no_material"              # a tripwire (too little training data) is no material too
     if c.get("skipped"):
         return str(c["skipped"])
     ev = evaluated.get(c.get("id"))

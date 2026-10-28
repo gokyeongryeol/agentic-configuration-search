@@ -136,8 +136,8 @@ def test_free_reask_replays_on_resume(big_root, tmp_path, monkeypatch):  # noqa:
 def test_prompt_lists_the_request_that_adopted_the_champion():
     """The tried-combination list carries the request that adopted the champion
     as the champion itself — the planner had read it as a new combination."""
-    from agentic_configuration_search.planner.llm import _ledger_block
+    from agentic_configuration_search.planner.llm import _combos_line
 
-    block = _ledger_block(_hist_with_relabeled_champion())
-    assert "{rescorer=True} = the request that adopted the current champion" in block
+    block = _combos_line(_hist_with_relabeled_champion())
+    assert "{rescorer=true} = the request that adopted the current champion" in block
     assert "champion_combo" in block
