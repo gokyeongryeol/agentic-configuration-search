@@ -312,11 +312,11 @@ def test_classifier_trains_on_fit_train_only(root, tmp_path, monkeypatch):
     assert gt_ids and not (gt_ids & fit_dev_anns)
 
 
-def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
+def test_classifier_tripwire_records_empty_axis(root, tmp_path, monkeypatch):
     """The classifier tripwire (too few training crops) cannot be decided up front —
     the background FP count is known only after inference. When it trips, the axis is
-    recorded as empty material (empty_axis) so it reaches the planner's dead-axis list —
-    the material stays the same until the champion changes."""
+    recorded as empty material (empty_axis), so the axis status counts it as no
+    material (the board's run column) — not as a failure."""
     import agentic_configuration_search.loop.adapt_round as ar
 
     _human_candidates_only(monkeypatch)
@@ -338,8 +338,9 @@ def test_classifier_tripwire_marks_axis_dead(root, tmp_path, monkeypatch):
     assert rec["skipped"] == "classifier_gate"
     assert rec["empty_axis"] == "crop_classifier"
 
-    from agentic_configuration_search.planner.llm import _dead_axis_lines
-    assert "- crop_classifier (values tried: True)" in _dead_axis_lines(hist)
+    from agentic_configuration_search.planner.axis_status import axis_status
+    s = axis_status(hist, 2).axes["crop_classifier"]
+    assert s.no_material == [True] and s.measured == 0     # the tripwire is not a failure
 
 
 def test_classifier_margin_rejection_is_not_dead(root, tmp_path, monkeypatch):

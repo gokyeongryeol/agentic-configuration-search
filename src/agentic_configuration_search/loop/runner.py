@@ -43,6 +43,7 @@ from ..fitting.materials import Materials
 from ..fitting.tail import split_identity
 from ..infer import gateway
 from ..planner import deterministic
+from ..planner.axis_status import axis_status
 from ..planner.deterministic import tried_combos
 from ..planner.gates import tiling_gate, tiling_shortfall
 from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
@@ -653,6 +654,23 @@ class Loop:
         if notes:
             diagnosis["train"]["crop_notes"] = notes
 
+    def _server_context(self) -> int | None:
+        """The context length the planner server reports — asked once and kept. If
+        it differs from the config's launch.max_model_len (attached to a server
+        that was already up), the server's value is the right one."""
+        if not hasattr(self, "_ctx"):
+            self._ctx = None
+            if self.llm_chat is None and self.cfg.planner.base_url:
+                from ..clients.llm import LLMClient
+                self._ctx = LLMClient(self.cfg.planner.base_url,
+                                      self.cfg.planner.model).max_model_len()
+                want = self.cfg.planner.launch.max_model_len
+                if self._ctx and self._ctx != want:
+                    log.warning("planner server context %d != config "
+                                "planner.launch.max_model_len %d — the prompt budget "
+                                "uses the server's value", self._ctx, want)
+        return self._ctx
+
     def _llm_planner(self, round_dir: Path) -> LLMPlanner:
         chat = self._planner_chat()
         if chat is None:
@@ -661,7 +679,7 @@ class Loop:
         return LLMPlanner(chat=chat, artifact_dir=round_dir,
                           max_candidates=self.cfg.planner.max_candidates,
                           notes=self.cfg.dataset_notes,
-                          token_budget=_token_budget(self.cfg),
+                          token_budget=_token_budget(self.cfg, self._server_context()),
                           disabled_axes=self.disabled_axes,
                           disabled_values=self.disabled_values,
                           facts=self._facts(),
@@ -669,11 +687,12 @@ class Loop:
                           tiling_tp_quantile=self.cfg.search.tiling_tp_quantile,
                           tiling_tp_min=self.cfg.search.tiling_tp_min,
                           budget=getattr(self, "_budget", None),
-                          prescreen=self._prescreen_info())
+                          prescreen=self._prescreen_info(),
+                          retire_after=self.cfg.search.axis_retire_after)
 
     def _prescreen_info(self) -> dict:
-        """The lost-value prescreen settings the planner prompt's allowed moves
-        carry — the subset size (without one — small, or max_share or more — the
+        """The lost-value prescreen settings the planner prompt's axis board
+        (planner.board) carries — the subset size (without one — small, or max_share or more — the
         full fit_dev)."""
         s = self.cfg.screen
         n_all = len(self.ds.fit_dev.images)
@@ -727,7 +746,8 @@ class Loop:
 
         The deterministic planner is not re-asked (None) — it is the fixed path
         and the A/B control. Neither is the LLM when its first call failed and
-        there is no conversation to continue."""
+        there is no conversation to continue, or when this re-ask call fails —
+        the round closes."""
         if self.cfg.planner.kind != "llm":
             return None
         rows = acc.skipped + [{k_: c[k_] for k_ in ("id", "axes")} | _requested(c)
@@ -738,13 +758,16 @@ class Loop:
         outcomes = acc.skipped + [r for r in rows[len(acc.skipped):] if r.get("skipped")]
         proposal = self._llm_planner(round_dir).reask(
             history, diagnosis, outcomes, k=k, taken={c["id"] for c in rows})
-        if proposal is None:              # no conversation to continue (first call failed)
+        if proposal is None:              # no conversation to continue, or the re-ask failed
             return None
         for c in proposal["candidates"] + proposal["dropped"]:
             c["reask"] = k
         so_far = history + [{"round": r, "champion": _champion_summary(champion),
                              "candidates": rows}]
-        fresh, dropped = self._filter(proposal["candidates"], so_far)
+        # the axis status counts from the round's start — the same verdict as the
+        # re-ask prompt (built from history)
+        fresh, dropped = self._filter(proposal["candidates"], so_far,
+                                      status_history=history)
         log.info("round %d: no candidate reached holdout, re-asked (%d) — %d new candidates",
                  r, k, len(fresh))
         return _with_round_ids({**proposal, "candidates": fresh,
@@ -752,10 +775,13 @@ class Loop:
                                 "stop": proposal["stop"] and not fresh},
                                r, {c["id"] for c in rows})
 
-    def _filter(self, merged: list[dict],
-                history: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _filter(self, merged: list[dict], history: list[dict], *,
+                status_history: list[dict] | None = None
+                ) -> tuple[list[dict], list[dict]]:
         """(kept, dropped) — the source-independent shared filter
-        (tiling_blocked, champion_combo, combo_tried)."""
+        (tiling_blocked, champion_combo, combo_tried) and axis_retired for LLM
+        candidates. The axis status counts over status_history (else history) — a
+        re-ask needs the round-start history to match its prompt."""
         # Common combo filter: regardless of source (LLM, deterministic, human),
         # block retrying **an already-tried full axes combination**. It works per
         # combination, not per (axis, value), so retrying the same axis after the
@@ -773,6 +799,10 @@ class Loop:
         # (planner.ledger) — candidates containing one are not blocked, only marked
         # (lost_values). Screen measures them on a subset first
         lost = lost_values(history) if self.cfg.screen.lost_value_prescreen else {}
+        # axes turned off during the run (planner.axis_status) — only LLM planner candidates are blocked
+        status = (axis_status(history if status_history is None else status_history,
+                              self.cfg.search.axis_retire_after)
+                  if self.cfg.planner.kind == "llm" else None)
         fresh, dropped = [], []
         for c in merged:
             # tiling fold gate (planner.gates) — screening a grid at or above an
@@ -783,6 +813,17 @@ class Loop:
                    if c.get("source") not in ("human", "carryover") else None)
             if why:
                 dropped.append({**c, "skipped": "tiling_blocked", "note": why})
+                continue
+            # axis retirement — rejected without evaluation when every function axis
+            # it changed is OFF. Human and carried candidates and the deterministic
+            # fallback (the safety net of a round the LLM failed — it knows nothing of
+            # OFF) pass
+            why = (status.block(c["axes"], champ_axes)
+                   if status is not None
+                   and c.get("source") not in ("human", "carryover", "fallback")
+                   else None)
+            if why:
+                dropped.append({**c, "skipped": "axis_retired", "note": why})
                 continue
             key = tuple(sorted(c["axes"].items()))
             if key in itself:
@@ -829,9 +870,10 @@ class Loop:
         if axis is None:
             return False
         log.info("candidate %s: %s material is empty, same as baseline — rejected", c["id"], axis)
-        # empty_axis is what the planner uses to collect "axes whose materials are
-        # empty on this dataset" regardless of the history window
-        # (planner.llm._dead_axis_lines) — so it never has to parse the note text.
+        # empty_axis is what the axis status uses to collect "values whose material
+        # is empty on this dataset" regardless of the history window (only for
+        # axes the candidate changed — planner.axis_status, the board's run
+        # column) — so it never has to parse the note text.
         skipped.append({**c, "skipped": "no_material", "empty_axis": axis,
                         "note": f"{axis} mining came back empty — this combination is identical "
                                 f"to the current one, so it is not evaluated"})
@@ -1119,14 +1161,14 @@ class Loop:
                        "note": f"{unused}: the screened setting does not use this axis — "
                                "same setting as champion, evaluation skipped"}
             else:
-                rec = {**c, "skipped": "same_setting",
+                rec = {**c, "skipped": "same_setting", "same_as": "champion",
                        "note": "served state equals the champion's — evaluation skipped"}
         elif fp in self._seen_fps:
-            rec = {**c, "skipped": "same_setting",
+            rec = {**c, "skipped": "same_setting", "same_as": "sibling",
                    "note": "served state equals another candidate's in this round — "
                            "evaluation skipped"}
         elif fp in self._tried_fps:
-            rec = {**c, "skipped": "same_setting",
+            rec = {**c, "skipped": "same_setting", "same_as": "tried",
                    "note": "served state equals a setting evaluated on holdout in an "
                            "earlier round — evaluation skipped"}
         else:
@@ -1591,7 +1633,12 @@ class Loop:
                    | _source_record(entry) | {"_wall": wall})
             screened.append(row)
             if not res["decision"].get("adopted"):
-                skipped.append({**c, "skipped": "lora_gate",
+                # the tripwire (training skipped for too few fit_train images) is short
+                # material — recorded as empty_axis like the classifier's, so the axis
+                # status does not count it as a failure
+                empty = ({"empty_axis": "lora"} if res["decision"].get("tripwire") else {})
+                skipped.append({**c, "skipped": "lora_gate", **empty,
+                                **_arm_gate_record(res["decision"]),
                                 "note": res["decision"].get("reason", ""),
                                 "wall_min": _wall_min(wall)} | _reuse_record(row))
                 continue
@@ -1683,12 +1730,14 @@ class Loop:
             screened.append(row)
             if not res["decision"].get("adopted"):
                 # The tripwire (too few training crops) keeps the same material
-                # until the champion changes — record the axis as empty so it reaches
-                # the planner's dead-axis list. It cannot be blocked up front because
-                # the background FP count is an inference result.
-                dead = ({"empty_axis": "crop_classifier"}
-                        if res["decision"].get("tripwire") else {})
-                skipped.append({**c, "skipped": "classifier_gate", **dead,
+                # until the champion changes — record the axis as empty (the axis
+                # status counts it as no material, not a failure). It cannot be
+                # blocked up front because the background FP count is an inference
+                # result.
+                empty = ({"empty_axis": "crop_classifier"}
+                         if res["decision"].get("tripwire") else {})
+                skipped.append({**c, "skipped": "classifier_gate", **empty,
+                                **_arm_gate_record(res["decision"]),
                                 "note": res["decision"].get("reason", ""),
                                 "wall_min": _wall_min(wall)} | _reuse_record(row)
                                | _classifier_lambda_record(row))
@@ -1794,6 +1843,8 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
         "champion": {"id": champion.get("id"), "axes": champion.get("axes"),
                      "micro_f_beta": (champion.get("eval") or {}).get("micro_f_beta")},
         "final_diagnosis": final_diag,
+        # rounds where the LLM planner fell back to deterministic — should be empty
+        "planner_fallbacks": _planner_fallbacks(loop.out_dir),
         # where report regeneration (acs report) finds the dataset again
         "dataset": str(loop.ds.root.resolve()),
         "finished_at": datetime.now().isoformat(timespec="seconds")})
@@ -1945,7 +1996,7 @@ def _neg_eta_record(c: dict) -> dict:
 # their safe point too
 _UNUSED_OFF = {
     "tiling": {"tiling": False},
-    "exemplar": {"exemplar": "none", "exemplar_k": None, "fn_k": None,
+    "exemplar": {"exemplar": "none", "exemplar_base_k": None, "exemplar_fn_k": None,
                  "visual_negatives": False, "visual_negative_k": None},
     "visual_negatives": {"visual_negatives": False, "visual_negative_k": None},
 }
@@ -2198,6 +2249,15 @@ def _source_record(c: dict) -> dict:
         | ({"remedy": c["remedy"]} if c.get("remedy") else {})
 
 
+def _arm_gate_record(decision: dict) -> dict:
+    """The numbers of an arm verdict failure (arm_gate: delta, margin, λ, tripwire) —
+    note is a sentence for people, so the planner prompt builds its reason from
+    this field (planner.llm._reason)."""
+    gate = {k: decision[k] for k in ("delta", "margin", "lam", "tripwire")
+            if decision.get(k) is not None}
+    return {"arm_gate": gate} if gate else {}
+
+
 def _reuse_record(c: dict) -> dict:
     """The origin of a run cache a detector-state arm used instead of training —
     lora: delta_reused ({"tail": {round, id}}, loop.tail_round._train_or_reuse),
@@ -2309,13 +2369,28 @@ def _with_round_ids(proposal: dict, r: int, taken: set) -> dict:
             "dropped": _round_ids(list(proposal.get("dropped") or []), r, taken)}
 
 
-def _token_budget(cfg) -> int:
+def _token_budget(cfg, server_ctx: int | None = None) -> int:
     """Prompt token budget (by the estimate) — the vLLM server context minus
-    the planner output cap and template slack. Even when attached to an
-    external server via base_url (actual context unknown), the launch value is
-    the reference."""
-    ctx = getattr(cfg.planner.launch, "max_model_len", 8192)
+    the planner output cap and template slack. The context the server reports
+    (server_ctx) if there is one, else the config's launch value."""
+    ctx = server_ctx or cfg.planner.launch.max_model_len
     return ctx - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
+
+
+def _planner_fallbacks(out_dir: Path) -> list[dict]:
+    """Rounds where the LLM planner fell back to deterministic, with the reason —
+    collected from proposal.json (the same on resume). Recorded in run_summary so
+    it does not pass silently."""
+    out = []
+    for p in sorted(Path(out_dir).glob("rounds/round_*/proposal.json")):
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if rec.get("fallback"):
+            out.append({"round": int(p.parent.name.split("_")[-1]),
+                        "error": str(rec.get("error") or "")[:300]})
+    return out
 
 
 def _winner_axes(winner: dict) -> tuple[dict, bool]:

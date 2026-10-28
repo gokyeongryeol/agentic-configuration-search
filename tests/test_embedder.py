@@ -66,7 +66,7 @@ def test_kcenter_duplicate_embeddings_return_distinct_indices():
 
 def test_zero_k_selects_nothing():
     """k=0 yields 0 under every strategy — if kcenter kept its seed,
-    exemplars_per_class=0 would silently produce 1 per class (diverging from mean)."""
+    exemplar_base_per_class=0 would silently produce 1 per class (diverging from mean)."""
     emb = np.array([[0.0, 0.0], [1.0, 1.0]])
     assert embedder.kcenter_greedy(emb, 0) == []
     assert embedder.mean_nearest(emb, 0) == []

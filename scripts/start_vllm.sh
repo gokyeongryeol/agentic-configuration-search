@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Start the shared vLLM planner on GPU 3 — every run attaches to it.
 #
-# Why a standalone script: launch code used to be inlined in several scripts, and
-# those copies had already drifted on --max-model-len (copy 8192 / actually served
-# 16384). Launching happens in exactly one place (run_parallel.sh calls this).
+# Why a standalone script: so launch arguments (--max-model-len etc.) do not split
+# into several copies, launching happens in exactly one place (run_parallel.sh calls this).
 #
 # Properties:
 #   · **Idempotent** — if health already returns 200, exit without doing anything.
@@ -14,7 +13,7 @@
 #     reported only after health comes up — starting runs without waiting would race:
 #     each sees a free port and launches its own vLLM.
 #
-# Usage: scripts/start_vllm.sh [--gpu 3] [--port 8104] [--max-len 16384] [--model NAME]
+# Usage: scripts/start_vllm.sh [--gpu 3] [--port 8104] [--max-len 32768] [--model NAME]
 #                              [--gpu-mem 0.9]
 #        scripts/start_vllm.sh --stop     # shut down (only when no run is using it)
 set -uo pipefail
@@ -22,12 +21,13 @@ cd "$(dirname "$0")/.."
 
 GPU=3
 PORT=8104
-MAXLEN=16384                       # the value actually served (the old inline copies had 8192)
+MAXLEN=32768                       # the same as the config default planner.launch.max_model_len
 MODEL=Qwen/Qwen3.8-27B-FP8
 # Share of GPU memory vLLM preallocates (weights + KV cache pool). The default
 # 0.9 equals planner.launch.gpu_memory_utilization when a run launches it. On a
 # shared GPU the floor is the weights — 27B-FP8 weights alone are ~29 GB, so 0.5
-# (~40 GB) on an 80 GB A100 leaves ~10 GB of KV cache.
+# (~40 GB) on an 80 GB A100 leaves ~10 GB of KV cache (one 32k-context request
+# takes ~9 GB — use 0.6 or more with many concurrent requests).
 GPU_MEM=0.9
 # Planner server venv. This is a **different variable** from the GPU worker venv
 # (ACS_VLLM_VENV, services/paths.py) — the two may diverge on this box. While the

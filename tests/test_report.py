@@ -74,9 +74,9 @@ def test_report_missing_run_errors(tmp_path):
 
 _BASE = {"exemplar": "none", "alias": False, "text_negatives": False,
          "visual_negatives": False, "tiling": False, "rescorer": False,
-         "lora": False, "crop_classifier": False, "exemplar_k": None,
-         "fn_k": None, "visual_negative_k": None, "text_negative_k": None}
-_EX = {**_BASE, "exemplar": "base", "exemplar_k": 4}
+         "lora": False, "crop_classifier": False, "exemplar_base_k": None,
+         "exemplar_fn_k": None, "visual_negative_k": None, "text_negative_k": None}
+_EX = {**_BASE, "exemplar": "base", "exemplar_base_k": 4}
 _EXT = {**_EX, "tiling": 2}
 
 

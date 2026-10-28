@@ -223,10 +223,11 @@ def select_candidate(grid: list[dict], margin: float) -> tuple[dict, dict]:
     if best["delta"] > margin:
         return best, {**info, "adopted": True, "rank": best["rank"],
                       "lam": best["lam"], "source": best["source"],
-                      "delta": best["delta"],
+                      "delta": best["delta"], "margin": margin,
                       "reason": f"fit_dev ΔF(β) {best['delta']:+.4f} > margin {margin}"
                                 + (" (champion reused)" if best["source"] == "champion" else "")}
     return best, {**info, "adopted": False, "delta": best["delta"],
-                  "source": best["source"],
+                  "source": best["source"], "margin": margin,
+                  "lam": best["lam"], "rank": best.get("rank"),
                   "reason": f"best candidate fit_dev ΔF(β) {best['delta']:+.4f} "
                             f"≤ margin {margin}"}

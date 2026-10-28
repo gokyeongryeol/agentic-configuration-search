@@ -51,14 +51,14 @@ def _require(value, name: str, axis: str):
 # Material kind -> the axes keys that determine it. If all these keys equal the
 # parent's, the parent's material is inherited as-is instead of re-mined.
 _INHERIT_KEYS: dict[str, tuple] = {
-    # exemplars also bind fn_k — fn_arm mining needs the base selection
+    # exemplars also bind exemplar_fn_k — fn_arm mining needs the base selection
     # (chosen_ann_ids), which is lost if only the base is inherited
-    "exemplars": ("exemplar", "exemplar_k", "fn_k"),
+    "exemplars": ("exemplar", "exemplar_base_k", "exemplar_fn_k"),
     "visual_negatives": ("visual_negatives", "visual_negative_k", "exemplar",
-                         "exemplar_k", "fn_k"),
+                         "exemplar_base_k", "exemplar_fn_k"),
     "aliases": ("alias",),
     "text_negatives": ("text_negatives", "text_negative_k", "exemplar",
-                       "exemplar_k", "fn_k"),
+                       "exemplar_base_k", "exemplar_fn_k"),
 }
 
 
@@ -94,10 +94,10 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
     rng = random.Random(seed)
     # Quantity axes (None = config default) override the mining quotas
     quota = {}
-    if axes.get("exemplar_k") is not None:
-        quota["exemplars_per_class"] = int(axes["exemplar_k"])
-    if axes.get("fn_k") is not None:
-        quota["fn_exemplars_per_class"] = int(axes["fn_k"])
+    if axes.get("exemplar_base_k") is not None:
+        quota["exemplar_base_per_class"] = int(axes["exemplar_base_k"])
+    if axes.get("exemplar_fn_k") is not None:
+        quota["exemplar_fn_per_class"] = int(axes["exemplar_fn_k"])
     if axes.get("visual_negative_k") is not None:
         quota["visual_negatives_per_class"] = int(axes["visual_negative_k"])
     if axes.get("text_negative_k") is not None:
@@ -166,9 +166,8 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
     neg_entries: dict[str, list[dict]] = {}
     fp_pool_all: dict[str, list[dict]] = {}
     # the gt_crop source needs no FP pass — it uses GT crops only
-    need_fp = ((axes["visual_negatives"] and "visual_negatives" not in inherited)
-               or (axes["text_negatives"] in ("fp_crop", "background")
-                   and "text_negatives" not in inherited))
+    need_fp = any(axes[axis] in ("fp_crop", "background") and axis not in inherited
+                  for axis in ("visual_negatives", "text_negatives"))
     if need_fp:
         # FP mining uses **the pass of the configuration to be served
         # (including adopted FN exemplars)**. A text-only candidate without
@@ -185,12 +184,26 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
         reports["negatives_excluded_on_object"] = skipped
 
     visual_negatives: dict[str, list[PromptBox]] = {}
+    # the sources match text_negatives (fp_crop | gt_crop | background) — the
+    # crops themselves go in as negative images instead of captions
+    vsrc = axes["visual_negatives"]
     if "visual_negatives" in inherited:
         visual_negatives = dict(parent_mat.visual_negatives)
-    elif axes["visual_negatives"]:
+    elif vsrc:
+        per = params.visual_negatives_per_class
+        if vsrc == "gt_crop":
+            cache = cache or mine.CropCache(train, onto, out_dir / "gt_crops")
+            vn_src = mine.other_class_gt(cache, onto, train, per)
+        elif vsrc == "background":
+            vn_src = mine.top_negatives(mine.background_only(fp_pool_all, train, onto),
+                                        per)
+        else:
+            vn_src = neg_entries
+        reports["visual_negative_source"] = {
+            "kind": vsrc, "per_class": {n: len(v) for n, v in vn_src.items() if v}}
         visual_negatives = {name: [PromptBox(class_name=name, image=e["image"],
-                                      bbox_xyxy=e["bbox_xyxy"]) for e in entries]
-                     for name, entries in neg_entries.items() if entries}
+                                             bbox_xyxy=e["bbox_xyxy"]) for e in entries]
+                            for name, entries in vn_src.items() if entries}
 
     # --- text alias ---
     aliases: dict[str, str] = dict(params.text_aliases)

@@ -31,7 +31,7 @@ adoption — the same rule as the tiling fold gate, planner.gates.under_champion
 A value that lost under an old champion may work in the new champion's context.
 
 **Same value**: the axis's main value (alias=vlm, exemplar=fn_arm,
-text_negatives=fp_crop …). Quantity axes (exemplar_k, fn_k, text_negative_k,
+text_negatives=fp_crop …). Quantity axes (exemplar_base_k, exemplar_fn_k, text_negative_k,
 visual_negative_k) are variants of their function axis's value. A candidate
 changing several axes is counted once per contained value — a combination
 containing any clearly-lost value is a variant of that value (prescreened). A
@@ -49,13 +49,14 @@ increment) is not prescreened.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from .gates import champion_round, tiling_gate, under_champion
 
 # quantity axis → function axis — a candidate changing only the quantity is a
 # variant of that function axis's value
-K_PARENT = {"exemplar_k": "exemplar", "fn_k": "exemplar",
+K_PARENT = {"exemplar_base_k": "exemplar", "exemplar_fn_k": "exemplar",
             "text_negative_k": "text_negatives",
             "visual_negative_k": "visual_negatives"}
 # axes the lost-value prescreen can filter — those whose expensive part comes
@@ -64,7 +65,7 @@ PRESCREEN_AXES = ("alias", "exemplar", "text_negatives", "visual_negatives", "ti
 
 # history skipped reason → ledger outcome group
 _BLOCKED = {"tiling_blocked", "combo_tried", "champion_combo", "axis_disabled",
-            "carried_duplicate",
+            "axis_retired", "carried_duplicate",
             "duplicate_axes", "max_candidates", "no_change", "invalid_axes",
             "detector_state_off", "compound_server_state", "missing_hook",
             "lora_deps", "adapt_ctl"}
@@ -76,9 +77,18 @@ _OUTCOME = {"lost_value_prescreen": "prescreened", "axis_unused": "unused",
             "fit_dev_lost": "screened", "fit_dev_identical": "same_setting"}
 
 
+def fmt_value(v) -> str:
+    """How a value is written in the prompt — like the response JSON (true, false, null), anything else as is."""
+    return json.dumps(v) if isinstance(v, bool) or v is None else str(v)
+
+
+def kv(axis: str, value) -> str:
+    return f"{axis}={fmt_value(value)}"
+
+
 def label(key: tuple) -> str:
     axis, value = key
-    return f"{axis}={value}"
+    return kv(axis, value)
 
 
 def value_keys(axes: dict, champion: dict) -> tuple:
@@ -86,8 +96,8 @@ def value_keys(axes: dict, champion: dict) -> tuple:
     sorted tuple.
 
     Quantity axes fold into the function axis's (candidate) value:
-    exemplar=fn_arm + fn_k=4 is the single ("exemplar", "fn_arm"). Changing only
-    exemplar_k is a variant of the champion's exemplar value."""
+    exemplar=fn_arm + exemplar_fn_k=4 is the single ("exemplar", "fn_arm"). Changing only
+    exemplar_base_k is a variant of the champion's exemplar value."""
     axes, champion = axes or {}, champion or {}
     keys = set()
     for k, v in axes.items():
@@ -104,6 +114,8 @@ def _asked(c: dict) -> dict:
 
 def _outcome(c: dict, evaluated: dict) -> str:
     s = c.get("skipped")
+    if c.get("empty_axis"):
+        return "no_material"              # a tripwire (too little training data) is no material too
     if s is None:
         if c.get("adopted"):
             return "adopted"
@@ -216,11 +228,16 @@ def axis_ledger(history: list[dict]) -> dict[tuple, ValueRecord]:
             g = ev.get("gate") or {}
             minutes = float((c.get("wall_min") or {}).get("total") or 0.0)
             kind = _outcome(c, evaluated)
+            empty_axis = c.get("empty_axis")
             for key in keys:
                 rec = out.setdefault(key, ValueRecord(key=key))
                 rec.tries += 1
                 rec.single += len(keys) == 1
-                rec.outcomes[kind] = rec.outcomes.get(kind, 0) + 1
+                # empty material belongs to empty_axis's value — the other values
+                # changed with it were just not measured
+                k_kind = ("blocked" if kind == "no_material" and empty_axis
+                          and key[0] != empty_axis else kind)
+                rec.outcomes[k_kind] = rec.outcomes.get(k_kind, 0) + 1
                 rec.minutes += minutes
                 if cmp.get("delta") is not None and (
                         rec.best_fit_dev is None
@@ -299,6 +316,9 @@ def tried_under_champion(history: list[dict]) -> list[str]:
     for e in history:
         recent = cr is not None and e.get("round", 0) > cr
         for c in e.get("candidates", []):
+            # rows dropped by axis retirement are not tried combos (as deterministic.tried_combos)
+            if c.get("skipped") == "axis_retired":
+                continue
             for axes in (c.get("axes"), c.get("requested_axes")):
                 if not isinstance(axes, dict):
                     continue
@@ -310,5 +330,5 @@ def tried_under_champion(history: list[dict]) -> list[str]:
                                 and k not in K_PARENT for k, v in delta.items())
                 if not recent and turns_off:
                     continue
-                seen[", ".join(f"{k}={v}" for k, v in sorted(delta.items()))] = None
+                seen[", ".join(kv(k, v) for k, v in sorted(delta.items()))] = None
     return list(seen)

@@ -30,7 +30,7 @@ class VllmLaunchCfg:
     host: str = "127.0.0.1"
     port: int = 8104
     gpu_memory_utilization: float = 0.90
-    max_model_len: int = 16384
+    max_model_len: int = 32768
     startup_timeout: int = 1800
     enforce_eager: bool = False
     # Persistent mode: attach to a healthy server on the port and leave it up when
@@ -247,6 +247,12 @@ class SearchCfg:
     # source the backend does not support). Honored by the same three places
     # (deterministic, LLM prompt, sanitize).
     disabled_values: dict = field(default_factory=dict)
+    # Axes turned off automatically during the run (planner.axis_status) — an axis
+    # with this many rounds in a row without effect is turned off, and reopened
+    # once when the champion changes. Applies to the LLM planner only (the
+    # deterministic planner is the A/B control and stays as is). null = off
+    # (the record is still carried in the prompt)
+    axis_retire_after: int | None = 2
 
 
 @dataclass(frozen=True)
@@ -254,7 +260,7 @@ class MineCfg:
     """Mining parameters — all hygiene rules and quotas. The adoption gate
     belongs to the loop.
     """
-    exemplars_per_class: int = 4          # default quotas 4/2/1/1
+    exemplar_base_per_class: int = 4      # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
     # Outlier trim before kcenter — drop only candidates whose centroid distance
     # exceeds median + k·MAD (null = no trim). 3.0 is about 3σ under a normal distribution.
@@ -262,7 +268,7 @@ class MineCfg:
     # The FN arm trims less than base (a larger multiple) — filter the noise but
     # keep the diversity that broadly covers missed appearances.
     fn_kcenter_outlier_mad: float | None = 3.5
-    fn_exemplars_per_class: int = 2
+    exemplar_fn_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
     fn_min_miss_rate: float = 0.02
     fn_min_area_ratio: float = 0.3        # cut tiny candidates relative to median GT area
@@ -316,7 +322,8 @@ class Config:
     beta: float = 1.0
     # Optional operator-supplied description of the dataset — inserted verbatim
     # into the LLM planner prompt only (the deterministic planner ignores it).
-    # With "" the prompt has no such block.
+    # With "" the prompt has no such block. The prompt is English, so write it in
+    # English (the planner logs a warning on non-English text).
     dataset_notes: str = ""
     # Seed for run stochasticity — used by material-mining sampling, lora and
     # crop-classifier training, and gate bootstrap resampling. Separate from the
@@ -391,6 +398,10 @@ def _validate(cfg: Config) -> None:
         if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
             raise ConfigError(f"{key}: must be an integer or null (got {v!r}) — to remove "
                               "the cap, use an unquoted null")
+    v = cfg.search.axis_retire_after
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
+        raise ConfigError("search.axis_retire_after: must be an integer >= 1 or null "
+                          f"(off) (got {v!r})")
     if cfg.subsample.max_images is not None and cfg.subsample.max_images < 1:
         raise ConfigError("subsample.max_images: must be >= 1 — to turn subsampling off, "
                           f"use null (no cap) ({cfg.subsample.max_images})")

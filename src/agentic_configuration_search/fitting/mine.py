@@ -104,7 +104,7 @@ def gt_exemplars(train: Split, ontology: Ontology, cache: CropCache, params,
                   for cid, anns in sorted(cache.prompt_pool.items()) if anns})
     for cid, anns in sorted(cache.prompt_pool.items()):
         name = ontology.id_to_name[cid]
-        k = min(params.exemplars_per_class, len(anns))
+        k = min(params.exemplar_base_per_class, len(anns))
         if not anns:
             exemplars[name] = []
             log.warning("class %r: no promptable train GT — 0 exemplars", name)
@@ -265,7 +265,7 @@ def fn_exemplar_candidates(train: Split, ontology: Ontology, fn_anns: dict,
     anns_by_cid = train.annotations_by_class()      # miss rate and median use all GT
     fn_boxes: dict[str, list[PromptBox]] = {}
     report: dict[str, dict] = {}
-    if params.fn_exemplars_per_class <= 0:
+    if params.exemplar_fn_per_class <= 0:
         return fn_boxes, report
     for cid, missed in sorted(fn_anns.items()):
         name = ontology.id_to_name[cid]
@@ -290,13 +290,13 @@ def fn_exemplar_candidates(train: Split, ontology: Ontology, fn_anns: dict,
         small = [a for a in pool if a.area < min_area]
         if small:
             report[name]["tiny_removed"] = len(small)
-        if not cand and len(small) >= params.fn_exemplars_per_class:
+        if not cand and len(small) >= params.exemplar_fn_per_class:
             cand = sorted(small, key=lambda a: a.area,
-                          reverse=True)[:params.fn_exemplars_per_class]
+                          reverse=True)[:params.exemplar_fn_per_class]
             report[name]["area_refilled"] = len(cand)
         if not cand:
             continue
-        k = min(params.fn_exemplars_per_class, len(cand))
+        k = min(params.exemplar_fn_per_class, len(cand))
         if len(cand) > k:
             if params.exemplar_selection == "random":
                 pick = rng.sample(range(len(cand)), k)

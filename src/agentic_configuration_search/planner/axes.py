@@ -8,6 +8,7 @@ a text prompt of the class name alone.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 # tiling axis value = grid g — each image is cut into g×g tiles
@@ -28,7 +29,10 @@ AXES: dict[str, tuple] = {
     #   gt_crop    = captions of other classes' GT crops (suppress confused classes)
     #   background = captions of FPs not overlapping any GT (suppress background FPs)
     "text_negatives": (False, "fp_crop", "gt_crop", "background"),
-    "visual_negatives": (False, True),                # visual negatives + neg_eta grid
+    # visual negatives take the same three sources — the crops themselves go in
+    # as negative image prompts instead of captions (semantic queries only;
+    # screen picks the neg_eta grid)
+    "visual_negatives": (False, "fp_crop", "gt_crop", "background"),
     "tiling": (False, *TILING_GRIDS),         # grid g (see TILING_GRIDS above)
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
@@ -37,16 +41,19 @@ AXES: dict[str, tuple] = {
     # None = the config's default quota (MineCfg's *_per_class) and the safe
     # point. Meaningful only when the matching feature axis is on (enforced by
     # validate_axes).
-    "exemplar_k": (None, 1, 2, 4, 8),         # base exemplars per class
-    "fn_k": (None, 1, 2, 4),                  # extra FN-arm exemplars per class
+    "exemplar_base_k": (None, 1, 2, 4, 8),         # base exemplars per class
+    "exemplar_fn_k": (None, 1, 2, 4),                  # extra FN-arm exemplars per class
     "visual_negative_k": (None, 1, 2, 4),            # visual negatives per class
     "text_negative_k": (None, 1, 2, 4),       # suppression phrases per class
 }
 
+# negative axes whose values are the mining source (fp_crop | gt_crop | background)
+NEGATIVE_AXES = ("text_negatives", "visual_negatives")
+
 BASELINE: dict = {"exemplar": "none", "alias": False, "text_negatives": False,
                   "visual_negatives": False, "tiling": False, "rescorer": False,
                   "lora": False, "crop_classifier": False,
-                  "exemplar_k": None, "fn_k": None,
+                  "exemplar_base_k": None, "exemplar_fn_k": None,
                   "visual_negative_k": None, "text_negative_k": None}
 
 
@@ -85,11 +92,19 @@ def axis_values(facts: DatasetFacts | None = None) -> dict[str, tuple]:
     if facts is None:
         return out
     if facts.n_classes == 1:
-        out["text_negatives"] = tuple(v for v in AXES["text_negatives"]
-                                      if v != "gt_crop")
+        for axis in NEGATIVE_AXES:
+            out[axis] = tuple(v for v in AXES[axis] if v != "gt_crop")
     if facts.lora_block():
         out["lora"] = (False,)
     return out
+
+
+class AxesError(ValueError):
+    """An axes contract violation — str is the full message, en a short line for the planner prompt."""
+
+    def __init__(self, msg: str, en: str):
+        super().__init__(msg)
+        self.en = en
 
 
 def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
@@ -97,49 +112,55 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
 
     With facts, combinations whose outcome is already decided on this dataset
     (material empty by definition, training that would be skipped) are rejected
-    too. Callers that re-key old records (tried_combos) do not pass it."""
+    too. Callers that re-key recorded axes (tried_combos) do not pass it."""
     unknown = sorted(set(axes) - set(AXES))
     if unknown:
-        raise ValueError(f"axes: unknown key {unknown} — allowed: {sorted(AXES)}")
+        raise AxesError(f"axes: unknown key {unknown} — allowed: {sorted(AXES)}",
+                        f"unknown axis {', '.join(unknown)}")
     full = {**BASELINE, **axes}
     for k, v in full.items():
         # 1 == True and 2.0 == 2, so `in` alone lets types leak in — tiling is an int grid
         if k == "tiling" and v is not False and (
                 isinstance(v, bool) or not isinstance(v, int)):
-            raise ValueError(f"axes.tiling: {v!r} must be one of {AXES[k]} "
-                             "(grid g — an integer)")
+            raise AxesError(f"axes.tiling: {v!r} must be one of {AXES[k]} "
+                            "(grid g — an integer)", f"tiling={json.dumps(v)} is not a grid value")
         if v not in AXES[k]:
-            raise ValueError(f"axes.{k}: {v!r} must be one of {AXES[k]}")
+            raise AxesError(f"axes.{k}: {v!r} must be one of {AXES[k]}",
+                            f"{k}={json.dumps(v)} is not a valid value")
     # Visual negatives ride only on semantic queries — cannot be on without exemplars
     if full["visual_negatives"] and full["exemplar"] == "none":
-        raise ValueError("axes.visual_negatives=True requires an exemplar "
-                         "(visual negatives apply to semantic queries only — text "
-                         "suppression is the text_negatives axis)")
+        raise AxesError("axes.visual_negatives requires an exemplar "
+                        "(visual negatives apply to semantic queries only — text "
+                        "suppression is the text_negatives axis)",
+                        'visual_negatives needs exemplar != "none"')
     # Count axes are meaningful only when their feature axis is on — meaningless
     # combos would pollute the tried set and the candidate budget, so they raise
-    requires = [("exemplar_k", full["exemplar"] != "none", "exemplar"),
-                ("fn_k", full["exemplar"] == "fn_arm", "exemplar=fn_arm"),
+    requires = [("exemplar_base_k", full["exemplar"] != "none", "exemplar"),
+                ("exemplar_fn_k", full["exemplar"] == "fn_arm", "exemplar=fn_arm"),
                 ("visual_negative_k", full["visual_negatives"], "visual_negatives"),
                 ("text_negative_k", full["text_negatives"], "text_negatives")]
     for key, ok, need in requires:
         if full[key] is not None and not ok:
-            raise ValueError(f"axes.{key} is only meaningful when {need} "
-                             f"(got {full[key]})")
+            raise AxesError(f"axes.{key} is only meaningful when {need} "
+                            f"(got {full[key]})", f"{key} applies only with {need}")
     # gt_crop is sourced from **other classes'** GT crops — with a single class
     # the pool is empty by definition, so the candidate would be rejected as
     # no_material and only use up a round slot. fp_crop and background cover the
     # same "suppress look-alikes" role.
     if facts is None:
         return full
-    if facts.n_classes == 1 and full["text_negatives"] == "gt_crop":
-        raise ValueError("axes.text_negatives=gt_crop is only meaningful with 2+ "
-                         "classes (sourced from other classes' GT) — on a "
-                         "single-class dataset use fp_crop or background")
+    for axis in NEGATIVE_AXES:
+        if facts.n_classes == 1 and full[axis] == "gt_crop":
+            raise AxesError(f"axes.{axis}=gt_crop is only meaningful with 2+ "
+                            "classes (sourced from other classes' GT) — on a "
+                            "single-class dataset use fp_crop or background",
+                            f"{axis}=gt_crop needs two or more classes")
     # lora (tail fine-tune) is rejected without training if fit_train has fewer
     # than lora.min_images images — the outcome follows from the data, so block it
     # before it uses a candidate slot
     if full["lora"] and (why := facts.lora_block()):
-        raise ValueError(f"axes.lora=True: {why}")
+        raise AxesError(f"axes.lora=True: {why}",
+                        "lora cannot train: too few fit_train images")
     return full
 
 
@@ -171,7 +192,7 @@ def merge_onto(base: dict, delta: dict) -> dict:
 
     When a feature axis is turned off or changed, the dependent and count axes
     the delta does not name go back to their safe point — if the champion's
-    stayed, validate_axes' dependency rules (e.g. fn_k only with
+    stayed, validate_axes' dependency rules (e.g. exemplar_fn_k only with
     exemplar=fn_arm) would drop the whole candidate."""
     out = {**BASELINE, **(base or {}), **delta}
 
@@ -181,11 +202,11 @@ def merge_onto(base: dict, delta: dict) -> dict:
 
     if "exemplar" in delta:
         if out["exemplar"] == "none":
-            for key in ("exemplar_k", "fn_k", "visual_negative_k"):
+            for key in ("exemplar_base_k", "exemplar_fn_k", "visual_negative_k"):
                 reset(key, None)
             reset("visual_negatives", False)
         elif out["exemplar"] != "fn_arm":
-            reset("fn_k", None)
+            reset("exemplar_fn_k", None)
     if "visual_negatives" in delta and not out["visual_negatives"]:
         reset("visual_negative_k", None)
     if "text_negatives" in delta and not out["text_negatives"]:
@@ -250,10 +271,11 @@ def sanitize_candidates(raw, *, max_candidates: int,
     if base:
         try:
             merge_base = validate_axes(base)
-        except ValueError:              # old-format record — read axes as-is
+        except ValueError:              # a base that does not validate — read axes as-is
             merge_base = None
 
-    def _drop(i, c, why: str, note: str, merged: dict | None = None) -> None:
+    def _drop(i, c, why: str, note: str, merged: dict | None = None,
+              invalid: str | None = None) -> None:
         # a candidate merged onto base is recorded with the merged axes — so
         # tried_combos does not fill the increment from BASELINE and block a
         # combination that was never tried
@@ -264,7 +286,8 @@ def sanitize_candidates(raw, *, max_candidates: int,
         dropped.append({"id": str(cand.get("id") or f"cand_{i}"),
                         "axes": axes if isinstance(axes, dict) else {},
                         "rationale": str(cand.get("rationale", "")),
-                        "skipped": why, "note": note})
+                        "skipped": why, "note": note}
+                       | ({"invalid": invalid} if invalid else {}))
 
     for i, c in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(c, dict) or not isinstance(c.get("axes"), dict):
@@ -274,9 +297,10 @@ def sanitize_candidates(raw, *, max_candidates: int,
             axes = validate_axes(merge_onto(merge_base, c["axes"]) if merge_base
                                  else c["axes"], facts=facts)
         except ValueError as exc:
-            # Carry the ValueError message verbatim — it goes back into the next
-            # round's prompt and is the only signal that stops the same violation.
-            _drop(i, c, "invalid_axes", str(exc))
+            # Keep what was violated — note is the full message, invalid (a short
+            # line) goes back into the next prompt as the reason and stops the
+            # same violation repeating (planner.llm._reason)
+            _drop(i, c, "invalid_axes", str(exc), invalid=getattr(exc, "en", None))
             continue
         if uses_disabled_axes(axes, disabled_axes, disabled_values, base=base):
             _drop(i, c, "disabled_axes", "uses an axis/value disabled for this run", axes)

@@ -79,9 +79,9 @@ def trajectory(run_dir: Path) -> dict:
 
 # --------------------------------------------------------------- candidate attempts
 
-# count keys roll up to their axis — a candidate that only changes exemplar_k is
+# count keys roll up to their axis — a candidate that only changes exemplar_base_k is
 # an exemplar attempt too (diagnose.story)
-_AXIS_PARENT = {"exemplar_k": "exemplar", "fn_k": "exemplar",
+_AXIS_PARENT = {"exemplar_base_k": "exemplar", "exemplar_fn_k": "exemplar",
                 "visual_negative_k": "visual_negatives",
                 "text_negative_k": "text_negatives"}
 
@@ -94,6 +94,8 @@ def _outcome(c: dict, evaluated: dict) -> str:
     holdout, or outside screen's top K."""
     if c.get("adopted"):
         return "adopted"
+    if c.get("empty_axis"):
+        return "no_material"              # a tripwire (too little training data) is no material too
     if c.get("skipped"):
         return str(c["skipped"])
     ev = evaluated.get(c.get("id"))

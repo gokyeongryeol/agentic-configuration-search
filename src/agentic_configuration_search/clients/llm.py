@@ -115,6 +115,18 @@ class LLMClient:
         except requests.RequestException:
             return False
 
+    def max_model_len(self, timeout: float = 5.0) -> Optional[int]:
+        """The context length the server reports (/v1/models max_model_len) — None
+        if unknown. The entry whose id matches the model first, else the first one."""
+        try:
+            data = self.session.get(f"{self.base_url}/v1/models",
+                                    timeout=timeout).json().get("data") or []
+        except (requests.RequestException, ValueError):
+            return None
+        hit = next((m for m in data if m.get("id") == self.model), data[0] if data else {})
+        n = hit.get("max_model_len")
+        return int(n) if isinstance(n, int) and n > 0 else None
+
     def chat(self, messages: list[dict], *, max_tokens: int = 1024,
              temperature: float = 0.0, schema: Optional[dict] = None) -> str:
         """`messages` is in OpenAI chat format as-is. Passing `schema` requests

@@ -13,6 +13,7 @@ rounds: 10                                # planner round cap — saturation win
 beta: 1.0
 # Operator-supplied description of the dataset (optional) — inserted verbatim into the
 # LLM planner prompt only (the deterministic planner ignores it). With "" the prompt has no such block.
+# The prompt is English, so write it in English (the planner logs a warning on non-English text).
 dataset_notes: ""
 # Execution randomness seed — material-mining sampling, lora, crop classifier training, gate bootstrap.
 # Kept separate from split.seed (split boundaries), so search variance can be measured
@@ -32,7 +33,7 @@ planner:
     port: 8104
     host: 127.0.0.1
     gpu_memory_utilization: 0.9           # vLLM memory share — preallocates weights + KV cache pool
-    max_model_len: 16384                  # headroom for late rounds with long history (the budget guard prevents overflow)
+    max_model_len: 32768                  # basis of the prompt budget — if the attached server reports another value, that one is used
     startup_timeout: 1800
     enforce_eager: false                  # true disables CUDA graphs (avoids OOM on shared GPUs)
     persist: true                         # resident: attach to a healthy port, not torn down at run end
@@ -92,8 +93,8 @@ query:                                    # detector-call contract, fixed regard
   threshold_floor: 0.03                   # multimodal_threshold — floor for τ_c
 
 mine:                                     # mining quotas and hygiene rules (the adoption gate belongs to the loop)
-  exemplars_per_class: 4                  # default quotas 4/2/1/1.
-  fn_exemplars_per_class: 2               #   count axes (exemplar_k etc.) may override per candidate
+  exemplar_base_per_class: 4              # default quotas 4/2/1/1.
+  exemplar_fn_per_class: 2                #   count axes (exemplar_base_k etc.) may override per candidate
   visual_negatives_per_class: 1
   text_negatives_max_per_class: 1
   exemplar_selection: kcenter             # kcenter | mean | random
@@ -124,6 +125,7 @@ search:                                   # value space of the screen (fit_dev) 
   modalities: [semantic, text]
   disabled_axes: []                       # axes the planner may not turn on in this run (e.g. [lora, tiling]) — a champion's own value is kept
   disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}
+  axis_retire_after: 2                    # LLM planner: turn an axis off after this many rounds in a row without effect (reopened once when the champion changes; null = record only)
 
 rescorer:                                 # discriminator on fit_train + α grid on fit_dev
   min_samples: 64                         # discriminator fit tripwire — below this P̂ degenerates to a constant

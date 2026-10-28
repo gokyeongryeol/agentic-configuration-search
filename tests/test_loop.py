@@ -129,7 +129,7 @@ def test_human_candidates_are_injected(big_root, tmp_path, monkeypatch):
         # with the stub there are no FNs, so fn_arm serves the same setting as
         # base (same_setting) — check injection with an increment no planner
         # candidate shares
-        "- id: my_idea\n  axes: {exemplar: base, exemplar_k: 2}\n  rationale: human-injected\n")
+        "- id: my_idea\n  axes: {exemplar: base, exemplar_base_k: 2}\n  rationale: human-injected\n")
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
     screened = out.decisions[1]["screened"]
@@ -160,7 +160,7 @@ def test_lora_without_deps_skips_and_records(big_root, tmp_path, monkeypatch):
 
 
 def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
-    """The exemplar_k quantity axis overrides the MineCfg quota — None means the config default."""
+    """The exemplar_base_k quantity axis overrides the MineCfg quota — None means the config default."""
     import numpy as np
 
     from agentic_configuration_search.config import config_from_dict
@@ -172,12 +172,12 @@ def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
     enc = lambda cid, paths: np.array(  # noqa: E731
         [[float(i), 0.0] for i in range(len(paths))])
 
-    m1 = materialize(cfg, ds, {"exemplar": "base", "exemplar_k": 2},
+    m1 = materialize(cfg, ds, {"exemplar": "base", "exemplar_base_k": 2},
                      tmp_path / "k2", encode_fn=enc, seed=0)
     assert all(len(bs) == 2 for bs in m1.exemplars.values())
     m2 = materialize(cfg, ds, {"exemplar": "base"},          # None -> default 5
                      tmp_path / "kd", encode_fn=enc, seed=0)
-    assert all(len(bs) == cfg.mine.exemplars_per_class
+    assert all(len(bs) == cfg.mine.exemplar_base_per_class
                for bs in m2.exemplars.values())
 
 
@@ -262,12 +262,11 @@ def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
     from agentic_configuration_search.loop import runner as runner_mod
 
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
-    # Non-ASCII (Korean) note on purpose: the prompt JSON must use ensure_ascii=False.
     monkeypatch.setattr(runner_mod.describe, "crop_notes",
                         lambda split, diag, chat, out: [
                             {"crop": 0, "kind": "background", "category_id": 1,
                              "image": "x.png", "box": [1, 2, 3, 4],
-                             "note": "반사광으로 보인다"}])
+                             "note": "looks like a glare reflection"}])
     seen = {}
 
     def chat(messages, **kw):
@@ -276,7 +275,7 @@ def test_crop_notes_reach_planner_prompt(big_root, tmp_path, monkeypatch):
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
                llm_chat=chat, rounds=1, **_fakes())
-    assert "crop_notes" in seen["prompt"] and "반사광" in seen["prompt"]
+    assert "glare reflection" in seen["prompt"]          # the note column of the sample table
 
 
 def test_resume_honors_saturation_and_writes_summary(big_root, tmp_path,
@@ -378,7 +377,7 @@ def test_empty_material_candidate_is_skipped():
     empty = Materials()
     assert _empty_material({"alias": "vlm"}, empty, {}) == "alias"
     assert _empty_material({"text_negatives": "fp_crop"}, empty, {}) == "text_negatives"
-    assert _empty_material({"visual_negatives": True}, empty, {}) == "visual_negatives"
+    assert _empty_material({"visual_negatives": "fp_crop"}, empty, {}) == "visual_negatives"
     assert _empty_material({"exemplar": "base"}, empty, {}) == "exemplar"
     # manual aliases are always applied regardless of axes.alias — empty generation means no increment
     assert _empty_material({"alias": "vlm"}, Materials(aliases={"a": "b"}),
@@ -424,8 +423,8 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
 
     def llm(messages, **kw):
         return {"candidates": [
-            {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
-             "rationale": "fn_k is exemplar=fn_arm only — caught by validation"},
+            {"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
+             "rationale": "exemplar_fn_k is exemplar=fn_arm only — caught by validation"},
             {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
@@ -437,20 +436,20 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["r1_bad_fn_k"]["skipped"] == "invalid_axes"
-    assert "fn_k" in rec["r1_bad_fn_k"].get("note", "")
+    assert "exemplar_fn_k" in rec["r1_bad_fn_k"].get("note", "")
     # a valid candidate passes sanitization — it may still be rejected later (axis_unused etc.)
     assert "r1_ok_tiling" in rec and rec["r1_ok_tiling"].get("skipped") != "invalid_axes"
 
 
-def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
-    """The drop reason must reach the next round's prompt to break the repetition."""
+def test_invalid_axes_reason_reaches_next_prompt(big_root, tmp_path, monkeypatch):
+    """The drop reason (English reason) must reach the next round's prompt to break the repetition."""
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     prompts: list = []
 
     def llm(messages, **kw):
         prompts.append(messages[-1]["content"])
         return {"candidates": [
-            {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
+            {"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
              "rationale": "invalid"},
             {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
@@ -462,7 +461,8 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     planner_prompts = [p for p in prompts if "Round history" in p]
     assert len(planner_prompts) >= 2
     assert "invalid_axes" in planner_prompts[1]
-    assert "fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
+    assert "exemplar_fn_k applies only with exemplar=fn_arm" in planner_prompts[1], \
+        "the violation (reason) must be carried too, or the repetition does not stop"
 
 
 def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
@@ -726,7 +726,7 @@ def test_gate_passer_that_lost_is_carried_to_next_round(big_root, tmp_path, monk
     assert carried is not None and carried.get("source") == "carryover"
     champ = hist[1]["champion"]["axes"]
     assert all(carried["axes"][k] == v for k, v in champ.items()
-               if k not in ("tiling", "exemplar", "exemplar_k"))
+               if k not in ("tiling", "exemplar", "exemplar_base_k"))
 
 
 def test_human_candidates_are_relative_to_champion(tmp_path):
@@ -756,7 +756,7 @@ def test_unused_axes_reads_the_screened_setting():
 
     cfgs = {0: {"visual_negatives": False, "tiling": None},
             1: {"visual_negatives": True, "tiling": None}}
-    ex = validate_axes({"exemplar": "base", "visual_negatives": True})
+    ex = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     text_only = _st({1: {"config_id": 0, "modality": "text"}}, cfgs)
     assert _unused_axes(ex, text_only) == ["exemplar", "visual_negatives"]
     sem_no_neg = _st({1: {"config_id": 0, "modality": "semantic"}}, cfgs)
@@ -849,7 +849,7 @@ def test_neg_eta_record_reads_the_screened_setting():
                            {"config_id": 3, "visual_negatives": True, "neg_eta": 0.75}],
                "per_class": {1: {"config_id": 1, "modality": "semantic"},
                              2: {"config_id": 2, "modality": "text"}}}
-    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    vn = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     assert _neg_eta_record({"axes": vn, "setting": setting}) == {
         "neg_eta_used": [0.25], "neg_eta_grid": [0.25, 0.5, 0.75]}
     # recorded against the request even after relabelling — negatives going
@@ -907,7 +907,7 @@ def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_pa
 
     def llm(messages, **kw):
         return {"candidates": [{"id": "vn", "axes": {"exemplar": "base",
-                                                     "visual_negatives": True},
+                                                     "visual_negatives": "fp_crop"},
                                 "rationale": "background FP"}], "stop": False}
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -919,18 +919,18 @@ def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_pa
 
 
 def test_compact_history_and_prompt_carry_neg_eta():
-    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history, _glossary
     from agentic_configuration_search.planner.axes import validate_axes
 
     b = validate_axes({})
-    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    vn = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
             {"round": 1, "champion": {"axes": b},
              "candidates": [{"id": "vn", "axes": vn, "neg_eta_used": [0.25],
                              "neg_eta_grid": [0.25, 0.5, 0.75]}]}]
     row = _compact_history(hist)[1]["candidates"][0]
     assert row["neg_eta_used"] == [0.25] and row["neg_eta_grid"] == [0.25, 0.5, 0.75]
-    assert "neg_eta_used" in PROMPT
+    assert "neg_eta_used" in _glossary([{"candidates": [row]}])   # explained when a row has it
 
 
 def test_unused_axis_with_different_materials_is_evaluated(big_root, tmp_path,
@@ -1091,8 +1091,9 @@ def test_candidate_turning_off_lora_is_skipped_not_adopted(big_root, tmp_path,
 
 
 def test_prompt_says_detector_state_axes_stay_on():
-    from agentic_configuration_search.planner.llm import PROMPT
-    assert "detector_state_off" in PROMPT
+    from agentic_configuration_search.planner.llm import _constraint_lines
+    from agentic_configuration_search.planner.axis_status import AxisStatus
+    assert any("detector_state_off" in l for l in _constraint_lines((), AxisStatus(2)))
 
 
 def test_failed_candidate_does_not_block_same_setting_sibling(big_root, tmp_path,
@@ -1167,7 +1168,7 @@ def test_skipped_unused_exemplar_keeps_modality_scores(big_root, tmp_path,
 
 def test_compact_history_and_prompt_carry_modality_scores():
     from agentic_configuration_search.planner.axes import validate_axes
-    from agentic_configuration_search.planner.llm import PROMPT, _compact_history
+    from agentic_configuration_search.planner.llm import _compact_history, _glossary
 
     b = validate_axes({})
     hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
@@ -1179,7 +1180,7 @@ def test_compact_history_and_prompt_carry_modality_scores():
     assert row["modality"] == {"text_won": 1, "semantic_won": 0,
                                "closest_text_margin": 0.2}
     assert "modality_f" not in row          # the full per-class record stays in the history file
-    assert "closest_text_margin" in PROMPT
+    assert "closest_text_margin" in _glossary([{"candidates": [row]}])
 
 
 def test_modality_summary_size_does_not_grow_with_classes():
@@ -1228,7 +1229,7 @@ def test_filtered_candidates_are_not_logged_as_unwired(big_root, tmp_path, monke
     import logging
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     human = tmp_path / "c.yaml"
-    human.write_text("- {id: bad, axes: {fn_k: 2}}\n")       # filtered as invalid_axes
+    human.write_text("- {id: bad, axes: {exemplar_fn_k: 2}}\n")       # filtered as invalid_axes
     with caplog.at_level(logging.WARNING,
                          logger="agentic_configuration_search.loop.runner"):
         run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",

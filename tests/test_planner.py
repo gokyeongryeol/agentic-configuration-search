@@ -22,12 +22,12 @@ def test_validate_axes_fills_baseline_and_rejects_unknown():
 
 def test_visual_negative_requires_exemplar():
     with pytest.raises(ValueError, match="visual_negatives"):
-        validate_axes({"visual_negatives": True})
-    validate_axes({"visual_negatives": True, "exemplar": "base"})   # OK
+        validate_axes({"visual_negatives": "fp_crop"})
+    validate_axes({"visual_negatives": "fp_crop", "exemplar": "base"})   # OK
 
 
 def test_sanitize_drops_invalid_and_dedups():
-    raw = [{"axes": {"visual_negatives": True}, "rationale": "invalid — no exemplar"},
+    raw = [{"axes": {"visual_negatives": "fp_crop"}, "rationale": "invalid — no exemplar"},
            {"axes": {"alias": "vlm"}, "rationale": "a"},
            {"axes": {"alias": "vlm"}, "rationale": "duplicate"},
            "garbage",
@@ -116,12 +116,12 @@ def test_llm_error_falls_back(tmp_path):
 def test_llm_valid_candidates_pass_through(tmp_path):
     planner = LLMPlanner(
         chat=lambda m, **k: {"candidates": [
-            {"id": "my", "axes": {"exemplar": "base", "visual_negatives": True},
+            {"id": "my", "axes": {"exemplar": "base", "visual_negatives": "fp_crop"},
              "rationale": "suppress background FPs"}], "stop": False},
         artifact_dir=tmp_path)
     out = planner.propose([], {})
     assert out["candidates"][0]["id"] == "my"
-    assert out["candidates"][0]["axes"]["visual_negatives"] is True
+    assert out["candidates"][0]["axes"]["visual_negatives"] == "fp_crop"
 
 
 def test_llm_prompt_is_compacted(tmp_path):
@@ -146,10 +146,9 @@ def test_llm_prompt_is_compacted(tmp_path):
 
 
 def test_prompt_omits_image_identifiers_and_merges_crop_notes(tmp_path):
-    """Samples carry no image identifiers — descriptions are folded into the samples, so there is
-    nothing to join on, and a bare name without coordinates cannot point at anything. No filename leaks either."""
-    import json
-
+    """Samples carry no image identifier — once notes are folded into samples
+    there is nothing to join on, and a name without coordinates points at
+    nothing. No file name leaks either."""
     from agentic_configuration_search.planner.llm import LLMPlanner
 
     name = "cam07/2024-01-02T03_04_05_jpg.rf.deadbeefcafe.jpg"
@@ -170,16 +169,14 @@ def test_prompt_omits_image_identifiers_and_merges_crop_notes(tmp_path):
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], diagnosis)
     prompt = seen["prompt"]
-    assert name not in prompt and "deadbeefcafe" not in prompt   # no filename leak
+    assert name not in prompt and "deadbeefcafe" not in prompt   # no file name leak
     assert '"image"' not in prompt                               # no identifier at all
 
-    diag = json.loads(prompt.split("what the errors look like.\n", 1)[1]
-                      .split("\n\n## Response", 1)[0])["train"]
-    assert all("image" not in r for r in diag["fp_sample"])
-    # descriptions are folded into the same detection's sample, so no separate crop_notes remain
-    bg = next(r for r in diag["fp_sample"] if r["kind"] == "background")
-    assert bg["note"] == "blurry fence post" and bg["wh"] == [15, 44]
-    assert "crop_notes" not in diag
+    # the note folds into the note column of the same detection's sample row — no separate row is left
+    rows = [l.split(" | ") for l in prompt.splitlines() if l.startswith("FP | ")]
+    bg = next(r for r in rows if r[1] == "background")
+    assert bg[4] == "15x44" and bg[5] == "blurry fence post"
+    assert not any(l.startswith("note | ") for l in prompt.splitlines())
 
 
 def test_samples_carry_class_name_not_id():
@@ -203,10 +200,9 @@ def test_samples_carry_class_name_not_id():
 
 
 def test_digest_maps_error_kinds_to_axes_per_round():
-    """Replaces the static "cause -> axis" table: one line per cause with this
+    """Replaces a static 'cause → axis' table: one line per cause with this
     round's count (train and holdout separately) and the axes that target it,
-    most first. Axis names come from the canonical REMEDY, and counts are not
-    repeated per axis."""
+    most first. Axis names come from REMEDY, and a count is not repeated per axis."""
     from agentic_configuration_search.planner.axes import AXES
     from agentic_configuration_search.planner.llm import _digest_lines
 
@@ -217,11 +213,12 @@ def test_digest_maps_error_kinds_to_axes_per_round():
     kinds = [l[2:].split(":")[0] for l in lines]
     assert kinds == ["below_threshold", "class_confusion", "missed"]   # most first
     bt = lines[0]
-    assert "below_threshold: 100 (train 80, held-out 20)" in bt    # sum and split
-    axes = [a.strip() for a in bt.split("->")[1].split(",")]
-    assert axes and all(a in AXES for a in axes)                  # no phantom axes
+    assert "below_threshold: 100 (train 80, held_out 20)" in bt    # sum and split
+    axes = [a.strip().split("=")[0] for a in bt.split("->")[1].split(",")]
+    assert axes and all(a in AXES for a in axes)                  # no ghost axes
+    assert "exemplar=base|fn_arm" in bt                           # down to values
     assert "rescorer" in axes
-    # axes dedicated to unobserved causes are omitted (tiling <- missed_small)
+    # an axis dedicated to an unobserved cause is not carried (tiling ← missed_small)
     assert not any("tiling" in l for l in lines)
     assert _digest_lines({}) == []
     # disabled axes are left out — they cannot be proposed
@@ -239,18 +236,19 @@ def test_digest_counts_background_for_crop_classifier_and_unaddressable_kinds():
     assert "no axis" in dup
 
 
-def test_dead_axes_survive_the_history_window(tmp_path):
-    """Axes with empty material are collected over the full history — once they slide out of the
-    history window the model proposes the same axis again (re-proposals did repeat in practice)."""
-    from agentic_configuration_search.planner.llm import MAX_HISTORY, LLMPlanner, _dead_axis_lines
+def test_empty_material_survives_the_history_window(tmp_path):
+    """Values with empty material are collected over the whole history into the
+    axis board's run column — pushed out of the history window, the model would
+    propose the same value again."""
+    from agentic_configuration_search.planner.llm import MAX_HISTORY, LLMPlanner
 
-    old = [{"round": 1, "champion": {"axes": BASELINE}, "candidates": [
+    old = [{"round": 0, "champion": {"axes": BASELINE}, "candidates": []},
+           {"round": 1, "champion": {"axes": BASELINE}, "candidates": [
         {"id": "c1", "axes": {**BASELINE, "alias": "vlm"},
          "skipped": "no_material", "empty_axis": "alias"}]}]
     filler = [{"round": i, "champion": {"axes": BASELINE}, "candidates": []}
               for i in range(2, MAX_HISTORY + 4)]
     history = old + filler
-    assert _dead_axis_lines(history) == ["- alias (values tried: vlm)"]
 
     seen = {}
 
@@ -259,8 +257,8 @@ def test_dead_axes_survive_the_history_window(tmp_path):
         return {"candidates": [], "stop": True}
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(history, {})
-    assert "came out empty, or too small to train on, on this" in seen["prompt"]
-    assert "- alias (values tried: vlm)" in seen["prompt"]
+    alias = next(l for l in seen["prompt"].splitlines() if l.startswith("alias | "))
+    assert "empty material for vlm" in alias
 
 
 def test_history_window_zero_means_no_history():
@@ -276,22 +274,22 @@ def test_history_window_zero_means_no_history():
 
 def test_quantity_axes_require_their_feature():
     """Quantity axes are meaningful only when their feature axis is on."""
-    validate_axes({"exemplar": "base", "exemplar_k": 2})           # OK
-    validate_axes({"exemplar": "fn_arm", "fn_k": 4})               # OK
+    validate_axes({"exemplar": "base", "exemplar_base_k": 2})           # OK
+    validate_axes({"exemplar": "fn_arm", "exemplar_fn_k": 4})               # OK
     validate_axes({"text_negatives": "fp_crop", "text_negative_k": 4})  # OK
-    with pytest.raises(ValueError, match="exemplar_k"):
-        validate_axes({"exemplar_k": 2})                # quantity with exemplar=none
-    with pytest.raises(ValueError, match="fn_k"):
-        validate_axes({"exemplar": "base", "fn_k": 4})  # not fn_arm
+    with pytest.raises(ValueError, match="exemplar_base_k"):
+        validate_axes({"exemplar_base_k": 2})                # quantity with exemplar=none
+    with pytest.raises(ValueError, match="exemplar_fn_k"):
+        validate_axes({"exemplar": "base", "exemplar_fn_k": 4})  # not fn_arm
     with pytest.raises(ValueError, match="visual_negative_k"):
         validate_axes({"visual_negative_k": 2})
-    with pytest.raises(ValueError, match="axes.exemplar_k"):
-        validate_axes({"exemplar": "base", "exemplar_k": 3})  # value off the grid
+    with pytest.raises(ValueError, match="axes.exemplar_base_k"):
+        validate_axes({"exemplar": "base", "exemplar_base_k": 3})  # value off the grid
 
 
 def test_quantity_axes_default_none_is_baseline():
     full = validate_axes({"exemplar": "base"})
-    assert full["exemplar_k"] is None and full["fn_k"] is None
+    assert full["exemplar_base_k"] is None and full["exemplar_fn_k"] is None
 
 
 def test_same_axis_reproposed_after_champion_change():
@@ -349,9 +347,8 @@ def test_llm_prompt_includes_dataset_notes(tmp_path):
     assert "Dataset notes" in seen["prompt"]
 
 
-def test_llm_prompt_without_notes_is_byte_identical(tmp_path):
-    """Without notes, the prompt must be byte-identical to the pre-notes prompt — a running
-    experiment's prompt must not change because of a code upgrade."""
+def test_llm_prompt_without_notes_has_no_notes_block(tmp_path):
+    """Without notes the notes block leaves nothing in the prompt."""
     seen = {}
 
     def chat(messages, **kw):
@@ -360,11 +357,10 @@ def test_llm_prompt_without_notes_is_byte_identical(tmp_path):
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], {})
     assert "Dataset notes" not in seen["prompt"]
-    # junction between the diagnosis digest and the response section — no empty
-    # block in between
+    # the joins around the digest and the response section — no empty block in between
     assert "and the samples.\n- (no errors observed)\n\nError detail." \
         in seen["prompt"]
-    assert "\n{}\n\n## Response\nPropose up to" in seen["prompt"]
+    assert "\n- (no error detail)\n\n## Response\nPropose up to" in seen["prompt"]
 
 
 def test_llm_notes_recorded_in_replay_artifact(tmp_path):
@@ -378,11 +374,12 @@ def test_llm_notes_recorded_in_replay_artifact(tmp_path):
 
 
 def test_compact_history_carries_rejection_magnitude():
-    """The *degree* of a rejection stays in the prompt — _compact_history carries each candidate's
-    holdout score (test_micro_f_beta, legacy name), gate Δ / CI lower bound (decision.evaluated),
-    the fit_dev score and the head of the skip reason (note). The LLM must tell a near miss from
-    a large regression to decide whether to retry or give up."""
-    from agentic_configuration_search.planner.llm import MAX_NOTE, _compact_history
+    """*How badly* a candidate was rejected stays in the prompt — holdout score and
+    gate Δ / CI lower bound per candidate (decision.evaluated), fit_dev score, and
+    the skip reason (English reason — the arm verdict numbers). The LLM must tell
+    a near miss from a clear regression to decide whether to retry. The note is
+    not carried."""
+    from agentic_configuration_search.planner.llm import _compact_history
 
     entry = {
         "round": 3,
@@ -391,7 +388,8 @@ def test_compact_history_carries_rejection_magnitude():
             {"id": "near", "axes": {"alias": "vlm"}, "adopted": False,
              "fit_dev_micro_f_beta": 0.72},
             {"id": "arm", "axes": {"lora": True}, "skipped": "lora_gate",
-             "note": "fit_dev ΔF(β) +0.0020 ≤ margin 0.01" + " long tail" * 40},
+             "note": "best candidate fit_dev ΔF(β) +0.0020 ≤ margin 0.01",
+             "arm_gate": {"delta": 0.002, "margin": 0.01}},
         ],
         "decision": {"adopted": False, "id": None, "evaluated": {
             "near": {"micro_f_beta": 0.705,
@@ -399,18 +397,19 @@ def test_compact_history_carries_rejection_magnitude():
                               "adopted": False}}}},
     }
     near, arm = _compact_history([entry])[0]["candidates"]
-    assert near["test_micro_f_beta"] == 0.705
+    assert near["held_out_micro_f_beta"] == 0.705
     assert near["gate_delta"] == 0.005 and near["gate_ci_lo"] == -0.001
     assert near["fit_dev_micro_f_beta"] == 0.72
-    assert arm["note"].startswith("fit_dev ΔF(β) +0.0020")
-    assert len(arm["note"]) <= MAX_NOTE          # only the head of the note (token budget)
-    assert "test_micro_f_beta" not in arm        # absent for candidates that never reached the holdout gate
+    assert "note" not in arm
+    assert arm["reason"] == ("tail fine-tune arm gate failed: best fit_dev delta "
+                             "+0.0020 <= margin 0.01")
+    assert "held_out_micro_f_beta" not in arm        # absent for a candidate that never reached holdout
 
 
 def test_compact_payloads_round_floats_to_4dp():
-    """Floats in the prompt are rounded to 4 digits — spurious precision (18-char floats) wastes
-    tokens. Why 4: gate Δ/CI decisions at the margin (0.005) scale are decided at the 4th digit
-    (with 3 digits, 0.0049 and 0.0051 become equal)."""
+    """Floats in the prompt are rounded to 4 digits — false precision (18-char
+    floats) wastes tokens. 4 digits because near a 0.005-level margin the Δ/CI
+    verdict turns on the 4th digit (with 3, 0.0049 and 0.0051 become equal)."""
     from agentic_configuration_search.planner.llm import _compact_diagnosis, _compact_history
 
     entry = {"round": 1,
@@ -427,7 +426,7 @@ def test_compact_payloads_round_floats_to_4dp():
     assert h["champion_micro_f_beta"] == 0.9685
     row = h["candidates"][0]
     assert row["fit_dev_micro_f_beta"] == 0.7123
-    assert row["test_micro_f_beta"] == 0.705
+    assert row["held_out_micro_f_beta"] == 0.705
     assert row["gate_delta"] == 0.0049 and row["gate_ci_lo"] == -0.0012
 
     diag = {"train": {"n_images": 10, "summary": {"fp": {"background": 1}},
@@ -437,7 +436,7 @@ def test_compact_payloads_round_floats_to_4dp():
     c = _compact_diagnosis(diag)["train"]
     assert c["per_class"]["cat"]["miss_rate"] == 0.3333
     assert c["fp_sample"][0]["score"] == 0.5123
-    # box coordinates are replaced by integer size (wh) — the planner has no use for coordinates
+    # box coordinates become an integer size (wh) — the planner has no use for coordinates
     assert c["fp_sample"][0]["wh"] == [2, 2] and "box" not in c["fp_sample"][0]
 
 
@@ -588,12 +587,12 @@ def test_sanitize_records_invalid_axes_instead_of_dropping_silently():
 
     A silent drop breaks two things at once: round budget shrinks unnoticed (only 2 of 3
     proposals evaluated), and the planner cannot learn from its mistake, so it **re-proposes the
-    same candidate next round** (e.g. fn_k attached without fn_arm, lost for several rounds in a row).
+    same candidate next round** (e.g. exemplar_fn_k attached without fn_arm, lost for several rounds in a row).
     combo_tried already solves the same problem via skipped records (see the no-silent-drop
     comment in runner.py) — validation failures were the only exception.
     """
-    raw = [{"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
-            "rationale": "invalid: fn_k is exemplar=fn_arm only"},
+    raw = [{"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
+            "rationale": "invalid: exemplar_fn_k is exemplar=fn_arm only"},
            {"id": "good", "axes": {"alias": "vlm"}, "rationale": "valid"}]
     dropped: list = []
     out = sanitize_candidates(raw, max_candidates=5, dropped=dropped)
@@ -603,7 +602,7 @@ def test_sanitize_records_invalid_axes_instead_of_dropping_silently():
     rec = dropped[0]
     assert rec["id"] == "bad_fn_k"
     assert rec["skipped"] == "invalid_axes"
-    assert "fn_k" in rec["note"]           # the ValueError message must be carried for the planner to learn
+    assert "exemplar_fn_k" in rec["note"]           # the ValueError message must be carried for the planner to learn
     assert rec["axes"] == raw[0]["axes"]   # original axes kept — to trace what was wrong
 
 
@@ -623,7 +622,7 @@ def test_sanitize_records_duplicate_and_overflow_drops():
 
 def test_sanitize_without_sink_keeps_old_signature():
     """Existing call sites that do not pass dropped keep working."""
-    out = sanitize_candidates([{"id": "x", "axes": {"visual_negatives": True}},
+    out = sanitize_candidates([{"id": "x", "axes": {"visual_negatives": "fp_crop"}},
                                {"id": "y", "axes": {"alias": "vlm"}}],
                               max_candidates=5)
     assert [c["id"] for c in out] == ["y"]
@@ -636,7 +635,7 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
     import json as _json
 
     def chat(messages, **kw):
-        return {"candidates": [{"id": "bad", "axes": {"rescorer": True, "fn_k": 2},
+        return {"candidates": [{"id": "bad", "axes": {"rescorer": True, "exemplar_fn_k": 2},
                                 "rationale": "invalid"},
                                {"id": "ok", "axes": {"alias": "vlm"},
                                 "rationale": "valid"}],
@@ -756,9 +755,10 @@ def test_llm_prompt_explains_tiling_grid(tmp_path):
         return {"candidates": [], "stop": True}
 
     LLMPlanner(chat=chat, artifact_dir=tmp_path).propose([], {})
-    assert "tiling: one of [False, 2, 3, 4, 5, 6]" in seen["prompt"]
+    tiling = next(l for l in seen["prompt"].splitlines() if l.startswith("tiling | "))
+    assert tiling.split(" | ")[2] == "2, 3, 4, 5, 6"
     assert "1 + g^2" in seen["prompt"]          # cost
-    assert "tiling_used" in seen["prompt"]      # how to read the shortfall signal
+    assert "Raise g only when the previous grid was used" in " ".join(seen["prompt"].split())
 
 
 def test_compact_history_carries_tiling_used():
@@ -813,7 +813,8 @@ def test_llm_prompt_and_response_drop_untrainable_lora(tmp_path):
             {"id": "t", "axes": {"tiling": 2}, "rationale": "y"}], "stop": False}
 
     out = LLMPlanner(chat=chat, artifact_dir=tmp_path, facts=SMALL).propose([], {})
-    assert "- lora: one of [False]" in seen["prompt"]
+    lora = next(l for l in seen["prompt"].splitlines() if l.startswith("lora | "))
+    assert lora.split(" | ")[1] == "BLOCKED"
     assert [c["id"] for c in out["candidates"]] == ["t"]
     assert out["dropped"][0]["id"] == "l"
     assert out["dropped"][0]["skipped"] == "invalid_axes"
@@ -886,7 +887,7 @@ def test_carryover_resets_dependent_axes_on_new_champion():
     candidate turned exemplar off, an overwrite would be a contract-violating
     combination and the gate passer would vanish without a record."""
     prev = validate_axes({"exemplar": "base"})
-    win = validate_axes({"exemplar": "base", "visual_negatives": True})
+    win = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     lost = validate_axes({"alias": "vlm"})          # turned exemplar off and alias on
     hist = [{"round": 1, "champion": {"axes": prev}, "candidates": []},
             {"round": 2, "champion": {"axes": win},
@@ -907,7 +908,7 @@ def test_llm_prompt_lists_carried_candidates_only_when_present(tmp_path):
     hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
     LLMPlanner(chat=chat, artifact_dir=tmp_path / "a").propose(hist, {})
     assert "Re-queued automatically" in seen["p"]
-    assert "rescorer=True" in seen["p"].split("Re-queued automatically", 1)[1][:400]
+    assert "rescorer=true" in seen["p"].split("Re-queued automatically", 1)[1][:400]
     LLMPlanner(chat=chat, artifact_dir=tmp_path / "b").propose(hist[:1], {})
     assert "Re-queued automatically" not in seen["p"]
 
@@ -961,8 +962,8 @@ def test_merge_resets_dependents_of_a_changed_feature_axis():
     """Turning a feature axis off or changing it resets the dependent and count
     axes the candidate does not name — if the champion's stayed, the validation
     rules would drop the whole candidate."""
-    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 4, "fn_k": 2,
-                           "visual_negatives": True, "visual_negative_k": 2,
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_base_k": 4, "exemplar_fn_k": 2,
+                           "visual_negatives": "fp_crop", "visual_negative_k": 2,
                            "text_negatives": "fp_crop", "text_negative_k": 2,
                            "rescorer": True})
     def one(ax):
@@ -970,15 +971,15 @@ def test_merge_resets_dependents_of_a_changed_feature_axis():
         assert out, f"{ax} was dropped"
         return out[0]["axes"]
     off = one({"exemplar": "none"})
-    assert off["exemplar_k"] is None and off["fn_k"] is None
+    assert off["exemplar_base_k"] is None and off["exemplar_fn_k"] is None
     assert off["visual_negatives"] is False and off["visual_negative_k"] is None
     assert off["rescorer"] is True and off["text_negatives"] == "fp_crop"
     base = one({"exemplar": "base"})
-    assert base["fn_k"] is None and base["exemplar_k"] == 4 and base["visual_negatives"]
+    assert base["exemplar_fn_k"] is None and base["exemplar_base_k"] == 4 and base["visual_negatives"]
     assert one({"visual_negatives": False})["visual_negative_k"] is None
     assert one({"text_negatives": False})["text_negative_k"] is None
     # an explicit value is used as given
-    assert one({"exemplar": "base", "exemplar_k": 8})["exemplar_k"] == 8
+    assert one({"exemplar": "base", "exemplar_base_k": 8})["exemplar_base_k"] == 8
 
 
 def test_candidate_identical_to_champion_is_dropped():
@@ -1081,10 +1082,9 @@ def _scripted_chat(*responses):
 
 
 def test_candidates_repeating_carried_ones_are_dropped_and_slots_refilled(tmp_path):
-    """When the planner repeats carried candidates, they are dropped as
-    duplicates and the freed slots are asked for once more — even with the
-    prompt saying not to spend slots on them, the planner can fill most of its
-    slots with carried candidates."""
+    """A planner repeating carried candidates gets them dropped as duplicates and is
+    asked once more for the freed slots — even with the prompt saying not to spend
+    slots on carried candidates, a real run filled 2 of 3 slots with them."""
     hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
     chat, calls = _scripted_chat(
         {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"},
@@ -1099,9 +1099,9 @@ def test_candidates_repeating_carried_ones_are_dropped_and_slots_refilled(tmp_pa
         "dup": "carried_duplicate", "dup2": "carried_duplicate"}
     assert len(calls) == 2                               # asked again only once
     follow = calls[1][-1]["content"]
-    assert "rescorer=True" in follow and "up to 2" in follow
-    assert "Kept from your answer: alias=vlm" in follow     # so kept ones are not repeated
-    assert calls[1][-2]["role"] == "assistant"           # continues the conversation
+    assert "rescorer=true" in follow and "up to 2" in follow
+    assert "Kept from your answer: alias=vlm" in follow     # so kept candidates are not proposed again
+    assert calls[1][-2]["role"] == "assistant"           # continues the earlier response as a conversation
     stored = json.loads((tmp_path / "proposal.json").read_text())
     assert stored["followup"]["response"]["candidates"][0]["id"] == "more"
 
@@ -1172,8 +1172,8 @@ def test_stop_with_only_carried_duplicates_keeps_running(tmp_path):
 
 
 def test_prompt_explains_carried_duplicate():
-    from agentic_configuration_search.planner.llm import PROMPT
-    assert "carried_duplicate" in PROMPT
+    from agentic_configuration_search.planner.llm import _reason
+    assert _reason({"skipped": "carried_duplicate"}) == "it repeats a re-queued candidate"
 
 
 def test_refill_shrinks_history_to_fit_instead_of_skipping(tmp_path):
@@ -1184,7 +1184,7 @@ def test_refill_shrinks_history_to_fit_instead_of_skipping(tmp_path):
 
     filler = [{"round": i, "champion": {"axes": validate_axes({})},   # the carry's previous champion
                "candidates": [{"id": f"f{i}_{j}", "axes": validate_axes(
-                   {"exemplar": "base", "exemplar_k": 2}),
+                   {"exemplar": "base", "exemplar_base_k": 2}),
                    "skipped": "no_material", "note": "x" * 80} for j in range(4)]}
               for i in range(1, 9)]
     carry = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
@@ -1229,13 +1229,13 @@ def test_tried_combos_name_the_champion_itself_first(tmp_path):
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.llm import LLMPlanner
 
-    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 8})
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_base_k": 8})
     history = [
         {"round": 0, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
          "candidates": [], "decision": {"adopted": True, "id": "baseline"}},
         {"round": 1, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
          "candidates": [{"id": "k4", "axes": validate_axes(
-             {"exemplar": "fn_arm", "exemplar_k": 4})}],
+             {"exemplar": "fn_arm", "exemplar_base_k": 4})}],
          "decision": {"adopted": False}},
     ]
     seen = {}
@@ -1249,7 +1249,7 @@ def test_tried_combos_name_the_champion_itself_first(tmp_path):
                 if l.startswith("Combos already tried"))
     items = line.split("): ", 1)[1]
     assert items.startswith("{} = the current champion itself")
-    assert "no_change" in items and items.index("{exemplar_k=4}") > 0
+    assert "no_change" in items and items.index("{exemplar_base_k=4}") > 0
 
 
 def test_refill_respects_disabled_axes(tmp_path):
