@@ -118,9 +118,9 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 
 | axis | materials / training | selection (`fit_dev`) | adoption (holdout) |
 |---|---|---|---|
-| `alias` | train: a few GT crops per class (the candidate's exemplars, or else a GT selection by `mine.exemplar_selection` — k-center by default — of `mine.exemplar_base_per_class`, 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
+| `alias` | train: `mine.caption_crops_per_class` (6) GT crops per class whose short side is at least `mine.caption_min_side` px (32) — apart from the served exemplars, picked by the `mine.exemplar_selection` rule — are captioned by the VLM, and the LLM picks one alias per class. A class the captioner gave no phrase, or with no large-enough crop, gets a reason in the mining report, and the captioner warns when crops get no caption | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
 | `exemplar` | train: `base` takes `exemplar_base_k` GT crops by k-center; `fn_arm` adds `exemplar_fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
-| `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
+| `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM — dropping phrases that name the target itself — to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
 | `visual_negatives` | train: `visual_negative_k` crops per class from the value's source (`fp_crop` mining-pass false positives, `gt_crop` other classes' GT, `background` false positives overlapping no GT) | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
 | `tiling` | none — an inference setting | tiled and untiled configs are chosen from the same grid, shared by all classes (a text-only candidate runs the text pass per tiling variant). If untiled wins, `axis_unused`. Grids ≥ `screen.prescreen_min_grid` are first screened on a `fit_dev` subset | 〃 |
 | `rescorer` | `fit_train`: discriminator training (area statistics over all of train, row cap `rescorer.max_train_rows`) | per-class α grid — identity unless the gain exceeds `rescorer.margin` | 〃 |
@@ -381,20 +381,39 @@ planner's input for the same round.
   more on an unparseable reply, and if that fails too each takes its own
   fallback (drop the phrases, keep the class name, skip the caption batch, no
   notes). Crop notes are a diagnostic signal only and never decide anything.
+  - Each splits a system message (role, rules) from a user message (data). The
+    two paths that send image batches (captioner, crop notes) upscale crops whose
+    short side is below `core.coco.MIN_VLM_CROP_PX`, and the response schema asks
+    for exactly as many entries as the batch has crops.
+  - The captioner puts one class per batch (mixed, "same wording for look-alikes"
+    carries one class's phrases over to another). Every phrase needs a type noun,
+    and a hard-to-make-out crop gets a best guess — the schema rules out an
+    empty list.
+  - Crop notes get a glossary of the error kinds and what `class=` means (the
+    predicted class for a false positive, the true class for a miss), and are told
+    not to restate the kind or cite our upscaling as a cause.
+  - Negative refinement states the pool's source (fp_crop, gt_crop, background)
+    truthfully and blocks only phrases naming the target itself — a negative is
+    attached only to the target's own prompts, so other category names are fine.
+    Rejections come back as rule numbers only (so a long reason cannot be cut off
+    and lose the whole class), and code cuts the `text_negative_k` cap by count.
+  - Category-name checks in alias and negative refinement are whole-word ('fish'
+    does not block 'jellyfish'), and plurals (-s, -es) count as the same name.
 - `--planner deterministic` maps error causes to remedy axes by rule; it backs
   the tests and serves as the A/B control.
 - **Prompt sections.** Objective → Hard constraints (conditions whose breach
   drops a candidate without evaluation — visual_negatives without an exemplar,
   turning a detector-state axis off, turning lora and crop_classifier on
-  together, repeating a combination, a folded tiling grid, OFF axes; lines
-  about disabled axes are left out) → Rules (general rules only — the tiling
+  together, a folded tiling grid, OFF axes; lines about disabled axes are left
+  out. The tried-combinations line below the board states the no-repeat rule) → Rules (general rules only — the tiling
   grid, its cost and how to pick the first grid only when tiling is not
   disabled) → Budget (rounds left, stop counters) → Current champion → Axis
   board → Round history (the last `MAX_HISTORY` = 3 rounds in detail, earlier
   rounds one line each; explanations of the detail rows' fields — fit_dev_cmp,
   tiling_used, unused_axes, modality, neg_eta_used, same_as,
   gate_passed_but_lost, lost_values, wall_min, material — follow right below,
-  only for fields present in some row) → Diagnosis digest (per cause, this
+  only for fields present in some row) → Diagnosis digest (a one-line definition
+  of the error kinds, `ERROR_KINDS` — every FP/FN kind in `core.metrics` — then per cause, this
   round's count in train and held-out and the axis=values that can be proposed
   now for it — left out: disabled axes, values the data blocks, values the
   champion already uses, OFF axes, values with empty material under the current
@@ -425,8 +444,9 @@ planner's input for the same round.
   axis, every remaining value mined empty or untrained). The legend states the
   off value per axis and when a value with empty material may be proposed
   again. Below the table come only details the rows point to — the evidence for
-  the one-time tiling exception, prescreened values, the negative-source
-  explanation, disabled axes and values, the axis retirement rule, the combos
+  the one-time tiling exception, prescreened values, what each axis does
+  (`AXIS_DOC` — exemplar, alias, rescorer, lora, crop_classifier, minus disabled
+  axes), the negative-source explanation, disabled axes and values, the axis retirement rule, the combos
   tried under the current champion (those under it, and earlier ones that do not
   turn the current champion's axes off) and carried candidates. axis_status,
   ledger and gates decide; the board only presents.

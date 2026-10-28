@@ -210,12 +210,13 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
     if "aliases" in inherited:
         aliases = {**parent_mat.aliases, **params.text_aliases}
     elif axes["alias"]:
-        source = {n: bs for n, bs in exemplars.items() if bs}
-        if not source:
-            # alias for a text-only candidate: no served exemplars, but a GT
-            # selection is still needed as the caption source (captioner
-            # output = vocabulary sample for text prompts)
-            source = _gt_selection("alias")
+        # the caption source is not the served exemplars but plenty of large-enough
+        # GT crops per class (captioner output = vocabulary sample for text
+        # prompts) — with a single exemplar or small objects the captioner gives
+        # no phrase and the material comes out empty
+        cache = cache or mine.CropCache(train, onto, out_dir / "gt_crops")
+        source, reports["alias_caption_source"] = mine.caption_sources(
+            train, onto, cache, params, _need_encoder("alias"), rng)
         # the crop->text converter is chosen by the axes value (currently only vlm)
         cap = _require(vlm_caption_fn, "vlm_caption_fn", f"alias={axes['alias']}")
         reports["alias_captioner"] = axes["alias"]
@@ -224,6 +225,13 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
             pools, class_names, params.text_aliases,
             _require(refine_alias_fn, "refine_alias_fn", "alias"))
         aliases = {**generated, **params.text_aliases}   # manual always wins
+        # a class with no source crop shows its reason in the same place — it
+        # never reached the captioner
+        for name, rec in reports["alias_caption_source"].items():
+            if not rec["chosen"] and name not in params.text_aliases:
+                alias_report["rejected"].setdefault(
+                    name, "no caption source crop — no GT with a short side of at "
+                          f"least mine.caption_min_side ({params.caption_min_side}px)")
         reports["alias"] = alias_report
 
     # --- text negative phrases ---
@@ -254,7 +262,7 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
         text_negatives, tn_report = mine.text_negative_candidates(
             pools, class_names,
             _require(refine_negatives_fn, "refine_negatives_fn", "text_negatives"),
-            params.text_negatives_max_per_class)
+            params.text_negatives_max_per_class, src)
         reports["text_negatives"] = tn_report
 
     materials = Materials(exemplars=exemplars, visual_negatives=visual_negatives,

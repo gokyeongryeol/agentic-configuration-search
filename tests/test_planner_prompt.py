@@ -775,3 +775,33 @@ def test_blocked_detector_state_axis_says_not_trained():
     hist = [_round(0, 0, [], f=0.7), _round(1, 0, rows, f=0.7)]
     row = _brow(_prompt(hist), "crop_classifier")
     assert row["status"] == "BLOCKED" and "not trained under this champion" in row["note"]
+
+
+def test_board_explains_what_each_axis_does():
+    """The board does not carry axis names alone — one line per axis says what it
+    does, so the planner does not pick base vs fn_arm from the record only. Axes
+    that are off are not explained."""
+    from agentic_configuration_search.planner.axes import axis_values
+    from agentic_configuration_search.planner.board import _axis_doc_line
+
+    line = _axis_doc_line(axis_values())
+    for token in ("alias", "vlm", "exemplar", "fn_arm", "rescorer", "crop_classifier",
+                  "lora"):
+        assert token in line, token
+    assert "rescorer" not in _axis_doc_line(axis_values(), disabled=("rescorer",))
+
+
+def test_prompt_defines_error_kinds_and_drops_redundant_lines():
+    from agentic_configuration_search.core.metrics import FN_KINDS, FP_KINDS
+    from agentic_configuration_search.planner import llm
+
+    for kind in FP_KINDS + FN_KINDS:
+        assert f"{kind} =" in llm.ERROR_KINDS, kind
+    assert "{error_kinds}" in llm.PROMPT
+    # the tried-combinations line (_combos_line) states the no-exact-repeat rule —
+    # the constraints do not carry it twice
+    from agentic_configuration_search.planner.axis_status import axis_status
+    assert not any("exact combination" in x
+                   for x in llm._constraint_lines((), axis_status([], None)))
+    # how the prompt is assembled is not a rule
+    assert "shown while" not in llm.TILING_RULE

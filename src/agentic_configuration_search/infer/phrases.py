@@ -80,26 +80,36 @@ SYSTEM = ("You filter candidate *negative* phrases for an open-vocabulary object
 
 # This prompt is **a safety filter only**. The refiner sees only phrase text, not
 # the crops, so it does not judge "visually confusable?" — the phrase came from
-# the caption of a real misdetected crop, and its effect is measured by the gate.
-# The refiner checks only rules 1-4, answerable from text alone: using a synonym,
-# part, or parent category of the target as a negative suppresses the target itself.
+# the caption of a source crop (a false detection, another class's GT, or a
+# background false detection), and its effect is measured by the gate. The
+# refiner checks only rules 1-4, answerable from text alone: using a synonym,
+# part, or parent category of the target as a negative suppresses the target
+# itself. Other category names are not blocked — a negative is attached only to
+# the target's own prompts (core.prompts).
+# Where the phrase pool came from — stated truthfully per source (the
+# text_negatives value). gt_crop is not a false detection but another class's GT crop
+SOURCE_INTRO = {
+    "fp_crop": 'crops where the detector wrongly fired for "{target}"',
+    "gt_crop": 'ground-truth crops of the other categories, which may look like "{target}"',
+    "background": 'wrong detections for "{target}" that overlap no ground-truth object',
+}
+
 RULES = """The detector is being prompted to find these categories:
 {categories}
 
-For the category "{target}", an automatic captioner looked at crops that the
-detector ACTUALLY FIRED ON BY MISTAKE, and produced these phrases (with how many
-such crops each phrase came from):
+For the category "{target}", an automatic captioner looked at {source} and
+produced these phrases (with how often each phrase occurred):
 {pool}
 
-These counts are empirical evidence of what the detector confuses with
-"{target}" -- the confusion is already established. Do NOT judge whether the
-confusion looks plausible to you: you cannot see the crops, and a separate
-measurement afterwards decides whether each phrase actually helps.
+These phrases are candidate NEGATIVE prompts for "{target}": a negative only
+suppresses "{target}"'s own prompts, so a phrase naming another category is
+fine. Do NOT judge whether the confusion looks plausible to you: you cannot see
+the crops, and a separate measurement afterwards decides whether each phrase
+actually helps.
 
 Your only job is a SAFETY filter. KEEP every phrase unless one of the following
 holds -- each is answerable from the phrase text alone:
-1. It names, contains, or is a synonym of "{target}" or of any other category
-   in the list above.
+1. It names, contains, or is a synonym of "{target}" itself.
 2. It names a PART or an ATTRIBUTE of "{target}" (e.g. for a cola bottle,
    "red cap" is its cap -- suppressing it would suppress the bottle itself).
 3. It names the object family or material that "{target}" belongs to (e.g. for
@@ -108,9 +118,9 @@ holds -- each is answerable from the phrase text alone:
 4. It is so generic that it would match the target as well (e.g. "object",
    "thing", "red shape").
 
-Return the phrases you keep, unchanged, plus a one-line reason per rejected
-phrase that names which rule (1, 2, 3 or 4) applies. Do not invent other
-grounds for rejection. Keep at most {max_keep}, preferring higher counts."""
+Return the phrases you keep, unchanged, in descending order of count, and each
+rejected phrase with the number of the rule (1, 2, 3 or 4) that applies. Do not
+invent other grounds for rejection."""
 
 SCHEMA = {
     "name": "negative_phrases",
@@ -123,9 +133,11 @@ SCHEMA = {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    # the reason is the rule number only — free text lengthens the
+                    # reply, and a truncated reply leaves the whole class with keep=[]
                     "properties": {"phrase": {"type": "string"},
-                                   "reason": {"type": "string"}},
-                    "required": ["phrase", "reason"],
+                                   "rule": {"type": "integer", "enum": [1, 2, 3, 4]}},
+                    "required": ["phrase", "rule"],
                     "additionalProperties": False,
                 },
             },
@@ -136,11 +148,26 @@ SCHEMA = {
 }
 
 
+def _names(phrase: str, name: str) -> bool:
+    """Does phrase contain name as whole words, or name contain phrase — 'category'
+    does not contain 'cat'. Plurals (-s, -es) count as the same name."""
+    p, n = phrase.lower(), name.lower()
+
+    def within(a, b):
+        return re.search(rf"(?<![a-z0-9]){re.escape(a)}(?:e?s)?(?![a-z0-9])", b) is not None
+    return within(n, p) or within(p, n)
+
+
 def refine_negatives(base_url: str, model: str, target: str, categories: list[str],
                      captions: list[str], *, max_keep: int = 5,
+                     source: str = "fp_crop",
                      session: requests.Session | None = None) -> dict:
-    """Captions → {"keep": [phrase], "rejected": [{phrase, reason}]}.
+    """Captions → {"keep": [phrase], "rejected": [{phrase, rule}]}.
 
+    `source` is where the pool came from (fp_crop, gt_crop, background) — the
+    prompt's opening says so. The max_keep cap is applied by code (it is not in the
+    prompt). Other category names are not blocked — a negative is attached only to
+    the target's own prompts.
     Returns keep=[] on failure — dropping is the safe direction.
     """
     pool = Counter(p for c in captions if c and (p := normalize_caption(c)))
@@ -148,14 +175,15 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
         return {"keep": [], "rejected": [], "error": "empty caption pool"}
     pool_txt = "\n".join(f"- {p!r} ×{n}" for p, n in pool.most_common())
     prompt = RULES.format(categories="\n".join(f"- {c!r}" for c in categories),
-                          target=target, pool=pool_txt, max_keep=max_keep)
+                          target=target, pool=pool_txt,
+                          source=SOURCE_INTRO[source].format(target=target))
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": prompt}],
-        # Each rejected phrase carries a one-line reason, so a large pool makes
-        # long JSON — too small a budget truncates the response and breaks
-        # parsing (json_schema enforcement does not prevent truncation).
+        # A large pool makes a long phrase list — too small a budget truncates
+        # the response and breaks parsing (json_schema enforcement does not
+        # prevent truncation).
         "max_tokens": 1536,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -165,16 +193,17 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
     try:
         parsed = _ask_json(sess, base_url, payload)
         keep = [p for p in parsed.get("keep", []) if isinstance(p, str) and p.strip()]
-        # Mechanical double-check for rule 1 in case the LLM misses it — cheap and harmless
-        lowered = {c.lower() for c in categories}
+        # Mechanical double-check for rule 1 in case the LLM misses it — cheap and
+        # harmless. Only the target's own name is checked (whole words)
         safe, dropped = [], list(parsed.get("rejected", []))
         for p in keep:
-            pl = p.lower()
-            if any(c in pl or pl in c for c in lowered):
-                dropped.append({"phrase": p,
-                                "reason": "rule 1 mechanical check: contains/contained in a category name"})
+            if _names(p, target):
+                dropped.append({"phrase": p, "rule": 1,
+                                "note": "mechanical check: contains the target name"})
                 continue
             safe.append(p)
+        # the cap is cut by code in count order — not relying on the LLM's order
+        safe.sort(key=lambda p: -pool.get(normalize_caption(p), 0))
         return {"keep": safe[:max_keep], "rejected": dropped}
     except Exception as exc:                                  # noqa: BLE001
         log.warning("negative phrase refinement failed (%s: %s) — dropping phrases",
@@ -203,16 +232,17 @@ when the category name is a slug, jargon, or under-descriptive.
 
 Rules:
 1. The phrase must describe "{target}" itself -- not a part of it, not the
-   background, not just the object family it belongs to.
-2. It must NOT describe (or be easily confused with) any OTHER category --
-   in particular, avoid anything that also appears in, or closely resembles,
-   another category's phrase list above.
+   background. A bare family noun ("bottle", "animal") is too broad; a family
+   noun plus a distinguishing attribute ("red soda can") is good.
+2. It must NOT describe (or be easily confused with) any OTHER category -- in
+   particular, avoid anything that closely resembles another category's phrase
+   list above.
 3. Prefer specific over generic; never pick phrases like "object" or "thing".
 4. Return the phrase EXACTLY as it appears in the "{target}" list -- do not
    invent, merge, or reword phrases.
 5. If no phrase adds anything beyond the name "{target}" itself, return null.
 
-Return the chosen phrase unchanged (or null) plus a one-line reason."""
+Give the reason in one short sentence."""
 
 ALIAS_SCHEMA = {
     "name": "alias_phrase",
@@ -221,7 +251,8 @@ ALIAS_SCHEMA = {
         "type": "object",
         "properties": {
             "alias": {"type": ["string", "null"]},
-            "reason": {"type": "string"},
+            # a truncated reply breaks parsing and falls back to alias=None (max_tokens 256)
+            "reason": {"type": "string", "maxLength": 200},
         },
         "required": ["alias", "reason"],
         "additionalProperties": False,
@@ -285,11 +316,10 @@ def refine_alias(base_url: str, model: str, target: str, categories: list[str],
         if alias == target.lower():
             return {"alias": None, "reason": "same as the class name — adds nothing"}
         # Mechanical rule-2 check — drop if it contains/is contained in another
-        # category name (containing its own name is harmless — just more specific)
-        al = alias.lower()
+        # category name as whole words (containing its own name is harmless — just
+        # more specific)
         for c in categories:
-            cl = c.lower()
-            if c != target and (cl in al or al in cl):
+            if c != target and _names(alias, c):
                 return {"alias": None,
                         "reason": f"mechanical check: contains/contained in another category {c!r}"}
         return {"alias": alias, "reason": str(parsed.get("reason", ""))}
@@ -300,45 +330,58 @@ def refine_alias(base_url: str, model: str, target: str, categories: list[str],
 
 # ----------------------------------------------------- VLM captioner (alias source)
 
-VLM_CAPTION_SYSTEM = ("You describe cropped image regions for an "
-                      "open-vocabulary detector's prompt vocabulary. "
-                      "Answer with JSON only.")
+VLM_CAPTION_SYSTEM = ("You write short search phrases for objects in image crops. "
+                      "These phrases become text prompts for an open-vocabulary "
+                      "object detector. Answer with JSON only.")
 
-VLM_CAPTION_RULES = """Each image below is a tight crop of ONE object instance.
-For every crop, give 1-3 short noun phrases describing what the object looks
-like -- the kind of phrase someone would type to search for it.
+VLM_CAPTION_RULES = """Below are {n} crops. Each is a tight crop of ONE object, and all of
+them show instances of the same object category. Crops can be small and
+upscaled, so they may look soft.
 
-- Describe the object itself: its type, material, colour, shape.
+For every crop, give 1-3 short phrases someone would type to search for that
+object:
+- Each phrase must contain a noun naming the object type, optionally with 1-2
+  visual attributes (e.g. "rusty bolted plate", "orange clownfish"); never an
+  attribute alone.
 - Do NOT describe the background, the crop border, or the image quality.
-- Plain lowercase noun phrases, 1-4 words, no sentences, no punctuation.
-- Different crops of the same thing should get consistent wording, so the
-  frequency table downstream is meaningful.
+- Plain lowercase, 1-4 words, no sentences, no punctuation.
+- Use consistent wording for crops that look alike, so the phrase counts are
+  meaningful.
+- If the object is hard to make out, give your single best guess of its type as
+  a plain noun (e.g. "metal plate"). Never return an empty list.
 
-Return one entry per crop, keyed by its index."""
+Return one entry per crop, with "crop" set to the number shown before it."""
 
-VLM_CAPTION_SCHEMA = {
-    "name": "crop_captions",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "captions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "crop": {"type": "integer"},
-                        "phrases": {"type": "array", "items": {"type": "string"}},
+
+def vlm_caption_schema(n: int) -> dict:
+    """Response schema for one batch — exactly one entry per crop, 1-3 phrases each."""
+    return {
+        "name": "crop_captions",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "captions": {
+                    "type": "array",
+                    "minItems": n,
+                    "maxItems": n,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "crop": {"type": "integer", "enum": list(range(n))},
+                            "phrases": {"type": "array", "minItems": 1, "maxItems": 3,
+                                        "items": {"type": "string", "maxLength": 40}},
+                        },
+                        "required": ["crop", "phrases"],
+                        "additionalProperties": False,
                     },
-                    "required": ["crop", "phrases"],
-                    "additionalProperties": False,
                 },
             },
+            "required": ["captions"],
+            "additionalProperties": False,
         },
-        "required": ["captions"],
-        "additionalProperties": False,
-    },
-}
+    }
+
 
 VLM_BATCH = 4            # crops shown per call — more blurs the descriptions, and a
                          # server capping images per prompt (--limit-mm-per-prompt)
@@ -353,12 +396,16 @@ def vlm_caption(rows: list[dict], chat, *, open_image=None,
     The VLM looks at each crop directly, yielding free-form visual descriptions
     rather than "class name + context" phrases that the alias safety rules (own
     name / other-category confusion) would reject. Calls are costly, so crops are
-    batched. Call failures and invalid responses degrade to **an empty result**
+    batched. A batch never mixes classes (the part of the id before '#' is the
+    class) — mixed, the "same wording for look-alikes" rule carries one class's
+    phrases over to another. Small crops are upscaled by the same rule as the
+    diagnosis descriptions. Call failures and invalid responses degrade to **an
+    empty result**
     (mining yields no material, and the loop rejects the candidate as
     no_material)."""
     from PIL import Image
 
-    from ..core.coco import crop_image
+    from ..core.coco import crop_image, upscale_for_vlm
     from ..core.io import data_uri
 
     def _open(path):
@@ -366,9 +413,13 @@ def vlm_caption(rows: list[dict], chat, *, open_image=None,
 
     opener = open_image or _open
     out: dict[str, list[str]] = {}
-    for start in range(0, len(rows), batch):
-        chunk = rows[start:start + batch]
-        parts: list[dict] = [{"type": "text", "text": VLM_CAPTION_RULES}]
+    by_class: dict[str, list[dict]] = {}
+    for r in rows:
+        by_class.setdefault(str(r["id"]).rsplit("#", 1)[0], []).append(r)
+    chunks = [group[start:start + batch] for group in by_class.values()
+              for start in range(0, len(group), batch)]
+    for chunk in chunks:
+        parts: list[dict] = []
         ids: list[str] = []
         for r in chunk:
             try:
@@ -379,13 +430,15 @@ def vlm_caption(rows: list[dict], chat, *, open_image=None,
                 continue
             parts.append({"type": "text", "text": f"crop {len(ids)}:"})
             parts.append({"type": "image_url",
-                          "image_url": {"url": data_uri(crop)}})
+                          "image_url": {"url": data_uri(upscale_for_vlm(crop))}})
             ids.append(r["id"])
         if not ids:
             continue
+        parts.insert(0, {"type": "text", "text": VLM_CAPTION_RULES.format(n=len(ids))})
         try:
-            raw = chat([{"role": "user", "content": parts}],
-                       schema=VLM_CAPTION_SCHEMA)
+            raw = chat([{"role": "system", "content": VLM_CAPTION_SYSTEM},
+                        {"role": "user", "content": parts}],
+                       schema=vlm_caption_schema(len(ids)))
         except Exception as exc:         # noqa: BLE001 — fallback is an empty result
             log.warning("VLM caption call failed (%s) — skipping this batch", exc)
             continue
@@ -397,4 +450,8 @@ def vlm_caption(rows: list[dict], chat, *, open_image=None,
                        if str(x).strip()]
             if isinstance(i, int) and 0 <= i < len(ids) and phrases:
                 out[ids[i]] = phrases
+    if len(out) < len(rows):
+        # a failed call, an unopenable crop or an invalid reply leaves that crop without a caption
+        log.warning("VLM caption: %d of %d crops have no caption",
+                    len(rows) - len(out), len(rows))
     return out

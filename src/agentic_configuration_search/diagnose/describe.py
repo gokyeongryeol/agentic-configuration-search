@@ -25,7 +25,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from ..core.coco import Split, crop_image
+from ..core.coco import MIN_VLM_CROP_PX, Split, crop_image, upscale_for_vlm
 from ..core.io import data_uri
 from .sample import pick_detail
 
@@ -37,43 +37,59 @@ CROPS_PER_CALL = 4       # crops per call — too many at once blurs the descrip
                          # --limit-mm-per-prompt=4 a batch of 6 is rejected **whole**
                          # (400, no notes at all). The default must stay under the
                          # cap — over it the result is not fewer notes but none.
-MIN_CROP_PX = 96         # upscale if the short side is smaller — error crops are
-                         # often a few dozen px, too small for the VLM to read shape
+MIN_CROP_PX = MIN_VLM_CROP_PX   # upscale if the short side is smaller (core.coco.upscale_for_vlm)
 
-SCHEMA = {
-    "name": "crop_notes",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "notes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"crop": {"type": "integer"},
-                                   "note": {"type": "string"}},
-                    "required": ["crop", "note"],
+
+def notes_schema(n: int) -> dict:
+    """Response schema for one batch — exactly one note per crop (one sentence, at most 200 chars)."""
+    return {
+        "name": "crop_notes",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "notes": {
+                    "type": "array",
+                    "minItems": n,
+                    "maxItems": n,
+                    "items": {
+                        "type": "object",
+                        "properties": {"crop": {"type": "integer", "enum": list(range(n))},
+                                       "note": {"type": "string", "maxLength": 200}},
+                        "required": ["crop", "note"],
+                        "additionalProperties": False,
+                    },
                 },
             },
+            "required": ["notes"],
+            "additionalProperties": False,
         },
-        "required": ["notes"],
-    },
-}
+    }
 
-PROMPT_HEAD = (
-    "You will see cropped regions from an object detector's error analysis on "
-    "the train split. For each crop, state in one short sentence what the "
-    "region actually contains and the most likely visual cause of the error "
-    "(e.g. reflection, look-alike object, occlusion, unusual viewpoint, tiny "
-    "or blurry object). The kind tells you which error it is: "
-    "background = a false positive on this region; "
-    "class_confusion = detected as the wrong class; "
-    "missed = this ground-truth object was not detected at all; "
-    "missed_small = a small ground-truth object that was not detected; "
-    "below_threshold = detected, but scored below the class threshold; "
-    "localization = detected, but the box does not overlap the object well; "
-    "duplicate = an extra near-duplicate box on an already-detected object. "
-    "Crops may be upscaled from a few dozen pixels, so they can look soft. "
+
+# The error kinds are all of core.metrics FP_KINDS and FN_KINDS — if one is
+# missing, crops of that kind go out with no definition
+SYSTEM = (
+    "You look at crops from an object detector's error analysis. For each crop, "
+    "write one short sentence: what the region actually shows, then the most "
+    "likely visual cause of the error (e.g. reflection, look-alike object, "
+    "occlusion, unusual viewpoint, tiny or blurry object).\n"
+    "Each crop is labelled with its error kind:\n"
+    "- background = a false positive on a region with no object of interest\n"
+    "- class_confusion = detected, but as the wrong class\n"
+    "- localization = detected, but the box does not overlap the object well\n"
+    "- duplicate = an extra near-duplicate box on an already-detected object\n"
+    "- tiling_artifact = a false positive produced only by the tiled (zoomed-in) "
+    "passes\n"
+    "- missed = this ground-truth object was not detected at all\n"
+    "- missed_small = a small ground-truth object that was not detected\n"
+    "- below_threshold = detected, but scored below the class threshold\n"
+    "class is the class the detector predicted (for false-positive kinds) or the "
+    "true class (for missed kinds). For a false positive, do not assume the crop "
+    "contains that class; say what it actually is, and if it does look like that "
+    "class, say so (possibly a missing label).\n"
+    "Do not restate the error kind. Crops may be upscaled; upscaling is ours, not "
+    "a cause -- judge the original object size from how pixelated the crop looks.\n"
     "Answer with JSON only.")
 
 
@@ -91,13 +107,7 @@ def select_crops(diag_train: dict) -> list[dict]:
 
 def _prepared(crop: Image.Image) -> Image.Image:
     """Upscale, keeping aspect ratio, if the short side is below MIN_CROP_PX."""
-    w, h = crop.size
-    short = min(w, h)
-    if short <= 0 or short >= MIN_CROP_PX:
-        return crop
-    scale = MIN_CROP_PX / short
-    return crop.resize((max(1, round(w * scale)), max(1, round(h * scale))),
-                       Image.LANCZOS)
+    return upscale_for_vlm(crop, MIN_CROP_PX)
 
 
 def _crop_payloads(split: Split, rows: list[dict]) -> tuple[list[dict], list[str]]:
@@ -127,7 +137,7 @@ def _describe_batch(chat, batch: list[dict], uris: list[str]) -> tuple[dict, dic
 
     Crop numbers in the prompt are **0-based within the batch**. Using global
     numbers would silently misalign when the model restarts counting at 0."""
-    parts: list[dict] = [{"type": "text", "text": PROMPT_HEAD}]
+    parts: list[dict] = []
     for i, m in enumerate(batch):
         # Give the class by name — a numeric id is no clue for the description
         label = m.get("category") or f"id {m.get('category_id')}"
@@ -137,7 +147,8 @@ def _describe_batch(chat, batch: list[dict], uris: list[str]) -> tuple[dict, dic
                       "image_url": {"url": uris[m["crop"]]}})
     raw, error = None, None
     try:
-        raw = chat([{"role": "user", "content": parts}], schema=SCHEMA)
+        raw = chat([{"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": parts}], schema=notes_schema(len(batch)))
     except Exception as exc:  # noqa: BLE001 — a failed description just means no description
         error = f"{type(exc).__name__}: {exc}"
         log.warning("crop description call failed (%s) — continuing this batch without notes", error)

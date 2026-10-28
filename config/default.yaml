@@ -107,6 +107,8 @@ mine:                                     # mining quotas and hygiene rules (the
   visual_negative_exclude_gt_iom: 0.7            # exclusion threshold for overlap (IoM) with same-class GT
   embedder_model: facebook/dinov3-vitl16-pretrain-lvd1689m   # gated — HF_TOKEN, or cache + HF_HUB_OFFLINE=1
   device: "cuda:0"                        # device for the embedding and crop-classifier training workers
+  caption_crops_per_class: 6              # alias caption source — GT crops per class (apart from served exemplars)
+  caption_min_side: 32                    # minimum short side (px) of a caption-source crop — smaller ones are left out
   text_aliases: {}                        # manual aliases — always override generated ones
 
 search:                                   # value space of the screen (fit_dev) grid (candidate axes decide what is on)

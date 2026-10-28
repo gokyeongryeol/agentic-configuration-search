@@ -51,6 +51,8 @@ def test_refine_prompt_is_safety_filter_only():
     for token in ("synonym", "part or an attribute", "family or material", "generic"):
         assert token in low, token
     assert "do not invent other" in low
+    # the cap (max_keep) is cut by code — in the prompt, safe phrases over the cap have nowhere to go
+    assert "at most" not in low and "max_keep" not in phrases.RULES
 
 
 class _FakeResp:
@@ -88,14 +90,63 @@ def test_refine_alias_rejects_other_category_overlap(monkeypatch):
 
 
 def test_refine_negatives_rule1_double_check(monkeypatch):
-    """Even if the LLM misses rule 1 (contains the category name), the mechanical check filters it out."""
+    """Even if the LLM misses rule 1 (the target's own name), the mechanical check filters it out.
+    Another category's name is fine as a negative — a negative is attached only to the
+    target's own prompts."""
     monkeypatch.setattr(phrases, "post_with_retry",
-                        lambda *a, **k: _FakeResp({"keep": ["red cat a", "blue ring"],
+                        lambda *a, **k: _FakeResp({"keep": ["red cat a", "cat b", "blue ring"],
                                                    "rejected": []}))
-    out = phrases.refine_negatives("http://x", "m", "cat a", ["cat a"],
-                                   ["red cat a", "blue ring"])
-    assert out["keep"] == ["blue ring"]
-    assert any("rule 1 mechanical check" in r["reason"] for r in out["rejected"])
+    out = phrases.refine_negatives("http://x", "m", "cat a", ["cat a", "cat b"],
+                                   ["red cat a", "cat b", "blue ring"])
+    assert out["keep"] == ["cat b", "blue ring"]
+    assert [r["phrase"] for r in out["rejected"]] == ["red cat a"]
+    assert out["rejected"][0]["rule"] == 1
+
+
+def test_refine_negatives_name_check_is_whole_word(monkeypatch):
+    monkeypatch.setattr(phrases, "post_with_retry",
+                        lambda *a, **k: _FakeResp({"keep": ["category label", "black cat"],
+                                                   "rejected": []}))
+    out = phrases.refine_negatives("http://x", "m", "cat", ["cat"],
+                                   ["category label", "black cat"])
+    assert out["keep"] == ["category label"]
+
+
+def test_refine_negatives_prompt_follows_the_source(monkeypatch):
+    """A gt_crop source is not a false detection — the prompt must state the source truthfully."""
+    sent = []
+
+    def capture(session, url, payload, timeout):
+        sent.append(payload["messages"][-1]["content"])
+        return _FakeResp({"keep": [], "rejected": []})
+    monkeypatch.setattr(phrases, "post_with_retry", capture)
+    for src in ("fp_crop", "gt_crop", "background"):
+        phrases.refine_negatives("http://x", "m", "cat a", ["cat a", "cat b"], ["p"],
+                                 source=src)
+    fp, gt, bg = (" ".join(t.lower().split()) for t in sent)
+    assert "wrongly fired" in fp
+    assert "ground-truth crops of the other categories" in gt and "wrongly fired" not in gt
+    assert "overlap no ground-truth object" in bg
+
+
+def test_refine_negatives_rejections_are_rule_numbers():
+    rej = phrases.SCHEMA["schema"]["properties"]["rejected"]["items"]
+    assert rej["properties"]["rule"]["enum"] == [1, 2, 3, 4]
+    assert "reason" not in rej["properties"]
+
+
+def test_refine_alias_other_category_check_is_whole_word(monkeypatch):
+    """With a 'fish' category, 'translucent jellyfish' does not contain another category's name."""
+    monkeypatch.setattr(phrases, "post_with_retry",
+                        lambda *a, **k: _FakeResp({"alias": "translucent jellyfish",
+                                                   "reason": "x"}))
+    out = phrases.refine_alias("http://x", "m", "jellyfish", ["jellyfish", "fish"],
+                               ["translucent jellyfish"])
+    assert out["alias"] == "translucent jellyfish"
+
+
+def test_refine_alias_reason_is_capped():
+    assert phrases.ALIAS_SCHEMA["schema"]["properties"]["reason"]["maxLength"] <= 200
 
 
 def test_refine_failure_drops_phrases(monkeypatch):
@@ -163,7 +214,7 @@ def test_vlm_caption_rows_contract():
     seen = {}
 
     def chat(messages, **kw):
-        seen["parts"] = messages[0]["content"]
+        seen["parts"] = messages[-1]["content"]          # the user message after the system one
         return {"captions": [{"crop": 0, "phrases": ["shiny red disc", "red dot"]},
                              {"crop": 1, "phrases": ["red dot"]}]}
 
@@ -186,3 +237,96 @@ def test_vlm_batches_stay_under_server_image_limit():
     from agentic_configuration_search.infer import phrases
 
     assert phrases.VLM_BATCH == describe.CROPS_PER_CALL <= 4
+
+
+def _vlm_rows(names_counts, size=(20, 20)):
+    rows = []
+    for name, n in names_counts:
+        for i in range(n):
+            rows.append({"id": f"{name}#{i}", "image": "a.png",
+                         "bbox_xyxy": [0, 0, size[0], size[1]]})
+    return rows
+
+
+def _echo_chat(calls):
+    """One phrase per crop — keeps a record of the calls."""
+    def chat(messages, **kw):
+        user = messages[-1]["content"]
+        n = sum(1 for p in user if p.get("type") == "image_url")
+        calls.append({"messages": messages, "schema": kw.get("schema"), "n": n})
+        return {"captions": [{"crop": i, "phrases": ["red disc"]} for i in range(n)]}
+    return chat
+
+
+def test_vlm_caption_batches_never_mix_classes():
+    """One call holds crops of one class only — mixed, the "same wording for
+    look-alikes" rule carries one class's phrases over to another."""
+    from PIL import Image
+    calls = []
+    rows = _vlm_rows([("cat a", 3), ("cat b", 3)])
+    out = phrases.vlm_caption(rows, _echo_chat(calls),
+                              open_image=lambda p: Image.new("RGB", (40, 40)), batch=4)
+    assert [c["n"] for c in calls] == [3, 3]
+    assert set(out) == {r["id"] for r in rows}
+
+
+def test_vlm_caption_schema_is_exact_per_batch():
+    """One entry per crop, 1-3 phrases per entry — allowing an empty list lets the
+    model give nothing on small crops."""
+    from PIL import Image
+    calls = []
+    phrases.vlm_caption(_vlm_rows([("cat a", 3)]), _echo_chat(calls),
+                        open_image=lambda p: Image.new("RGB", (40, 40)), batch=4)
+    caps = calls[0]["schema"]["schema"]["properties"]["captions"]
+    assert caps["minItems"] == caps["maxItems"] == 3
+    item = caps["items"]["properties"]
+    assert item["crop"]["enum"] == [0, 1, 2]
+    assert item["phrases"]["minItems"] == 1 and item["phrases"]["maxItems"] == 3
+    assert item["phrases"]["items"]["maxLength"] <= 40
+
+
+def test_vlm_caption_upscales_small_crops():
+    """Small crops are upscaled by the same rule as the diagnosis descriptions."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    from agentic_configuration_search.core.coco import MIN_VLM_CROP_PX
+    calls = []
+    phrases.vlm_caption(_vlm_rows([("cat a", 1)], size=(12, 24)), _echo_chat(calls),
+                        open_image=lambda p: Image.new("RGB", (40, 40)))
+    url = next(p for p in calls[0]["messages"][-1]["content"]
+               if p.get("type") == "image_url")["image_url"]["url"]
+    img = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+    assert min(img.size) == MIN_VLM_CROP_PX
+
+
+def test_vlm_caption_prompt_intent():
+    """One batch is one category, phrases carry a type noun, a best guess when unclear — never empty."""
+    low = " ".join(phrases.VLM_CAPTION_RULES.lower().split())
+    assert "same object category" in low
+    assert "noun" in low and "never an attribute alone" in low
+    assert "never return an empty list" in low
+    assert "background" in low                       # no background, border or image quality
+    assert "detector" in phrases.VLM_CAPTION_SYSTEM.lower()
+
+
+def test_refine_negatives_cap_keeps_the_most_frequent(monkeypatch):
+    """The cap is cut by code in count order — not relying on the order the LLM returned."""
+    monkeypatch.setattr(phrases, "post_with_retry",
+                        lambda *a, **k: _FakeResp({"keep": ["rare ring", "common disc"],
+                                                   "rejected": []}))
+    out = phrases.refine_negatives("http://x", "m", "cat a", ["cat a"],
+                                   ["rare ring", "common disc", "common disc"], max_keep=1)
+    assert out["keep"] == ["common disc"]
+
+
+def test_name_check_covers_plurals(monkeypatch):
+    """Plurals are the same name — 'soccer balls' is a phrase for the target 'soccer ball'."""
+    monkeypatch.setattr(phrases, "post_with_retry",
+                        lambda *a, **k: _FakeResp({"keep": ["soccer balls", "glass boxes", "ballroom"],
+                                                   "rejected": []}))
+    out = phrases.refine_negatives("http://x", "m", "soccer ball", ["soccer ball"],
+                                   ["soccer balls", "glass boxes", "ballroom"])
+    assert out["keep"] == ["glass boxes", "ballroom"]

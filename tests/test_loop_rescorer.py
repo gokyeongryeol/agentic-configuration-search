@@ -85,7 +85,7 @@ def _fakes():
                                  for r in rows},
         vlm_caption_fn=lambda rows: {r["id"]: [f"{r['id'].split('#')[0]} look"]
                                  for r in rows},
-        refine_negatives_fn=lambda name, cn, pool, mk: {"keep": [],
+        refine_negatives_fn=lambda name, cn, pool, mk, src: {"keep": [],
                                                         "rejected": []},
         refine_alias_fn=lambda name, cn, pool, others: {"alias": None,
                                                         "reason": "none"},
