@@ -31,6 +31,7 @@ HF_HUB_OFFLINE=1 .venv/bin/acs run --config c.yaml             # → runs/<datas
 .venv/bin/acs report runs/<ds>/run [--config c.yaml]            # redraw report.md
 .venv/bin/acs ab runs/a runs/b                                  # compare two runs
 .venv/bin/python scripts/predict.py runs/<ds>/run --config c.yaml --split test   # final measurement
+.venv/bin/python scripts/ablate.py runs/<ds>/run --config c.yaml --gpu 4 --out ablate/<ds>.json   # marginal contribution per component
 scripts/run_parallel.sh --rounds 10                             # demo datasets in parallel across GPUs
 ```
 

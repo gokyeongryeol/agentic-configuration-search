@@ -494,3 +494,14 @@ glossary appendix at the end. Its material
   detections before the τ cut (τ_c is only the F(β) operating point).
 - `--config` is required because the run directory does not snapshot the
   config.
+
+**The marginal contribution per component is measured by `scripts/ablate.py`.**
+The loop's Δ is the increment at adoption, so it is confounded by adoption
+order. ablate keeps the champion's setting fixed, removes one component at a
+time (the axis and its dependents — count axes, and visual_negatives when
+exemplar goes), re-measures on holdout, and reports F(champion) − F(champion \ C)
+with a paired-bootstrap CI. Removing a detector-state axis takes (weights,
+artifact, λ) down together by the replay rule above and empties the pass cache.
+Removing a mining axis inherits the champion's materials for every other axis,
+as the loop does, and the re-mining LLM refinement and VLM caption hooks only
+attach to a running planner vLLM (none is launched).
