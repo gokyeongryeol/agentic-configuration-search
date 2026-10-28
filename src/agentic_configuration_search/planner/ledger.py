@@ -31,7 +31,7 @@ adoption — the same rule as the tiling fold gate, planner.gates.under_champion
 A value that lost under an old champion may work in the new champion's context.
 
 **Same value**: the axis's main value (alias=vlm, exemplar=fn_arm,
-text_negatives=fp_crop …). Quantity axes (exemplar_k, fn_k, text_negative_k,
+text_negatives=fp_crop …). Quantity axes (exemplar_base_k, exemplar_fn_k, text_negative_k,
 visual_negative_k) are variants of their function axis's value. A candidate
 changing several axes is counted once per contained value — a combination
 containing any clearly-lost value is a variant of that value (prescreened). A
@@ -55,7 +55,7 @@ from .gates import champion_round, tiling_gate, under_champion
 
 # quantity axis → function axis — a candidate changing only the quantity is a
 # variant of that function axis's value
-K_PARENT = {"exemplar_k": "exemplar", "fn_k": "exemplar",
+K_PARENT = {"exemplar_base_k": "exemplar", "exemplar_fn_k": "exemplar",
             "text_negative_k": "text_negatives",
             "visual_negative_k": "visual_negatives"}
 # axes the lost-value prescreen can filter — those whose expensive part comes
@@ -86,8 +86,8 @@ def value_keys(axes: dict, champion: dict) -> tuple:
     sorted tuple.
 
     Quantity axes fold into the function axis's (candidate) value:
-    exemplar=fn_arm + fn_k=4 is the single ("exemplar", "fn_arm"). Changing only
-    exemplar_k is a variant of the champion's exemplar value."""
+    exemplar=fn_arm + exemplar_fn_k=4 is the single ("exemplar", "fn_arm"). Changing only
+    exemplar_base_k is a variant of the champion's exemplar value."""
     axes, champion = axes or {}, champion or {}
     keys = set()
     for k, v in axes.items():

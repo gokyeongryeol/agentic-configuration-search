@@ -254,7 +254,7 @@ class MineCfg:
     """Mining parameters — all hygiene rules and quotas. The adoption gate
     belongs to the loop.
     """
-    exemplars_per_class: int = 4          # default quotas 4/2/1/1
+    exemplar_base_per_class: int = 4      # default quotas 4/2/1/1
     exemplar_selection: str = "kcenter"   # one of EXEMPLAR_SELECTIONS
     # Outlier trim before kcenter — drop only candidates whose centroid distance
     # exceeds median + k·MAD (null = no trim). 3.0 is about 3σ under a normal distribution.
@@ -262,7 +262,7 @@ class MineCfg:
     # The FN arm trims less than base (a larger multiple) — filter the noise but
     # keep the diversity that broadly covers missed appearances.
     fn_kcenter_outlier_mad: float | None = 3.5
-    fn_exemplars_per_class: int = 2
+    exemplar_fn_per_class: int = 2
     fn_min_candidates: int = 5            # headroom pre-filter (0 = off)
     fn_min_miss_rate: float = 0.02
     fn_min_area_ratio: float = 0.3        # cut tiny candidates relative to median GT area

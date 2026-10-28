@@ -77,7 +77,7 @@ line) that equals the baseline behavior exactly.
 | axis | values |
 |---|---|
 | `alias` — Prompt alias | `false`: class name only (manual aliases in `mine.text_aliases` are always included)<br>`vlm`: alias proposed by a multimodal LLM that looks at the crops |
-| `exemplar` — Visual exemplar | `none`: text prompts only<br>`base`: GT crops as image prompts (by default chosen for diversity by embedding k-center — `mine.exemplar_selection`)<br>`fn_arm`: `base` + crops of GT objects missed when train is inferred with the `base` exemplars<br>counts `exemplar_k` ∈ {1, 2, 4, 8} (default 4), `fn_k` ∈ {1, 2, 4} (default 2) |
+| `exemplar` — Visual exemplar | `none`: text prompts only<br>`base`: GT crops as image prompts (by default chosen for diversity by embedding k-center — `mine.exemplar_selection`)<br>`fn_arm`: `base` + crops of GT objects missed when train is inferred with the `base` exemplars<br>counts `exemplar_base_k` ∈ {1, 2, 4, 8} (default 4), `exemplar_fn_k` ∈ {1, 2, 4} (default 2) |
 | `text_negatives` — Negative text | `false`: no suppression phrases<br>`fp_crop`: phrases from false-positive crops of the mining pass — the mining pass infers train with the candidate's exemplars only (a GT k-center selection if it has none), without tiling or negatives<br>`gt_crop`: phrases from other classes' GT crops (suppress confusion — not valid on single-class datasets)<br>`background`: phrases from the same mining pass's false positives that overlap no GT of any class (suppress background)<br>count `text_negative_k` ∈ {1, 2, 4} (default 1) |
 | `visual_negatives` — Negative visual | `false`: no suppression crops<br>`true`: false-positive crops of the mining pass (the same as `fp_crop`) as negative image prompts (needs `exemplar`), emulated as IoU suppression. The suppression IoU threshold is chosen on fit_dev by screen, one config shared across classes, among a config without negatives and `search.neg_eta_grid` (0.25, 0.35, 0.5, 0.65, 0.75 — lower suppresses more)<br>count `visual_negative_k` ∈ {1, 2, 4} (default 1) |
 | `rescorer` — Score calibration | `false`: detection scores as-is<br>`true`: a discriminator recalibrates scores. The per-class mixing weight α_c is chosen on fit_dev from `rescorer.alphas` (0, 0.1, 0.25, 0.5, 1, 2, 3, 4), and is non-zero only when the gain exceeds `rescorer.margin` (α_c = 0 is the original score) |
@@ -90,7 +90,7 @@ is better on fit_dev (exemplar against text prompts per class, tiling against
 the untiled config).
 
 Axes not to search on a dataset go in `search.disabled_axes` by the axis keys
-in the table (e.g. `[lora, tiling]`). The count keys (`exemplar_k`, `fn_k`,
+in the table (e.g. `[lora, tiling]`). The count keys (`exemplar_base_k`, `exemplar_fn_k`,
 `text_negative_k`, `visual_negative_k`) can be disabled on their own too (the
 count stays at its default or the champion's value), and
 `search.disabled_values` bans single values (e.g. `{text_negatives: [gt_crop]}`).
@@ -118,8 +118,8 @@ holdout (thresholds included) feeds materials (`test_materialize_purity` and
 
 | axis | materials / training | selection (`fit_dev`) | adoption (holdout) |
 |---|---|---|---|
-| `alias` | train: a few GT crops per class (the candidate's exemplars, or else a GT selection by `mine.exemplar_selection` — k-center by default — of `mine.exemplars_per_class`, 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
-| `exemplar` | train: `base` takes `exemplar_k` GT crops by k-center; `fn_arm` adds `fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
+| `alias` | train: a few GT crops per class (the candidate's exemplars, or else a GT selection by `mine.exemplar_selection` — k-center by default — of `mine.exemplar_base_per_class`, 4) are captioned by the VLM, and the LLM picks one alias per class | carried in the text pass's prompts, so it counts in the per-class modality choice below | holdout gate |
+| `exemplar` | train: `base` takes `exemplar_base_k` GT crops by k-center; `fn_arm` adds `exemplar_fn_k` crops of GT missed by the mining pass | one config shared by all classes from the semantic pass's config grid (max F sum), then per class a choice against the text pass of the same config | 〃 |
 | `text_negatives` | train: `fp_crop` (mining-pass false positives), `gt_crop` (other classes' GT) or `background` (false positives overlapping no GT) crops are captioned by the VLM and refined by the LLM to at most `text_negative_k` phrases per class | carried in the text pass's prompts, so it counts in the modality choice. For a candidate without exemplars, the text pass sweeps the suppression IoU over `search.neg_eta_grid`, one config shared by all classes; with exemplars it follows the semantic config | 〃 |
 | `visual_negatives` | train: `visual_negative_k` mining-pass false-positive crops per class | from the semantic grid, one config shared by all classes among the one without negatives and the suppression IoU grid (`search.neg_eta_grid`) | 〃 |
 | `tiling` | none — an inference setting | tiled and untiled configs are chosen from the same grid, shared by all classes (a text-only candidate runs the text pass per tiling variant). If untiled wins, `axis_unused`. Grids ≥ `screen.prescreen_min_grid` are first screened on a `fit_dev` subset | 〃 |
@@ -160,8 +160,8 @@ planner's input for the same round.
   (no point-estimate win is required); otherwise it is rejected as
   `lost_value_prescreen` without the rescorer refit, full screen or holdout
   (`screen.lost_value_prescreen`, on by default). A value is the axis's main
-  value (alias=vlm, exemplar=fn_arm …) and quantity axes (`exemplar_k`,
-  `fn_k`, …) are its variants. A combination containing any clearly-lost value
+  value (alias=vlm, exemplar=fn_arm …) and quantity axes (`exemplar_base_k`,
+  `exemplar_fn_k`, …) are its variants. A combination containing any clearly-lost value
   is a variant too. The axes covered are alias, exemplar, text_negatives,
   visual_negatives and tiling — rescorer, lora and crop_classifier are left out
   because their expensive part (refit, training) comes before the comparison,

@@ -92,8 +92,8 @@ query:                                    # detector-call contract, fixed regard
   threshold_floor: 0.03                   # multimodal_threshold — floor for τ_c
 
 mine:                                     # mining quotas and hygiene rules (the adoption gate belongs to the loop)
-  exemplars_per_class: 4                  # default quotas 4/2/1/1.
-  fn_exemplars_per_class: 2               #   count axes (exemplar_k etc.) may override per candidate
+  exemplar_base_per_class: 4              # default quotas 4/2/1/1.
+  exemplar_fn_per_class: 2                #   count axes (exemplar_base_k etc.) may override per candidate
   visual_negatives_per_class: 1
   text_negatives_max_per_class: 1
   exemplar_selection: kcenter             # kcenter | mean | random

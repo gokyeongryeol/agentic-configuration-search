@@ -59,9 +59,9 @@ def test_value_keys_fold_quantity_axes_into_their_feature():
     from agentic_configuration_search.planner.ledger import value_keys
 
     champ = validate_axes({"exemplar": "base"})
-    fn = validate_axes({"exemplar": "fn_arm", "fn_k": 4})
+    fn = validate_axes({"exemplar": "fn_arm", "exemplar_fn_k": 4})
     assert value_keys(fn, champ) == (("exemplar", "fn_arm"),)
-    k_only = validate_axes({"exemplar": "base", "exemplar_k": 2})
+    k_only = validate_axes({"exemplar": "base", "exemplar_base_k": 2})
     assert value_keys(k_only, champ) == (("exemplar", "base"),)   # a variant of the champion's value
     combo = validate_axes({"exemplar": "fn_arm", "alias": "vlm"})
     assert value_keys(combo, champ) == (("alias", "vlm"), ("exemplar", "fn_arm"))
@@ -172,7 +172,7 @@ def test_ledger_counts_outcomes_minutes_and_merges_arm_rows():
             _round(1, 0, [_cand("l", lora=True, wall=18.0),
                           _cand("l", lora=True, skipped="lora_gate", wall=18.0),
                           _cand("u", tiling=2, skipped="axis_unused", wall=3.0),
-                          _cand("u2", tiling=2, exemplar_k=None, skipped="axis_unused",
+                          _cand("u2", tiling=2, exemplar_base_k=None, skipped="axis_unused",
                                 wall=2.0, alias="vlm")])]
     led = _ledger(hist)
     assert led["lora=True"].tries == 1 and led["lora=True"].status == "arm_gate"
@@ -187,7 +187,7 @@ def test_status_prefers_the_furthest_outcome():
     ev = {"e": {"micro_f_beta": 0.7, "gate": {"delta": 0.001, "lo": -0.01}}}
     hist = [_round(0, 0, []),
             _round(1, 0, [_cand("s", alias="vlm"), _cand("e", alias="vlm",
-                                                          exemplar_k=None),
+                                                          exemplar_base_k=None),
                           _cand("u", alias="vlm", tiling=2, skipped="axis_unused")],
                    evaluated=ev)]
     assert _ledger(hist)["alias=vlm"].status == "evaluated"
@@ -224,10 +224,10 @@ def test_tried_under_champion_drops_old_combos_that_turn_champion_axes_off():
             _round(1, 1, [_cand("old_alias", alias="vlm"),
                           {**_cand("w", exemplar="base"), "adopted": True}],
                    champ=base),
-            _round(2, 1, [_cand("fn", exemplar="fn_arm", fn_k=4, champ=base)],
+            _round(2, 1, [_cand("fn", exemplar="fn_arm", exemplar_fn_k=4, champ=base)],
                    champ=base)]
     lines = tried_under_champion(hist)
-    assert "exemplar=fn_arm, fn_k=4" in lines          # under the current champion
+    assert "exemplar=fn_arm, exemplar_fn_k=4" in lines          # under the current champion
     # the old combo alias=vlm (exemplar=none) turns the champion's exemplar off — left out
     assert not any("alias=vlm" in x for x in lines)
 

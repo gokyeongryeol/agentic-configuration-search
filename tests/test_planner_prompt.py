@@ -50,7 +50,7 @@ def _history():
         _round(2, 1, [{**_row("t3", tiling=3, champ=base, skipped="axis_unused",
                               wall=20.0), "unused_axes": ["tiling"],
                        "tiling_used": False},
-                      _row("fn", exemplar="fn_arm", fn_k=4, champ=base, ub=0.004,
+                      _row("fn", exemplar="fn_arm", exemplar_fn_k=4, champ=base, ub=0.004,
                            delta=0.003, wall=25.0)], champ=base),
         _round(3, 1, [_row("vlm", alias="vlm", champ=base, ub=-0.004, delta=-0.012,
                            wall=8.0)], champ=base, evaluated=ev3),
@@ -140,7 +140,7 @@ def test_ledger_table_lists_values_with_status_and_prescreen():
     assert "folded" in t3
     # row order: clearly-lost values first
     assert ledger.index("alias=vlm |") < ledger.index("exemplar=fn_arm |")
-    assert "{exemplar=fn_arm, fn_k=4}" in ledger and "{alias=vlm}" in ledger
+    assert "{exemplar=fn_arm, exemplar_fn_k=4}" in ledger and "{alias=vlm}" in ledger
 
     allowed = p.split("## Allowed moves", 1)[1].split("## Round history", 1)[0]
     assert "Prescreened values" in allowed and "alias=vlm (round 3 vlm" in allowed
@@ -322,7 +322,7 @@ def test_runner_feeds_budget_card_into_the_prompt(big_root, tmp_path,  # noqa: F
 
 # --- untried axes ----------------------------------------------------------------
 # Why: in a validation run with one candidate per round the planner proposed four
-# exemplar_k variants before reaching crop_classifier, an axis that had been
+# exemplar_base_k variants before reaching crop_classifier, an axis that had been
 # worth +0.06 in earlier runs. With few candidates the order is the budget.
 
 def _untried(p):
@@ -341,7 +341,7 @@ def test_untried_axes_line_lists_enabled_axes_not_tried_under_the_champion():
     for axis in ("text_negatives", "visual_negatives", "rescorer", "lora",
                  "crop_classifier"):
         assert axis in names, axis
-    for axis in ("tiling", "exemplar", "alias", "exemplar_k", "fn_k"):
+    for axis in ("tiling", "exemplar", "alias", "exemplar_base_k", "exemplar_fn_k"):
         assert axis not in names.replace("visual_negatives", "").replace(
             "text_negatives", ""), axis
     assert "prefer one of them over another variant of an already-tried value" in line

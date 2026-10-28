@@ -21,17 +21,17 @@ def _ax(**kw):
 
 def test_inherit_plan_keeps_unchanged_axes():
     """Same axis value → inherit; changed → re-mine. No parent → re-mine everything."""
-    champ = _ax(exemplar="base", exemplar_k=1, alias="vlm")
+    champ = _ax(exemplar="base", exemplar_base_k=1, alias="vlm")
     # candidate that only turns on alias → exemplar inherited
-    cand = _ax(exemplar="base", exemplar_k=1, alias="vlm", rescorer=True)
+    cand = _ax(exemplar="base", exemplar_base_k=1, alias="vlm", rescorer=True)
     assert inherit_plan(cand, champ) == {"exemplars", "aliases",
                                          "visual_negatives", "text_negatives"}
     # candidate raising exemplar → only exemplar re-mined, alias inherited
-    cand2 = _ax(exemplar="base", exemplar_k=2, alias="vlm")
+    cand2 = _ax(exemplar="base", exemplar_base_k=2, alias="vlm")
     plan2 = inherit_plan(cand2, champ)
     assert "exemplars" not in plan2 and "aliases" in plan2
     # raising to fn_arm also re-mines exemplar (needs chosen_ann_ids)
-    cand3 = _ax(exemplar="fn_arm", exemplar_k=1, alias="vlm")
+    cand3 = _ax(exemplar="fn_arm", exemplar_base_k=1, alias="vlm")
     assert "exemplars" not in inherit_plan(cand3, champ)
     # no parent → no inheritance
     assert inherit_plan(cand, None) == set()
@@ -85,10 +85,10 @@ def test_changed_axis_is_remined(dataset_root, tmp_path):
                  caption_fn=lambda rows: {r["id"]: ["x look"] for r in rows},
                  vlm_caption_fn=lambda rows: {r["id"]: ["x look"] for r in rows},
                  refine_alias_fn=lambda n, cn, p, o: {"alias": p[0], "reason": "t"})
-    champ_axes = _ax(exemplar="base", exemplar_k=1)
+    champ_axes = _ax(exemplar="base", exemplar_base_k=1)
     parent = tmp_path / "p"
     m0 = materialize(cfg, ds, champ_axes, parent, seed=0, **fakes)
-    cand = _ax(exemplar="base", exemplar_k=2)
+    cand = _ax(exemplar="base", exemplar_base_k=2)
     m1 = materialize(cfg, ds, cand, tmp_path / "c", seed=0,
                      parent=parent, parent_axes=champ_axes, **fakes)
     n0 = sum(len(v) for v in m0.exemplars.values())

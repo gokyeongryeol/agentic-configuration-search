@@ -79,9 +79,9 @@ def trajectory(run_dir: Path) -> dict:
 
 # --------------------------------------------------------------- candidate attempts
 
-# count keys roll up to their axis — a candidate that only changes exemplar_k is
+# count keys roll up to their axis — a candidate that only changes exemplar_base_k is
 # an exemplar attempt too (diagnose.story)
-_AXIS_PARENT = {"exemplar_k": "exemplar", "fn_k": "exemplar",
+_AXIS_PARENT = {"exemplar_base_k": "exemplar", "exemplar_fn_k": "exemplar",
                 "visual_negative_k": "visual_negatives",
                 "text_negative_k": "text_negatives"}
 

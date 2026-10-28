@@ -68,7 +68,7 @@ def _spread_encode(cache):
 
 def test_gt_exemplars_kcenter_and_chosen_ids(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplars_per_class=2, kcenter_outlier_mad=None)
+    params = _params(exemplar_base_per_class=2, kcenter_outlier_mad=None)
     ex, chosen = mine.gt_exemplars(train, onto, cache, params,
                                    _spread_encode(cache), random.Random(0))
     for cid in cache.prompt_pool:
@@ -86,7 +86,7 @@ def test_gt_exemplars_prefetches_all_classes_in_one_call(train, onto, tmp_path):
     before the per-class calls — the real implementation embeds c1..cN in one
     worker run (one model load). The selection equals the one without prefetch."""
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplars_per_class=2, kcenter_outlier_mad=None)
+    params = _params(exemplar_base_per_class=2, kcenter_outlier_mad=None)
     base = _spread_encode(cache)
     prefetched = []
 
@@ -105,7 +105,7 @@ def test_gt_exemplars_prefetches_all_classes_in_one_call(train, onto, tmp_path):
 
 def test_gt_exemplars_random_skips_prefetch(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplar_selection="random", exemplars_per_class=2)
+    params = _params(exemplar_selection="random", exemplar_base_per_class=2)
 
     def encode_fn(cid, paths):
         raise AssertionError("the random path does not call the embedder")
@@ -116,7 +116,7 @@ def test_gt_exemplars_random_skips_prefetch(train, onto, tmp_path):
 
 def test_gt_exemplars_random_is_seeded(train, onto, tmp_path):
     cache = mine.CropCache(train, onto, tmp_path / "c")
-    params = _params(exemplar_selection="random", exemplars_per_class=2)
+    params = _params(exemplar_selection="random", exemplar_base_per_class=2)
 
     def no_encode(cid, paths):
         raise AssertionError("the random path must not call the embedder")
@@ -180,7 +180,7 @@ def _fn_setup(train, onto, tmp_path, **params_over):
 
 def test_fn_headroom_filter(train, onto, tmp_path):
     cache, params = _fn_setup(train, onto, tmp_path,
-                              fn_min_candidates=3, fn_exemplars_per_class=2)
+                              fn_min_candidates=3, exemplar_fn_per_class=2)
     cid = 1
     missed = cache.prompt_pool[cid][:2]           # 2 candidates < 3
     boxes, report = mine.fn_exemplar_candidates(
@@ -205,7 +205,7 @@ def test_fn_miss_rate_filter(train, onto, tmp_path):
 def test_fn_excludes_already_chosen(train, onto, tmp_path):
     cache, params = _fn_setup(train, onto, tmp_path,
                               fn_min_candidates=0, fn_min_miss_rate=0.0,
-                              fn_exemplars_per_class=5)
+                              exemplar_fn_per_class=5)
     cid = 1
     missed = list(cache.prompt_pool[cid])
     chosen = {cid: {missed[0].id}}
@@ -219,7 +219,7 @@ def test_fn_excludes_already_chosen(train, onto, tmp_path):
 def test_fn_candidates_report_added(train, onto, tmp_path):
     cache, params = _fn_setup(train, onto, tmp_path,
                               fn_min_candidates=0, fn_min_miss_rate=0.0,
-                              fn_exemplars_per_class=2)
+                              exemplar_fn_per_class=2)
     cid = 1
     missed = list(cache.prompt_pool[cid])         # 5 -> 2 via kcenter
     boxes, report = mine.fn_exemplar_candidates(

@@ -1945,7 +1945,7 @@ def _neg_eta_record(c: dict) -> dict:
 # their safe point too
 _UNUSED_OFF = {
     "tiling": {"tiling": False},
-    "exemplar": {"exemplar": "none", "exemplar_k": None, "fn_k": None,
+    "exemplar": {"exemplar": "none", "exemplar_base_k": None, "exemplar_fn_k": None,
                  "visual_negatives": False, "visual_negative_k": None},
     "visual_negatives": {"visual_negatives": False, "visual_negative_k": None},
 }

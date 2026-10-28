@@ -276,22 +276,22 @@ def test_history_window_zero_means_no_history():
 
 def test_quantity_axes_require_their_feature():
     """Quantity axes are meaningful only when their feature axis is on."""
-    validate_axes({"exemplar": "base", "exemplar_k": 2})           # OK
-    validate_axes({"exemplar": "fn_arm", "fn_k": 4})               # OK
+    validate_axes({"exemplar": "base", "exemplar_base_k": 2})           # OK
+    validate_axes({"exemplar": "fn_arm", "exemplar_fn_k": 4})               # OK
     validate_axes({"text_negatives": "fp_crop", "text_negative_k": 4})  # OK
-    with pytest.raises(ValueError, match="exemplar_k"):
-        validate_axes({"exemplar_k": 2})                # quantity with exemplar=none
-    with pytest.raises(ValueError, match="fn_k"):
-        validate_axes({"exemplar": "base", "fn_k": 4})  # not fn_arm
+    with pytest.raises(ValueError, match="exemplar_base_k"):
+        validate_axes({"exemplar_base_k": 2})                # quantity with exemplar=none
+    with pytest.raises(ValueError, match="exemplar_fn_k"):
+        validate_axes({"exemplar": "base", "exemplar_fn_k": 4})  # not fn_arm
     with pytest.raises(ValueError, match="visual_negative_k"):
         validate_axes({"visual_negative_k": 2})
-    with pytest.raises(ValueError, match="axes.exemplar_k"):
-        validate_axes({"exemplar": "base", "exemplar_k": 3})  # value off the grid
+    with pytest.raises(ValueError, match="axes.exemplar_base_k"):
+        validate_axes({"exemplar": "base", "exemplar_base_k": 3})  # value off the grid
 
 
 def test_quantity_axes_default_none_is_baseline():
     full = validate_axes({"exemplar": "base"})
-    assert full["exemplar_k"] is None and full["fn_k"] is None
+    assert full["exemplar_base_k"] is None and full["exemplar_fn_k"] is None
 
 
 def test_same_axis_reproposed_after_champion_change():
@@ -588,12 +588,12 @@ def test_sanitize_records_invalid_axes_instead_of_dropping_silently():
 
     A silent drop breaks two things at once: round budget shrinks unnoticed (only 2 of 3
     proposals evaluated), and the planner cannot learn from its mistake, so it **re-proposes the
-    same candidate next round** (e.g. fn_k attached without fn_arm, lost for several rounds in a row).
+    same candidate next round** (e.g. exemplar_fn_k attached without fn_arm, lost for several rounds in a row).
     combo_tried already solves the same problem via skipped records (see the no-silent-drop
     comment in runner.py) — validation failures were the only exception.
     """
-    raw = [{"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
-            "rationale": "invalid: fn_k is exemplar=fn_arm only"},
+    raw = [{"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
+            "rationale": "invalid: exemplar_fn_k is exemplar=fn_arm only"},
            {"id": "good", "axes": {"alias": "vlm"}, "rationale": "valid"}]
     dropped: list = []
     out = sanitize_candidates(raw, max_candidates=5, dropped=dropped)
@@ -603,7 +603,7 @@ def test_sanitize_records_invalid_axes_instead_of_dropping_silently():
     rec = dropped[0]
     assert rec["id"] == "bad_fn_k"
     assert rec["skipped"] == "invalid_axes"
-    assert "fn_k" in rec["note"]           # the ValueError message must be carried for the planner to learn
+    assert "exemplar_fn_k" in rec["note"]           # the ValueError message must be carried for the planner to learn
     assert rec["axes"] == raw[0]["axes"]   # original axes kept — to trace what was wrong
 
 
@@ -636,7 +636,7 @@ def test_llm_proposal_carries_dropped_and_replays_it(tmp_path):
     import json as _json
 
     def chat(messages, **kw):
-        return {"candidates": [{"id": "bad", "axes": {"rescorer": True, "fn_k": 2},
+        return {"candidates": [{"id": "bad", "axes": {"rescorer": True, "exemplar_fn_k": 2},
                                 "rationale": "invalid"},
                                {"id": "ok", "axes": {"alias": "vlm"},
                                 "rationale": "valid"}],
@@ -961,7 +961,7 @@ def test_merge_resets_dependents_of_a_changed_feature_axis():
     """Turning a feature axis off or changing it resets the dependent and count
     axes the candidate does not name — if the champion's stayed, the validation
     rules would drop the whole candidate."""
-    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 4, "fn_k": 2,
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_base_k": 4, "exemplar_fn_k": 2,
                            "visual_negatives": True, "visual_negative_k": 2,
                            "text_negatives": "fp_crop", "text_negative_k": 2,
                            "rescorer": True})
@@ -970,15 +970,15 @@ def test_merge_resets_dependents_of_a_changed_feature_axis():
         assert out, f"{ax} was dropped"
         return out[0]["axes"]
     off = one({"exemplar": "none"})
-    assert off["exemplar_k"] is None and off["fn_k"] is None
+    assert off["exemplar_base_k"] is None and off["exemplar_fn_k"] is None
     assert off["visual_negatives"] is False and off["visual_negative_k"] is None
     assert off["rescorer"] is True and off["text_negatives"] == "fp_crop"
     base = one({"exemplar": "base"})
-    assert base["fn_k"] is None and base["exemplar_k"] == 4 and base["visual_negatives"]
+    assert base["exemplar_fn_k"] is None and base["exemplar_base_k"] == 4 and base["visual_negatives"]
     assert one({"visual_negatives": False})["visual_negative_k"] is None
     assert one({"text_negatives": False})["text_negative_k"] is None
     # an explicit value is used as given
-    assert one({"exemplar": "base", "exemplar_k": 8})["exemplar_k"] == 8
+    assert one({"exemplar": "base", "exemplar_base_k": 8})["exemplar_base_k"] == 8
 
 
 def test_candidate_identical_to_champion_is_dropped():
@@ -1184,7 +1184,7 @@ def test_refill_shrinks_history_to_fit_instead_of_skipping(tmp_path):
 
     filler = [{"round": i, "champion": {"axes": validate_axes({})},   # the carry's previous champion
                "candidates": [{"id": f"f{i}_{j}", "axes": validate_axes(
-                   {"exemplar": "base", "exemplar_k": 2}),
+                   {"exemplar": "base", "exemplar_base_k": 2}),
                    "skipped": "no_material", "note": "x" * 80} for j in range(4)]}
               for i in range(1, 9)]
     carry = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
@@ -1229,13 +1229,13 @@ def test_tried_combos_name_the_champion_itself_first(tmp_path):
     from agentic_configuration_search.planner.axes import validate_axes
     from agentic_configuration_search.planner.llm import LLMPlanner
 
-    champ = validate_axes({"exemplar": "fn_arm", "exemplar_k": 8})
+    champ = validate_axes({"exemplar": "fn_arm", "exemplar_base_k": 8})
     history = [
         {"round": 0, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
          "candidates": [], "decision": {"adopted": True, "id": "baseline"}},
         {"round": 1, "champion": {"axes": champ, "round": 0, "micro_f_beta": 0.5},
          "candidates": [{"id": "k4", "axes": validate_axes(
-             {"exemplar": "fn_arm", "exemplar_k": 4})}],
+             {"exemplar": "fn_arm", "exemplar_base_k": 4})}],
          "decision": {"adopted": False}},
     ]
     seen = {}
@@ -1249,7 +1249,7 @@ def test_tried_combos_name_the_champion_itself_first(tmp_path):
                 if l.startswith("Combos already tried"))
     items = line.split("): ", 1)[1]
     assert items.startswith("{} = the current champion itself")
-    assert "no_change" in items and items.index("{exemplar_k=4}") > 0
+    assert "no_change" in items and items.index("{exemplar_base_k=4}") > 0
 
 
 def test_refill_respects_disabled_axes(tmp_path):

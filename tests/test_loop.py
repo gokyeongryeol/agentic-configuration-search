@@ -129,7 +129,7 @@ def test_human_candidates_are_injected(big_root, tmp_path, monkeypatch):
         # with the stub there are no FNs, so fn_arm serves the same setting as
         # base (same_setting) — check injection with an increment no planner
         # candidate shares
-        "- id: my_idea\n  axes: {exemplar: base, exemplar_k: 2}\n  rationale: human-injected\n")
+        "- id: my_idea\n  axes: {exemplar: base, exemplar_base_k: 2}\n  rationale: human-injected\n")
     out = run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",
                      rounds=1, candidates_file=cand_file, **_fakes())
     screened = out.decisions[1]["screened"]
@@ -160,7 +160,7 @@ def test_lora_without_deps_skips_and_records(big_root, tmp_path, monkeypatch):
 
 
 def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
-    """The exemplar_k quantity axis overrides the MineCfg quota — None means the config default."""
+    """The exemplar_base_k quantity axis overrides the MineCfg quota — None means the config default."""
     import numpy as np
 
     from agentic_configuration_search.config import config_from_dict
@@ -172,12 +172,12 @@ def test_quantity_axes_override_mine_quota(big_root, tmp_path, monkeypatch):
     enc = lambda cid, paths: np.array(  # noqa: E731
         [[float(i), 0.0] for i in range(len(paths))])
 
-    m1 = materialize(cfg, ds, {"exemplar": "base", "exemplar_k": 2},
+    m1 = materialize(cfg, ds, {"exemplar": "base", "exemplar_base_k": 2},
                      tmp_path / "k2", encode_fn=enc, seed=0)
     assert all(len(bs) == 2 for bs in m1.exemplars.values())
     m2 = materialize(cfg, ds, {"exemplar": "base"},          # None -> default 5
                      tmp_path / "kd", encode_fn=enc, seed=0)
-    assert all(len(bs) == cfg.mine.exemplars_per_class
+    assert all(len(bs) == cfg.mine.exemplar_base_per_class
                for bs in m2.exemplars.values())
 
 
@@ -424,8 +424,8 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
 
     def llm(messages, **kw):
         return {"candidates": [
-            {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
-             "rationale": "fn_k is exemplar=fn_arm only — caught by validation"},
+            {"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
+             "rationale": "exemplar_fn_k is exemplar=fn_arm only — caught by validation"},
             {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
 
@@ -437,7 +437,7 @@ def test_invalid_axes_dropped_recorded_in_history(big_root, tmp_path, monkeypatc
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     rec = {c["id"]: c for c in hist[1]["candidates"]}
     assert rec["r1_bad_fn_k"]["skipped"] == "invalid_axes"
-    assert "fn_k" in rec["r1_bad_fn_k"].get("note", "")
+    assert "exemplar_fn_k" in rec["r1_bad_fn_k"].get("note", "")
     # a valid candidate passes sanitization — it may still be rejected later (axis_unused etc.)
     assert "r1_ok_tiling" in rec and rec["r1_ok_tiling"].get("skipped") != "invalid_axes"
 
@@ -450,7 +450,7 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     def llm(messages, **kw):
         prompts.append(messages[-1]["content"])
         return {"candidates": [
-            {"id": "bad_fn_k", "axes": {"rescorer": True, "fn_k": 2},
+            {"id": "bad_fn_k", "axes": {"rescorer": True, "exemplar_fn_k": 2},
              "rationale": "invalid"},
             {"id": "ok_tiling", "axes": {"tiling": 2}, "rationale": "valid"}],
             "stop": False}
@@ -462,7 +462,7 @@ def test_invalid_axes_note_reaches_next_prompt(big_root, tmp_path, monkeypatch):
     planner_prompts = [p for p in prompts if "Round history" in p]
     assert len(planner_prompts) >= 2
     assert "invalid_axes" in planner_prompts[1]
-    assert "fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
+    assert "exemplar_fn_k" in planner_prompts[1], "the reason (note) must be carried too, or the repetition does not stop"
 
 
 def test_single_class_gt_crop_never_reaches_materialize(tmp_path, monkeypatch):
@@ -726,7 +726,7 @@ def test_gate_passer_that_lost_is_carried_to_next_round(big_root, tmp_path, monk
     assert carried is not None and carried.get("source") == "carryover"
     champ = hist[1]["champion"]["axes"]
     assert all(carried["axes"][k] == v for k, v in champ.items()
-               if k not in ("tiling", "exemplar", "exemplar_k"))
+               if k not in ("tiling", "exemplar", "exemplar_base_k"))
 
 
 def test_human_candidates_are_relative_to_champion(tmp_path):
@@ -1228,7 +1228,7 @@ def test_filtered_candidates_are_not_logged_as_unwired(big_root, tmp_path, monke
     import logging
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     human = tmp_path / "c.yaml"
-    human.write_text("- {id: bad, axes: {fn_k: 2}}\n")       # filtered as invalid_axes
+    human.write_text("- {id: bad, axes: {exemplar_fn_k: 2}}\n")       # filtered as invalid_axes
     with caplog.at_level(logging.WARNING,
                          logger="agentic_configuration_search.loop.runner"):
         run_rounds(big_root, out_dir=tmp_path / "run", planner="deterministic",

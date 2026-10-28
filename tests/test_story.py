@@ -48,7 +48,7 @@ def test_strategy_label_is_plain():
     assert story.strategy_label({"tiling": 3}) == "Zoom into parts of the photo (3×3)"
     assert story.strategy_label({"rescorer": False, "lora": True}) == \
         "Extra training on this data + drop second review"
-    assert story.strategy_label({"exemplar_k": 4}) == "Show example photos (different number)"
+    assert story.strategy_label({"exemplar_base_k": 4}) == "Show example photos (different number)"
 
 
 def test_run_end_writes_the_story(finished_run):  # noqa: F811

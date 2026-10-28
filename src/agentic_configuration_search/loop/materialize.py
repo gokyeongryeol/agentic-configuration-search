@@ -51,14 +51,14 @@ def _require(value, name: str, axis: str):
 # Material kind -> the axes keys that determine it. If all these keys equal the
 # parent's, the parent's material is inherited as-is instead of re-mined.
 _INHERIT_KEYS: dict[str, tuple] = {
-    # exemplars also bind fn_k — fn_arm mining needs the base selection
+    # exemplars also bind exemplar_fn_k — fn_arm mining needs the base selection
     # (chosen_ann_ids), which is lost if only the base is inherited
-    "exemplars": ("exemplar", "exemplar_k", "fn_k"),
+    "exemplars": ("exemplar", "exemplar_base_k", "exemplar_fn_k"),
     "visual_negatives": ("visual_negatives", "visual_negative_k", "exemplar",
-                         "exemplar_k", "fn_k"),
+                         "exemplar_base_k", "exemplar_fn_k"),
     "aliases": ("alias",),
     "text_negatives": ("text_negatives", "text_negative_k", "exemplar",
-                       "exemplar_k", "fn_k"),
+                       "exemplar_base_k", "exemplar_fn_k"),
 }
 
 
@@ -94,10 +94,10 @@ def materialize(cfg, dataset, axes: dict, out_dir: Path, *, client=None,
     rng = random.Random(seed)
     # Quantity axes (None = config default) override the mining quotas
     quota = {}
-    if axes.get("exemplar_k") is not None:
-        quota["exemplars_per_class"] = int(axes["exemplar_k"])
-    if axes.get("fn_k") is not None:
-        quota["fn_exemplars_per_class"] = int(axes["fn_k"])
+    if axes.get("exemplar_base_k") is not None:
+        quota["exemplar_base_per_class"] = int(axes["exemplar_base_k"])
+    if axes.get("exemplar_fn_k") is not None:
+        quota["exemplar_fn_per_class"] = int(axes["exemplar_fn_k"])
     if axes.get("visual_negative_k") is not None:
         quota["visual_negatives_per_class"] = int(axes["visual_negative_k"])
     if axes.get("text_negative_k") is not None:

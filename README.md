@@ -73,7 +73,7 @@ details in the [axis reference](docs/design.md#axis-reference).
 | axis | values | what it does |
 |---|---|---|
 | `alias` | `false` · `vlm` | class aliases a multimodal LLM makes from GT crops, added to the text prompt |
-| `exemplar` | `none` · `base` · `fn_arm` | GT crops (+ crops of missed GT) as image prompts. Counts `exemplar_k`, `fn_k` |
+| `exemplar` | `none` · `base` · `fn_arm` | GT crops (+ crops of missed GT) as image prompts. Counts `exemplar_base_k`, `exemplar_fn_k` |
 | `text_negatives` | `false` · `fp_crop` · `gt_crop` · `background` | suppression phrases from false-positive or other-class crops. Count `text_negative_k` |
 | `visual_negatives` | `false` · `true` | false-positive crops as negative image prompts (needs `exemplar`). Count `visual_negative_k` |
 | `rescorer` | `false` · `true` | discriminator score calibration (per-class α, `rescorer.alphas`) |

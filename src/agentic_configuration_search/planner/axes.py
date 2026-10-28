@@ -37,8 +37,8 @@ AXES: dict[str, tuple] = {
     # None = the config's default quota (MineCfg's *_per_class) and the safe
     # point. Meaningful only when the matching feature axis is on (enforced by
     # validate_axes).
-    "exemplar_k": (None, 1, 2, 4, 8),         # base exemplars per class
-    "fn_k": (None, 1, 2, 4),                  # extra FN-arm exemplars per class
+    "exemplar_base_k": (None, 1, 2, 4, 8),         # base exemplars per class
+    "exemplar_fn_k": (None, 1, 2, 4),                  # extra FN-arm exemplars per class
     "visual_negative_k": (None, 1, 2, 4),            # visual negatives per class
     "text_negative_k": (None, 1, 2, 4),       # suppression phrases per class
 }
@@ -46,7 +46,7 @@ AXES: dict[str, tuple] = {
 BASELINE: dict = {"exemplar": "none", "alias": False, "text_negatives": False,
                   "visual_negatives": False, "tiling": False, "rescorer": False,
                   "lora": False, "crop_classifier": False,
-                  "exemplar_k": None, "fn_k": None,
+                  "exemplar_base_k": None, "exemplar_fn_k": None,
                   "visual_negative_k": None, "text_negative_k": None}
 
 
@@ -117,8 +117,8 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
                          "suppression is the text_negatives axis)")
     # Count axes are meaningful only when their feature axis is on — meaningless
     # combos would pollute the tried set and the candidate budget, so they raise
-    requires = [("exemplar_k", full["exemplar"] != "none", "exemplar"),
-                ("fn_k", full["exemplar"] == "fn_arm", "exemplar=fn_arm"),
+    requires = [("exemplar_base_k", full["exemplar"] != "none", "exemplar"),
+                ("exemplar_fn_k", full["exemplar"] == "fn_arm", "exemplar=fn_arm"),
                 ("visual_negative_k", full["visual_negatives"], "visual_negatives"),
                 ("text_negative_k", full["text_negatives"], "text_negatives")]
     for key, ok, need in requires:
@@ -171,7 +171,7 @@ def merge_onto(base: dict, delta: dict) -> dict:
 
     When a feature axis is turned off or changed, the dependent and count axes
     the delta does not name go back to their safe point — if the champion's
-    stayed, validate_axes' dependency rules (e.g. fn_k only with
+    stayed, validate_axes' dependency rules (e.g. exemplar_fn_k only with
     exemplar=fn_arm) would drop the whole candidate."""
     out = {**BASELINE, **(base or {}), **delta}
 
@@ -181,11 +181,11 @@ def merge_onto(base: dict, delta: dict) -> dict:
 
     if "exemplar" in delta:
         if out["exemplar"] == "none":
-            for key in ("exemplar_k", "fn_k", "visual_negative_k"):
+            for key in ("exemplar_base_k", "exemplar_fn_k", "visual_negative_k"):
                 reset(key, None)
             reset("visual_negatives", False)
         elif out["exemplar"] != "fn_arm":
-            reset("fn_k", None)
+            reset("exemplar_fn_k", None)
     if "visual_negatives" in delta and not out["visual_negatives"]:
         reset("visual_negative_k", None)
     if "text_negatives" in delta and not out["text_negatives"]:

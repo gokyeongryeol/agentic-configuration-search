@@ -419,7 +419,7 @@ UNTRIED_RULE = ("While untried axes remain, prefer one of them over another vari
 
 
 def _axes_touched(axes: dict, base: dict) -> set[str]:
-    """Function axes changed from base — quantity axes (exemplar_k etc.) fold into their function axis."""
+    """Function axes changed from base — quantity axes (exemplar_base_k etc.) fold into their function axis."""
     return {K_PARENT.get(k, k) for k in _delta_axes(axes, base)}
 
 
@@ -922,7 +922,7 @@ Rules:
   modality counts the classes where the text pass beat the semantic (exemplar)
   pass on fit_dev F (text_won) and the rest (semantic_won);
   closest_text_margin is the smallest F gap among the classes text won — small
-  means another exemplar_k or fn_arm may flip a class, large means exemplar
+  means another exemplar_base_k or fn_arm may flip a class, large means exemplar
   variants are unlikely to win.
 - A visual_negatives row carries neg_eta_used (the suppression IoU thresholds
   the screen picked; lower means stronger suppression) and neg_eta_grid (the
