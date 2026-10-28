@@ -96,7 +96,7 @@ def gate(champion_records: list[dict], candidate_records: list[dict], *,
     Both record lists must cover **the same holdout images in the same order**
     (paired) — metrics.bootstrap_ci raises on a length mismatch.
     """
-    # One-sided — the gate only asks "Δ > margin". A two-sided bound (alpha/2)
+    # One-sided — the gate only asks "lower bound ≥ margin". A two-sided bound (alpha/2)
     # halves the effective significance level and rejects real gains.
     # Count (tp, fp, fn) per image once — re-matching on every resample makes
     # one gate n_boot times the matching. micro F(β) is set by the sum of these

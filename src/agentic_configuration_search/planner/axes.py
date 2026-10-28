@@ -37,7 +37,7 @@ AXES: dict[str, tuple] = {
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
     "crop_classifier": (False, True),         # re-classify / blend detections (fixes class_confusion, suppresses background FPs)
-    # --- count axes (grid 1·2·4; exemplar up to 8 to see whether it hits the cap) ---
+    # --- count axes (grid 1·2·4; only exemplar_base_k up to 8 to see whether it hits the cap) ---
     # None = the config's default quota (MineCfg's *_per_class) and the safe
     # point. Meaningful only when the matching feature axis is on (enforced by
     # validate_axes).
@@ -162,6 +162,20 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
         raise AxesError(f"axes.lora=True: {why}",
                         "lora cannot train: too few fit_train images")
     return full
+
+
+def effective_disabled(disabled_axes, champion: dict | None = None) -> tuple:
+    """The disabled axes (search.disabled_axes) plus axes that cannot be proposed
+    without them — visual negatives sit on top of exemplars, so with exemplar
+    disabled and no exemplar in the champion they cannot be proposed alone
+    (invalid_axes) or together (disabled_axes). When the champion already has an
+    exemplar (inherited from before the narrowing), visual_negatives on top of it
+    can still be proposed."""
+    out = tuple(disabled_axes or ())
+    if ("exemplar" in out and "visual_negatives" not in out
+            and (champion or {}).get("exemplar", "none") == "none"):
+        out += ("visual_negatives",)
+    return out
 
 
 def uses_disabled_axes(axes: dict, disabled_axes, disabled_values=None,

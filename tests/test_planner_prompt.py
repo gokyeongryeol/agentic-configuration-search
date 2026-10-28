@@ -90,7 +90,7 @@ def test_budget_card_shows_rounds_left_and_counters_only():
                                     "empty_rounds": 2})
     card = p.split("## Budget", 1)[1].split("## Current champion", 1)[0]
     assert "Round 4 of 8: 5 rounds left including this one." in card
-    assert "without adoption: 2; the run stops at 5" in card
+    assert "not clearly positive): 2; the run stops at 5" in card
     assert "(a round where a candidate was dropped for losing on fit_dev does not count): 1; the run stops at 2" in card
     assert " min" not in card                              # cost is the board's min column
 
@@ -303,9 +303,9 @@ def test_runner_feeds_budget_card_into_the_prompt(big_root, tmp_path,  # noqa: F
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
                rounds=2, cfg=cfg, **_fakes())
     assert "Round 1 of 2: 2 rounds left including this one." in prompts[0]
-    assert "without adoption: 0; the run stops at 4" in prompts[0]
+    assert "not clearly positive): 0; the run stops at 4" in prompts[0]
     assert "Round 2 of 2: 1 round left including this one." in prompts[1]
-    assert "without adoption: 1; the run stops at 4" in prompts[1]
+    assert "not clearly positive): 1; the run stops at 4" in prompts[1]
     hist = [json.loads(line) for line in
             (tmp_path / "run" / "history.jsonl").read_text().splitlines()]
     row = {c["id"]: c for c in hist[1]["candidates"]}["r1_t1"]
@@ -739,7 +739,7 @@ def test_loop_wires_the_server_context_into_the_planner(tmp_path, monkeypatch):
     monkeypatch.setattr(Loop, "_facts", lambda self: None)
     monkeypatch.setattr(Loop, "_prescreen_info", lambda self: {})
     loop.disabled_axes, loop.disabled_values = (), {}
-    planner = loop._llm_planner(tmp_path)
+    planner = loop._llm_planner(tmp_path, {})
     assert planner.token_budget == 16384 - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
 
 
@@ -805,3 +805,142 @@ def test_prompt_defines_error_kinds_and_drops_redundant_lines():
                    for x in llm._constraint_lines((), axis_status([], None)))
     # how the prompt is assembled is not a rule
     assert "shown while" not in llm.TILING_RULE
+
+
+def test_visual_negatives_note_says_the_pair_is_allowed_when_exemplar_is_off():
+    """Even with exemplar OFF, a candidate changing an exemplar value together with
+    visual_negatives is not dropped (not every changed axis is OFF) — the board and
+    the hard constraints say so."""
+    hist = [_round(0, 0, [], f=0.7), _round(1, 0, [], f=0.7)]
+    text = _prompt(hist)
+    vn = _brow(text, "visual_negatives")
+    assert "same candidate" in vn["note"]
+    line = [ln for ln in text.splitlines() if ln.startswith("- visual_negatives needs")][0]
+    assert "same candidate" in line
+
+
+def test_all_invalid_fallback_records_why(tmp_path):
+    """A fallback because every candidate was invalid keeps the reason in error — the
+    run summary does not carry an empty reason."""
+    chat = lambda m, **k: {"candidates": [{"axes": {"alias": "bogus"}}]}  # noqa: E731
+    planner = LLMPlanner(chat=chat, artifact_dir=tmp_path)
+    planner.propose(_history(), {"train": {"summary": {"fn": {"missed": 5}}}})
+    stored = json.loads((tmp_path / "proposal.json").read_text())
+    assert stored["fallback"] == "deterministic"
+    assert stored["error"].startswith("no valid candidate") and "invalid_axes" in stored["error"]
+
+
+def test_all_invalid_fallback_is_logged_at_error(tmp_path, caplog):
+    import logging
+    chat = lambda m, **k: {"candidates": [{"axes": {"alias": "bogus"}}]}  # noqa: E731
+    with caplog.at_level(logging.ERROR):
+        LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(
+            _history(), {"train": {"summary": {"fn": {"missed": 5}}}})
+    assert any("no valid candidate" in r.getMessage() for r in caplog.records
+               if r.levelno == logging.ERROR)
+
+
+def test_exemplar_disabled_disables_visual_negatives_too():
+    """Visual negatives sit on top of exemplars — with exemplar disabled,
+    visual_negatives cannot be proposed either (alone invalid_axes, together
+    disabled_axes). Treated as disabled, the board and hard constraints do not show
+    it as proposable."""
+    from agentic_configuration_search.planner import deterministic
+    from agentic_configuration_search.planner.axes import effective_disabled
+    assert set(effective_disabled(["exemplar"])) == {"exemplar", "visual_negatives"}
+    assert effective_disabled(["tiling"]) == ("tiling",)
+    # a champion that already has an exemplar (inherited) still allows visual_negatives on top
+    assert effective_disabled(["exemplar"], {"exemplar": "base"}) == ("exemplar",)
+    diag = {"train": {"summary": {"fp": {"background": 50}}, "fp_total": 50}}
+    det = deterministic.propose([], diag, max_candidates=5,
+                                disabled_axes=effective_disabled(["exemplar"]))
+    assert not any(c["axes"].get("visual_negatives") for c in det["candidates"])
+    hist = [_round(0, 0, [], f=0.7), _round(1, 0, [], f=0.7)]
+    text = _prompt(hist, disabled_axes=effective_disabled(["exemplar"]))
+    assert not any(ln.startswith("visual_negatives |") for ln in _board(text).splitlines())
+    assert not any(ln.startswith("- visual_negatives needs") for ln in text.splitlines())
+
+
+def test_loop_gives_the_planner_the_effective_disabled_axes(tmp_path, monkeypatch):
+    """With exemplar disabled, visual_negatives is disabled too unless the champion
+    already has an exemplar — the runner computes it per round from the champion."""
+    from agentic_configuration_search.config import config_from_dict
+    from agentic_configuration_search.loop.runner import Loop
+    loop = Loop.__new__(Loop)
+    loop.cfg = config_from_dict({"dataset": "x", "planner": {"base_url": "http://x"}})
+    loop.llm_chat = lambda m, **k: {}
+    monkeypatch.setattr(Loop, "_server_context", lambda self: 16384)
+    monkeypatch.setattr(Loop, "_facts", lambda self: None)
+    monkeypatch.setattr(Loop, "_prescreen_info", lambda self: {})
+    loop.disabled_axes, loop.disabled_values = ("exemplar",), {}
+    assert "visual_negatives" in loop._llm_planner(tmp_path, None).disabled_axes
+    assert "visual_negatives" not in loop._llm_planner(
+        tmp_path, {"exemplar": "base"}).disabled_axes
+
+
+def test_visual_negatives_on_an_inherited_exemplar_is_not_disabled():
+    """With exemplar disabled, visual_negatives on top of an exemplar the champion
+    inherited is not blocked. Without an exemplar in the champion, turning
+    visual_negatives on is dropped as disabled_axes."""
+    from agentic_configuration_search.planner.axes import (effective_disabled,
+                                                           sanitize_candidates)
+    with_ex = validate_axes({"exemplar": "base"})
+    vn = {"id": "v", "axes": {"exemplar": "base", "visual_negatives": "fp_crop"}}
+    kept = sanitize_candidates([vn], max_candidates=3, base=with_ex,
+                               disabled_axes=effective_disabled(["exemplar"], with_ex))
+    assert [c["id"] for c in kept] == ["v"]
+    none = validate_axes({})
+    dropped = []
+    kept = sanitize_candidates([vn], max_candidates=3, base=none, dropped=dropped,
+                               disabled_axes=effective_disabled(["exemplar"], none))
+    assert not kept and dropped[0]["skipped"] == "disabled_axes"
+
+
+def test_board_leaves_out_disabled_quantity_keys():
+    """A disabled quantity key (search.disabled_axes) is not in the board's propose cell — proposing it is disabled_axes."""
+    from agentic_configuration_search.planner.axes import DatasetFacts, axis_values
+    from agentic_configuration_search.planner.axis_status import axis_status
+    from agentic_configuration_search.planner.board import board_lines
+    hist = [_round(0, 0, [], f=0.7), _round(1, 0, [], f=0.7)]
+    rows = board_lines(hist, axis_values(DatasetFacts(n_classes=2)), axis_status(hist, 2),
+                       disabled=("text_negative_k",))
+    tn = [r for r in rows if r.startswith("text_negatives |")]
+    assert tn and "text_negative_k" not in tn[0]
+
+
+def test_tiling_rule_uses_the_configured_overlap():
+    """The magnification example is computed from search.tiling_overlap — the default (0.5) is not hard-coded."""
+    from agentic_configuration_search.planner.llm import tiling_rule
+    assert "1.5x at g=2, 2x at g=3" in " ".join(tiling_rule(0.5).split())
+    assert "1.75x at g=2, 2.5x at g=3" in " ".join(tiling_rule(0.25).split())
+    assert "overlap 0.25" in " ".join(tiling_rule(0.25).split())
+
+
+def test_constraint_line_follows_the_champion_exemplar():
+    """When the champion uses an exemplar, changing visual_negatives alone is fine —
+    "an exemplar in the same candidate" is carried only when the champion has no
+    exemplar (the same condition as the board note)."""
+    from agentic_configuration_search.planner.axis_status import axis_status
+    from agentic_configuration_search.planner.llm import _constraint_lines
+    st = axis_status([], 2)
+    without = [ln for ln in _constraint_lines((), st, {"exemplar": "none"})
+               if "visual_negatives" in ln][0]
+    with_ex = [ln for ln in _constraint_lines((), st, {"exemplar": "base"})
+               if "visual_negatives" in ln][0]
+    assert "same candidate" in without and "same candidate" not in with_ex
+
+
+def test_prompt_states_the_gate_min_delta():
+    """Besides lower bound ≥ margin the gate needs Δ ≥ gate.min_delta — the prompt
+    states the value, so a row with gate_ci_lo ≥ 0 but a small Δ is not read as passing."""
+    text = _prompt(_history(), min_delta=0.007)
+    assert "at least 0.007" in text
+
+
+def test_prompt_states_the_gate_margin():
+    """The gate needs lower bound ≥ gate.margin — with margin > 0 a row with
+    0 ≤ gate_ci_lo < margin is rejected too, so the prompt states the value. Δ > 0 is
+    needed even when min_delta is 0."""
+    text = _prompt(_history(), margin=0.002, min_delta=0.0)
+    assert "clears 0.002" in text and "gate_ci_lo below 0.002" in text
+    assert "positive and at least 0" in text

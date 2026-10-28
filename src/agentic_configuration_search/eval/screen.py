@@ -243,76 +243,75 @@ def screen_candidate(cfg, client, fit_dev, ontology, materials: Materials, *,
     modality_diagnostic: dict[str, dict] = {}
     text_recs_by_config: dict[int, list] = {}
     text_dets_by_config: dict[int, list] = {}
-    if "text" in cfg.search.modalities:
-        grid_by_id = {c["config_id"]: c for c in grid}
-        tq, _, alias = text_query_bundle(cfg.query, ontology,
-                                              materials.aliases,
-                                              materials.text_negatives)
-        # A text-only candidate (no semantic best) sweeps the whole grid with
-        # the text pass — this is the neg_eta sweep path for text negatives.
-        # The text pass keeps the neg axis: emulation uses neg_eta as the
-        # suppression IoU for text negatives, so the strength screen picks
-        # must apply to the text pass too for screen to match eval.
-        wanted = (sorted({r["config_id"] for r in best.values()}) if best
-                  else sorted(grid_by_id))
+    grid_by_id = {c["config_id"]: c for c in grid}
+    tq, _, alias = text_query_bundle(cfg.query, ontology,
+                                     materials.aliases,
+                                     materials.text_negatives)
+    # A text-only candidate (no semantic best) sweeps the whole grid with
+    # the text pass — this is the neg_eta sweep path for text negatives.
+    # The text pass keeps the neg axis: emulation uses neg_eta as the
+    # suppression IoU for text negatives, so the strength screen picks
+    # must apply to the text pass too for screen to match eval.
+    wanted = (sorted({r["config_id"] for r in best.values()}) if best
+              else sorted(grid_by_id))
+    for config_id in wanted:
+        txt = gateway.infer_config(
+            ctx, client, grid_by_id[config_id], tq,
+            ontology, image_paths, alias_to_name=alias)
+        text_dets_by_config[config_id] = txt
+        text_recs_by_config[config_id] = per_image_records(fit_dev, image_paths, txt)
+
+    for cid, r in list(per_class.items()):
+        config_id = r["config_id"]
+        text_thr, text_f1 = _estimate_class(cfg, text_recs_by_config[config_id], cid)
+        pick, thr, f1 = "semantic", r["threshold"], r["f_beta"]
+        if text_f1 > f1:  # ties go to semantic
+            pick, thr, f1 = "text", text_thr, text_f1
+        per_class[cid] = {"config_id": config_id, "threshold": thr,
+                          "f_beta": f1, "modality": pick}
+        union_dets = [ensemble.merge_modalities(a, b)
+                      for a, b in zip(dets_by_config[config_id],
+                                      text_dets_by_config[config_id])]
+        union_thr, union_f1 = _estimate_class(
+            cfg, per_image_records(fit_dev, image_paths, union_dets), cid)
+        modality_diagnostic[str(cid)] = {
+            "chosen": pick, "chosen_f_beta": f1,
+            "semantic": {"f_beta": r["f_beta"], "threshold": r["threshold"]},
+            "text": {"f_beta": text_f1, "threshold": text_thr},
+            "union": {"f_beta": union_f1, "threshold": union_thr},
+            "union_margin": union_f1 - f1,
+        }
+
+    # Rescue classes left out of semantic (zero exemplars, or a text-only
+    # candidate) via the text pass.
+    if per_class:
+        config_ids = [e["config_id"] for e in per_class.values()]
+        shared_id = max(set(config_ids), key=config_ids.count)
+    else:
+        # Shared config for a text-only candidate — apply the semantic rule
+        # (max sum of per-class F(β)) to the text scoring rows.
+        rows_t = []
         for config_id in wanted:
-            txt = gateway.infer_config(
-                ctx, client, grid_by_id[config_id], tq,
-                ontology, image_paths, alias_to_name=alias)
-            text_dets_by_config[config_id] = txt
-            text_recs_by_config[config_id] = per_image_records(fit_dev, image_paths, txt)
-
-        for cid, r in list(per_class.items()):
-            config_id = r["config_id"]
-            text_thr, text_f1 = _estimate_class(cfg, text_recs_by_config[config_id], cid)
-            pick, thr, f1 = "semantic", r["threshold"], r["f_beta"]
-            if text_f1 > f1:  # ties go to semantic
-                pick, thr, f1 = "text", text_thr, text_f1
-            per_class[cid] = {"config_id": config_id, "threshold": thr,
-                              "f_beta": f1, "modality": pick}
-            union_dets = [ensemble.merge_modalities(a, b)
-                          for a, b in zip(dets_by_config[config_id],
-                                          text_dets_by_config[config_id])]
-            union_thr, union_f1 = _estimate_class(
-                cfg, per_image_records(fit_dev, image_paths, union_dets), cid)
-            modality_diagnostic[str(cid)] = {
-                "chosen": pick, "chosen_f_beta": f1,
-                "semantic": {"f_beta": r["f_beta"], "threshold": r["threshold"]},
-                "text": {"f_beta": text_f1, "threshold": text_thr},
-                "union": {"f_beta": union_f1, "threshold": union_thr},
-                "union_margin": union_f1 - f1,
-            }
-
-        # Rescue classes left out of semantic (zero exemplars, or a text-only
-        # candidate) via the text pass.
-        if per_class:
-            config_ids = [e["config_id"] for e in per_class.values()]
-            shared_id = max(set(config_ids), key=config_ids.count)
-        else:
-            # Shared config for a text-only candidate — apply the semantic rule
-            # (max sum of per-class F(β)) to the text scoring rows.
-            rows_t = []
-            for config_id in wanted:
-                for c in ontology.classes:
-                    thr, f1 = _estimate_class(cfg, text_recs_by_config[config_id],
-                                              c.id)
-                    rows_t.append({"config_id": config_id, "category_id": c.id,
-                                   "threshold": thr, "f_beta": f1})
-            best_t = select_shared_config(rows_t, grid)
-            mean_f = _mean_f(rows_t, n_classes)
-            tile_f = _with_gap_ub(
-                cfg, tiling_f(grid, mean_f), grid, mean_f,
-                text_recs_by_config.__getitem__, _thresholds(rows_t).__getitem__,
-                cat_ids)
-            shared_id = (next(iter(best_t.values()))["config_id"] if best_t
-                         else 0)
-        for c in ontology.classes:
-            if c.id in per_class:
-                continue
-            thr, f1 = _estimate_class(cfg, text_recs_by_config[shared_id], c.id)
-            if f1 > 0.0:
-                per_class[c.id] = {"config_id": shared_id, "threshold": thr,
-                                   "f_beta": f1, "modality": "text"}
+            for c in ontology.classes:
+                thr, f1 = _estimate_class(cfg, text_recs_by_config[config_id],
+                                          c.id)
+                rows_t.append({"config_id": config_id, "category_id": c.id,
+                               "threshold": thr, "f_beta": f1})
+        best_t = select_shared_config(rows_t, grid)
+        mean_f = _mean_f(rows_t, n_classes)
+        tile_f = _with_gap_ub(
+            cfg, tiling_f(grid, mean_f), grid, mean_f,
+            text_recs_by_config.__getitem__, _thresholds(rows_t).__getitem__,
+            cat_ids)
+        shared_id = (next(iter(best_t.values()))["config_id"] if best_t
+                     else 0)
+    for c in ontology.classes:
+        if c.id in per_class:
+            continue
+        thr, f1 = _estimate_class(cfg, text_recs_by_config[shared_id], c.id)
+        if f1 > 0.0:
+            per_class[c.id] = {"config_id": shared_id, "threshold": thr,
+                               "f_beta": f1, "modality": "text"}
 
     # --- fit_dev micro F(β) of the adopted setting (reuses cached passes — no
     # extra inference) ---

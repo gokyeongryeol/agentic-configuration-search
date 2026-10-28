@@ -461,10 +461,10 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
     E_tr = (np.array([r["emb"] for r in rows_tr], dtype=float) if has_emb
             else np.zeros((len(rows_tr), 0), dtype=float))
     if not has_emb:
-        log.info("rescorer: fitting without embeddings — using only %d hand-crafted features "
-                 "(the detector does not provide embeddings)", len(feat_names))
+        log.warning("rescorer: fitting without embeddings — using only %d hand-crafted features "
+                    "(the detector does not provide embeddings)", len(feat_names))
     t0 = time.monotonic()
-    # the entry point pins OpenMP threads to 1 — released only for the discriminator fit
+    # the entry point sets the OpenMP thread default to 1 — released only for the discriminator fit
     with threadpool_limits(limits=rs_cfg.fit_threads, user_api="openmp"):
         disc = fit_discriminator(feat_names, X_tr, E_tr, ys_tr,
                                  members=rs_cfg.ensemble_members,

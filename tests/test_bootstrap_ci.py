@@ -60,7 +60,7 @@ def test_rank_auc_perfect_and_random_and_ties():
 
 
 def test_one_sided_tail_is_less_conservative():
-    """The gate asks a one-sided question (Δ > margin) — a two-sided 2.5% cut halves
+    """The gate asks a one-sided question (lower bound ≥ margin) — a two-sided 2.5% cut halves
     the effective significance level and is over-conservative. tail="lower" gives the alpha percentile."""
     import numpy as np
 

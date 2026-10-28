@@ -46,7 +46,7 @@ def test_active_reads_the_served_state_not_the_label():
     champ = {"axes": {"tiling": 2, "crop_classifier": False, "rescorer": True},
              "setting": {"configs": [{"config_id": 0, "tiling": None},
                                      {"config_id": 1, "tiling": 2}],
-                         "per_class": {"1": {"config_id": 0}}},
+                         "per_class": {"1": {"config_id": 0, "modality": "semantic"}}},
              "adapt_root": "/x/artifact"}
     on = ab._active(champ)
     assert "tiling" not in on              # no class is assigned to a tiled config

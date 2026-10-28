@@ -173,8 +173,8 @@ class RescorerCfg:
     # inverse-probability weights restoring the original distribution
     # (fitting.rescorer.cap_train_rows). null = no cap — 0 is refused, it reads as "0 rows"
     max_train_rows: int | None = 100_000
-    # OpenMP threads of the discriminator (GBDT) fit — the entry point pins threads
-    # to 1, so they are released only for the fit. The GBDT result does not depend on
+    # OpenMP threads of the discriminator (GBDT) fit — the entry point sets the
+    # thread default to 1, so they are released only for the fit. The GBDT result does not depend on
     # the thread count (the same random_state gives the same model)
     fit_threads: int = 8
 
@@ -241,7 +241,6 @@ class SearchCfg:
     # the same s*.
     tiling_tp_quantile: float = 0.1
     tiling_tp_min: int = 20
-    modalities: list = field(default_factory=lambda: ["semantic", "text"])
     # Axes that may not be turned on in this run — unwireable axes are blocked at
     # proposal time instead of failing later. Honored by the planners
     # (deterministic and LLM prompt) and by candidate sanitization; a value the
@@ -507,6 +506,11 @@ def _validate(cfg: Config) -> None:
     if cfg.search.tiling_merge not in TILING_MERGES:
         raise ConfigError(f"search.tiling_merge: {cfg.search.tiling_merge!r} must be "
                           f"one of {TILING_MERGES}")
+    if cfg.gate.margin < 0:
+        raise ConfigError(f"gate.margin cannot be negative ({cfg.gate.margin})")
+    if cfg.crop_classifier.margin < 0:
+        raise ConfigError("crop_classifier.margin cannot be negative "
+                          f"({cfg.crop_classifier.margin})")
     if cfg.gate.min_delta < 0:
         raise ConfigError("gate.min_delta: must not be negative — 0 is off "
                           f"({cfg.gate.min_delta})")

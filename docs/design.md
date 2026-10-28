@@ -97,7 +97,11 @@ count stays at its default or the champion's value), and
 An unknown key or value fails at the start of the run. Disabled axes and values
 are left out of the planner's value list, and candidates that turn them on or
 change them away from the champion's value are rejected — candidates that turn
-them off or inherit the champion's value are kept.
+them off or inherit the champion's value are kept. Visual negatives sit on top of
+exemplars, so with `exemplar` disabled and no exemplar in the champion,
+`visual_negatives` is treated as disabled too (`planner.axes.effective_disabled`,
+computed per round from the champion for every candidate source). A disabled
+count key is left out of the board's propose cell as well.
 
 ### Split use per axis
 
@@ -355,7 +359,9 @@ planner's input for the same round.
   `error` keep the finish reason, the token count and the head and tail of the
   reply. Fallback candidates carry `source: fallback`, and `run_summary.json`
   lists the fallback rounds with their reason (`planner_fallbacks` — it should
-  be empty). One call per round, plus at most one follow-up in the same
+  be empty). When the reply arrives but the sanitizer drops every candidate,
+  the reason is `no valid candidate: <skip: reason; …>`, logged at ERROR like
+  the other fallbacks. One call per round, plus at most one follow-up in the same
   conversation when the planner repeats carried candidates: those are dropped
   as `carried_duplicate` and the freed slots are asked for again.
 - **The prompt is English only.** A candidate row's `note` is a sentence for
