@@ -12,7 +12,7 @@ def test_defaults():
     assert cfg.planner.kind == "llm"
     assert cfg.split.fit_train_ratio == 0.8
     assert cfg.gate.margin == 0.0
-    assert cfg.saturation.rounds == 5
+    assert cfg.saturation.rounds == 3
     assert cfg.screen.top_k == 2
 
 

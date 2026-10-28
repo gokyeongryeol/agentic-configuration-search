@@ -45,7 +45,7 @@ gate:                                     # adoption gate
   confidence: 0.95                        # CI confidence level (alpha = 1 - confidence)
 
 saturation:                               # stopping rule
-  rounds: 5                               # stop after this many consecutive stalled rounds
+  rounds: 3                               # stop after this many consecutive stalled rounds
   epsilon: 0.0                            # a round is stalled if the Δ CI lower bound is ≤ this
   empty_rounds: 2                         # stop after this many consecutive rounds that measured nothing on holdout (0=off; rounds with candidates skipped by the fit_dev verdict are excluded)
 

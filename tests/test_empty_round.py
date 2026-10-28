@@ -282,14 +282,16 @@ def test_consecutive_empty_rounds_stop_the_run(big_root, tmp_path, monkeypatch):
     out = run_rounds(big_root, out_dir=tmp_path / "run", llm_chat=_always_blocked_tiling(),
                      rounds=8, cfg=cfg, **_fakes())
     assert out.stopped == "empty_rounds"
-    assert [d["round"] for d in out.decisions] == [0, 1, 2]   # before saturation.rounds (5)
+    assert [d["round"] for d in out.decisions] == [0, 1, 2]   # before saturation.rounds (3)
     summary = json.loads((tmp_path / "run" / "run_summary.json").read_text())
     assert summary["stopped"] == "empty_rounds"
 
     off = run_rounds(big_root, out_dir=tmp_path / "off", llm_chat=_always_blocked_tiling(),
                      rounds=8, cfg=_cfg(big_root, rounds=8, planner={"max_reasks": 0},
-                                        saturation={"empty_rounds": 0}), **_fakes())
-    assert off.stopped == "saturation" and len(off.decisions) == 6
+                                        saturation={"rounds": 3, "empty_rounds": 0}),
+                     **_fakes())
+    # with the empty-round stop off it stops on stagnation (saturation.rounds) — baseline + 3 rounds
+    assert off.stopped == "saturation" and len(off.decisions) == 4
 
 
 def test_resume_restores_the_empty_round_counter(big_root, tmp_path,  # noqa: F811

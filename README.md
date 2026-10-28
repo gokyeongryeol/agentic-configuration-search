@@ -95,7 +95,7 @@ details in the [axis reference](docs/design.md#axis-reference).
 | `search.axis_retire_after` | 2 | LLM planner: an axis with this many rounds in a row without effect turns OFF until the champion changes. null = record only |
 | `planner.launch.max_model_len` | 32768 | planner server context — the basis of the prompt budget (the value an attached server reports wins) |
 | `gate.min_delta` | 0.005 | minimum Δ for adoption |
-| `saturation.rounds` | 5 | stagnant rounds before stopping |
+| `saturation.rounds` | 3 | stagnant rounds before stopping |
 | `detector.device` · `mine.device` · `lora.device` | `cuda:0` · `cuda:0` · `cuda:0` | GPU placement (keep off the planner's GPU) |
 | `subsample.max_images` · `subsample.center_ratio` | 500 · 0.1 | when fit_train is large, train lora, the rescorer and the classifier on a subset that covers the GT embedding clusters. null = off |
 | `rescorer.fit_threads` | 8 | rescorer discriminator (GBDT) fit threads — same result, less time |
