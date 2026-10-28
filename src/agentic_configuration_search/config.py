@@ -82,7 +82,7 @@ class GateCfg:
 
 @dataclass(frozen=True)
 class SaturationCfg:
-    rounds: int = 5                      # stop after this many consecutive stagnant rounds
+    rounds: int = 3                      # stop after this many consecutive stagnant rounds
     epsilon: float = 0.0                 # a round is stagnant if the Δ CI lower bound <= this
     # Stop (stopped="empty_rounds") after this many consecutive rounds that
     # measured nothing on holdout (even after re-asking). 0 turns it off — such
