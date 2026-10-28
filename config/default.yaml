@@ -135,6 +135,7 @@ rescorer:                                 # discriminator on fit_train + α grid
   ensemble_members: 5
   inner_folds: 5                          # for the oof_phat diagnostic
   max_train_rows: 100000                  # discriminator training row cap — TPs first, FPs in (class × score quartile) strata + inverse-probability weights. null = no cap
+  fit_threads: 8                          # discriminator (GBDT) fit threads — the result does not depend on the thread count, only the time
 
 crop_classifier:                          # detection reclassification axis — corrects class_confusion, suppresses background FPs (off by default, the planner turns it on)
   min_samples: 32                         # total crop tripwire — skip training below this

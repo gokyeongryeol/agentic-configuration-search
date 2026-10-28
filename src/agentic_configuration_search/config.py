@@ -173,6 +173,10 @@ class RescorerCfg:
     # inverse-probability weights restoring the original distribution
     # (fitting.rescorer.cap_train_rows). null = no cap — 0 is refused, it reads as "0 rows"
     max_train_rows: int | None = 100_000
+    # OpenMP threads of the discriminator (GBDT) fit — the entry point pins threads
+    # to 1, so they are released only for the fit. The GBDT result does not depend on
+    # the thread count (the same random_state gives the same model)
+    fit_threads: int = 8
 
 
 @dataclass(frozen=True)
@@ -407,6 +411,8 @@ def _validate(cfg: Config) -> None:
                           f"use null (no cap) ({cfg.subsample.max_images})")
     if not (0.0 < cfg.subsample.center_ratio <= 1.0):
         raise ConfigError(f"subsample.center_ratio: outside (0,1] ({cfg.subsample.center_ratio})")
+    if cfg.rescorer.fit_threads < 1:
+        raise ConfigError(f"rescorer.fit_threads: must be >= 1 ({cfg.rescorer.fit_threads})")
     if cfg.rescorer.max_train_rows is not None and cfg.rescorer.max_train_rows < 1:
         raise ConfigError("rescorer.max_train_rows: must be >= 1 — to remove the cap, use "
                           f"null ({cfg.rescorer.max_train_rows})")

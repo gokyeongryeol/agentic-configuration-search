@@ -538,10 +538,28 @@ runs/<dataset>/run/
   `pass_cache`, and decisions `reasks`/`free_reasks`. `plan` is the LLM
   response's `expected_gain`, `cost_min` and `differs`; only a malformed field
   is dropped.
+- **Rescorer refit records** (artifact only — not in the planner prompt): a
+  candidate that refit the rescorer carries `rescorer_min`, the minutes per
+  stage — fit_train and fit_dev inference with embeddings (`infer_train`,
+  `infer_dev`), the discriminator fit (`discriminator`), the α grid (`alpha`) and
+  the comparison below (`cmp`). `cmp` is record-only and kept out of `wall_min`.
+  An ordinary candidate refits inside screen, but lora and classifier arms refit
+  after screen closes (after the arm grid), so their refit time is not in
+  `wall_min` and appears only here. In rounds where the champion has a rescorer,
+  such a candidate also carries `rescorer_cmp`: micro F(β) on the same fit_dev
+  predictions for the refit (`refit`), the champion's discriminator and α as they
+  are (`champion_rescorer`), and the champion's discriminator with α re-picked
+  (`champion_disc_alpha`). It is a record for weighing a scheme that trains the
+  discriminator only when the champion changes, never used for a decision, and
+  adds no inference; if it fails, only `refit` and `error` are kept and the
+  candidate goes on. The discriminator (GBDT) fit runs on `rescorer.fit_threads`
+  (8) threads — the entry point pins threads to 1, so they are released only
+  there, and the result does not depend on the thread count.
 - **Final diagnosis** (`rounds/final/`): a failure still ends the run, and the
   error is kept in `run_summary.json` as `final_diagnosis.error`.
 - **Rescorer row cap**: a rescorer candidate's `rescorer_info.json` carries
-  `n_train_raw` (rows before the cap) and `train_rows_capped`.
+  `n_train_raw` (rows before the cap), `train_rows_capped` and `wall_s` (seconds
+  per stage — inference, discriminator, α).
 
 ### Report
 
