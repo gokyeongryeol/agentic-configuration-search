@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from ..core import metrics
@@ -22,7 +23,7 @@ from ..core.metrics import per_image_records
 from ..eval.runner import chosen_groups, infer_for_groups
 from ..eval.screen import count_rows
 from ..fitting.materials import Materials
-from ..fitting.rescorer import _apply_rescorer, fit_rescorer
+from ..fitting.rescorer import Rescorer, _apply_rescorer, fit_rescorer, refit_alphas
 
 log = logging.getLogger(__name__)
 
@@ -75,12 +76,19 @@ def split_preds(cfg, client, ds, setting, materials: Materials, split, prefix):
 def fit_for_setting(cfg, client, ds, setting: dict, materials: Materials,
                     out_dir: Path):
     """Fit discriminator (fit_train) and α (fit_dev) under `setting` —
-    (rescorer|None, info, dev_preds). dev_preds is reused for scoring."""
+    (rescorer|None, info, dev_preds). dev_preds is reused for scoring.
+    info["wall_s"] holds seconds per stage — inference (fit_train, fit_dev, with
+    embeddings) and the discriminator fit and α selection (absent when the
+    discriminator is skipped)."""
     area_stats = ds.train.area_stats()
+    t0 = time.monotonic()
     train_preds, _ = split_preds(cfg, client, ds, setting, materials,
                                  ds.fit_train, "tr")
+    t1 = time.monotonic()
     dev_preds, dev_paths = split_preds(cfg, client, ds, setting, materials,
                                        ds.fit_dev, "dv")
+    wall = {"infer_train": round(t1 - t0, 2),
+            "infer_dev": round(time.monotonic() - t1, 2)}
     rescorer, info = fit_rescorer(
         cfg.rescorer, train_preds=train_preds, train_split=ds.fit_train,
         dev_preds=dev_preds, dev_split=ds.fit_dev, dev_image_paths=dev_paths,
@@ -89,6 +97,7 @@ def fit_for_setting(cfg, client, ds, setting: dict, materials: Materials,
         threshold_floor=cfg.query.threshold_floor,
         max_threshold_candidates=cfg.search.max_threshold_candidates,
         beta=cfg.beta, area_stats=area_stats)
+    info["wall_s"] = wall | info.pop("fit_s", {})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "rescorer_info.json").write_text(
@@ -96,6 +105,28 @@ def fit_for_setting(cfg, client, ds, setting: dict, materials: Materials,
     if rescorer is not None:
         rescorer.save(out_dir / "rescorer.json")
     return rescorer, info, dev_preds
+
+
+def champion_scores(cfg, ds, setting: dict, champion: Rescorer, dev_preds: dict,
+                    dev_split) -> dict:
+    """Two micro F(β) of the candidate's fit_dev predictions under the champion's
+    discriminator — a record of how scoring without refitting the discriminator
+    would have gone (never used for a decision).
+
+    champion_rescorer: the champion's discriminator and α as they are.
+    champion_disc_alpha: the champion's discriminator with α re-picked on this
+    candidate's fit_dev."""
+    paths = [dev_split.image_path(e) for e in dev_split.images]
+    realpha = refit_alphas(
+        cfg.rescorer, champion.discriminator, dev_preds=dev_preds, dev_split=dev_split,
+        dev_image_paths=paths, tiled_ids=_tiled_ids(setting),
+        iou_thr=cfg.detector.iou_threshold, threshold_floor=cfg.query.threshold_floor,
+        max_threshold_candidates=cfg.search.max_threshold_candidates, beta=cfg.beta,
+        area_stats=ds.train.area_stats())
+    return {name: rescored_split_score(cfg, ds, setting, r, dev_preds,
+                                       dev_split)["micro_f_beta"]
+            for name, r in (("champion_rescorer", champion),
+                            ("champion_disc_alpha", realpha))}
 
 
 def apply_to_preds(cfg, ds, setting, rescorer, preds: dict) -> dict:

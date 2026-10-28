@@ -38,10 +38,16 @@ import hashlib
 import json
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+# load sklearn (OpenMP) first — threadpool_limits changes only the OpenMP already
+# loaded, so if it were first imported inside the discriminator-fit block the
+# first fit would not get rescorer.fit_threads
+import sklearn.ensemble  # noqa: F401
+from threadpoolctl import threadpool_limits
 
 from ..core import metrics
 from ..core.metrics import iou_matrix, per_image_records
@@ -418,6 +424,7 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
     fit_dev is held out from discriminator training, so P̂ is applied directly to
     measure each class's F(α) curve, and α_c is picked by a margin gate. α=0 is
     on the grid, so without gain it naturally falls back to identity.
+    info["fit_s"] holds the seconds of the discriminator fit and the α selection.
 
     Returns (rescorer|None, info).
     """
@@ -456,10 +463,58 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
     if not has_emb:
         log.info("rescorer: fitting without embeddings — using only %d hand-crafted features "
                  "(the detector does not provide embeddings)", len(feat_names))
-    disc = fit_discriminator(feat_names, X_tr, E_tr, ys_tr,
-                             members=rs_cfg.ensemble_members,
-                             sample_weight=w_tr if cap_info["capped"] else None)
+    t0 = time.monotonic()
+    # the entry point pins OpenMP threads to 1 — released only for the discriminator fit
+    with threadpool_limits(limits=rs_cfg.fit_threads, user_api="openmp"):
+        disc = fit_discriminator(feat_names, X_tr, E_tr, ys_tr,
+                                 members=rs_cfg.ensemble_members,
+                                 sample_weight=w_tr if cap_info["capped"] else None)
+    t1 = time.monotonic()
+    alphas, sel = _select_alphas(rs_cfg, disc, rows_dev, dev_split, dev_image_paths,
+                                 iou_thr=iou_thr, threshold_floor=threshold_floor,
+                                 max_threshold_candidates=max_threshold_candidates,
+                                 beta=beta)
+    info.update(sel)
+    info["fit_s"] = {"discriminator": round(t1 - t0, 2),
+                     "alpha": round(time.monotonic() - t1, 2)}
+    info.update({"ensemble_members": disc.members, "features": feat_names})
+    log.info("rescorer: train n=%d%s, dev n=%d, α>0 classes %d/%d (margin %.3f)",
+             len(rows_tr), f" (capped — {n_raw} before)" if cap_info["capped"] else "",
+             len(rows_dev), info["alpha_active_classes"], info["n_classes"],
+             rs_cfg.margin)
+    fp = dataset_fingerprint(dataset_name, ontology)
+    # time (fit_s) is not artifact metadata — the caller keeps it as wall_s in rescorer_info.json
+    meta = {k: v for k, v in info.items() if k != "fit_s"}
+    return Rescorer(disc, alphas, meta=meta, fingerprint=fp), info
 
+
+def refit_alphas(rs_cfg, discriminator: GbdtVerifier, *, dev_preds: dict, dev_split,
+                 dev_image_paths, tiled_ids: set | None = None, iou_thr: float = 0.5,
+                 threshold_floor: float = 0.03, max_threshold_candidates: int = 50,
+                 beta: float = 1.0, area_stats: dict | None = None) -> Rescorer:
+    """Keep the discriminator and re-pick only α on these fit_dev predictions (the
+    same α selection as fit_rescorer). If the discriminator was fit with
+    embeddings, rows without one are dropped."""
+    rows_dev = _rescorer_rows(dev_preds, dev_split, tiled_ids or set(), iou_thr,
+                              area_stats)
+    if discriminator.emb_dim:
+        rows_dev = [r for r in rows_dev if r["emb"] is not None]
+    else:
+        for r in rows_dev:
+            r["emb"] = []
+    alphas, sel = _select_alphas(rs_cfg, discriminator, rows_dev, dev_split,
+                                 dev_image_paths, iou_thr=iou_thr,
+                                 threshold_floor=threshold_floor,
+                                 max_threshold_candidates=max_threshold_candidates,
+                                 beta=beta)
+    return Rescorer(discriminator, alphas, meta=sel)
+
+
+def _select_alphas(rs_cfg, disc: GbdtVerifier, rows_dev: list[dict], dev_split,
+                   dev_image_paths, *, iou_thr: float, threshold_floor: float,
+                   max_threshold_candidates: int, beta: float) -> tuple[dict, dict]:
+    """The per-class α grid on fit_dev rows — (alphas, a piece of info)."""
+    info: dict = {}
     alphas: dict[int, float] = {}
     sel_f1: dict[int, dict[float, float]] = {}
     counts: dict[int, int] = {}
@@ -523,16 +578,11 @@ def fit_rescorer(rs_cfg, *, train_preds: dict, train_split, dev_preds: dict,
     info.update({"alphas": {str(k): v for k, v in sorted(alphas.items())},
                  "alpha_active_classes": n_on, "n_classes": len(counts),
                  "margin": float(rs_cfg.margin),
-                 "ensemble_members": disc.members, "features": feat_names,
                  "class_counts_dev": {str(c): counts[c] for c in sorted(counts)},
                  "sel_f_beta_by_class_alpha": {
                      str(cid): {str(a): round(v, 4) for a, v in sorted(c.items())}
                      for cid, c in sel_f1.items()}})
-    log.info("rescorer: train n=%d%s, dev n=%d, α>0 classes %d/%d (margin %.3f)",
-             len(rows_tr), f" (capped — {n_raw} before)" if cap_info["capped"] else "",
-             len(rows_dev), n_on, len(counts), rs_cfg.margin)
-    fp = dataset_fingerprint(dataset_name, ontology)
-    return Rescorer(disc, alphas, meta=dict(info), fingerprint=fp), info
+    return alphas, info
 
 
 def _apply_rescorer(rescorer, preds: dict, train, tiled_ids,

@@ -903,8 +903,9 @@ class Loop:
         """
         if not entry["axes"].get("rescorer"):
             return setting
-        rescorer, _info, dev_preds = rescore.fit_for_setting(
+        rescorer, info, dev_preds = rescore.fit_for_setting(
             self.cfg, self.client, self.ds, setting, materials, mat_dir)
+        self._rescorer_profile(entry, info)
         if rescorer is None or not rescorer.active:
             log.info("candidate %s: rescorer re-fit on the arm is identity — label corrected",
                      entry["id"])
@@ -915,8 +916,45 @@ class Loop:
             return setting
         entry["_rescorer"] = rescorer
         entry["rescorer_path"] = str(Path(mat_dir) / "rescorer.json")
-        return rescore.rescored_screen(self.cfg, self.ds, setting,
-                                       rescorer, dev_preds)
+        out = rescore.rescored_screen(self.cfg, self.ds, setting, rescorer, dev_preds)
+        self._rescorer_compare(entry, setting, dev_preds, out)
+        return out
+
+    def _rescorer_profile(self, entry: dict, info: dict) -> None:
+        """Minutes per refit stage (inference, discriminator, α) — history's rescorer_min."""
+        if info.get("wall_s"):
+            entry["_rescorer_min"] = {k: round(v / 60, 2)
+                                      for k, v in info["wall_s"].items()}
+
+    def _rescorer_compare(self, entry: dict, setting: dict, dev_preds: dict,
+                          refit: dict) -> None:
+        """If the champion has a rescorer, also keep the fit_dev micro scored with its
+        discriminator — history's rescorer_cmp. A record for weighing a scheme that
+        trains the discriminator only when the champion changes, so it is never
+        used for a decision. It uses the fit_dev predictions already made for the
+        refit, so no inference is added."""
+        path = (getattr(self, "_champion", None) or {}).get("rescorer_path")
+        if not path:
+            return
+        from ..fitting.rescorer import Rescorer, dataset_fingerprint
+        t0 = time.monotonic()
+        cmp = {"refit": refit["fit_dev_micro_f_beta"]}
+        try:
+            champ = Rescorer.load(Path(path), expect=dataset_fingerprint(
+                self.ds.root.name, self.ds.ontology))
+            cmp |= rescore.champion_scores(self.cfg, self.ds, setting, champ,
+                                           dev_preds, self.ds.fit_dev)
+        except Exception as exc:  # noqa: BLE001 — a record-only computation must not reject the candidate
+            log.warning("candidate %s: champion discriminator comparison failed — %r",
+                        entry.get("id"), exc, exc_info=True)
+            cmp["error"] = repr(exc)
+        entry["_rescorer_cmp"] = cmp
+        # record-only computation time — kept out of the cost the planner sees
+        # (wall_min), only in rescorer_min
+        dt = time.monotonic() - t0
+        if "_wall" in entry:
+            entry["_wall"]["_record_only"] = entry["_wall"].get("_record_only", 0.0) + dt
+        entry.setdefault("_rescorer_min", {})["cmp"] = round(dt / 60, 2)
 
     def _shortfall(self, c: dict, entry: dict) -> None:
         """Attach the magnification-shortfall verdict (tiling_shortfall) to a
@@ -1102,16 +1140,19 @@ class Loop:
             with self._lambda_for(entry):
                 rescorer, info, dev_preds = rescore.fit_for_setting(
                     self.cfg, self.client, self.ds, setting0, materials, mat_dir)
+            self._rescorer_profile(entry, info)
             if rescorer is None or not rescorer.active:
                 # the identity verdict is deterministic — a sibling in the same
                 # state gets the same result, so block it
                 self._seen_fps.add(entry["setting_fp"])
                 skipped.append({**c, "skipped": "rescorer_identity",
                                 "note": "rescorer skipped or α=0 for all classes — "
-                                        "identical to champion, evaluation skipped"})
+                                        "identical to champion, evaluation skipped"}
+                               | _rescorer_record(entry))
                 return
             setting = rescore.rescored_screen(self.cfg, self.ds, setting0,
                                               rescorer, dev_preds)
+            self._rescorer_compare(entry, setting0, dev_preds, setting)
             entry["_rescorer"] = rescorer
             entry["rescorer_path"] = str(Path(mat_dir) / "rescorer.json")
         else:
@@ -1422,6 +1463,7 @@ class Loop:
                             | ({"gate_passed_but_lost": True} if c["id"] in lost else {})
                             | _source_record(c) | _reuse_record(c)
                             | _classifier_lambda_record(c) | _skip_record(c)
+                            | _rescorer_record(c)
                             for c in screened] + skipped),
             "decision": decision})
         return decision, champion
@@ -1655,6 +1697,7 @@ class Loop:
             entry["setting"] = row["setting"] = setting
             entry["fit_dev_micro_f_beta"] = row["fit_dev_micro_f_beta"] = \
                 setting["fit_dev_micro_f_beta"]
+            row.update(_rescorer_record(entry))
             row.update(_cmp_of(self._fit_dev_cmp(setting)))
             if self._arm_skip(row):
                 continue
@@ -1744,7 +1787,7 @@ class Loop:
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
             entry["setting"] = setting
-            row.update(_cmp_of(self._fit_dev_cmp(setting)))
+            row.update(_cmp_of(self._fit_dev_cmp(setting)) | _rescorer_record(entry))
             if self._arm_skip(row):
                 continue
             t1 = time.monotonic()
@@ -1892,18 +1935,23 @@ def _wall_min(wall: dict) -> dict:
     stage and total.
 
     materialize (material mining) · screen (fit_dev scoring — including the
-    prescreen, the rescorer refit and lora/classifier training) · holdout
-    (evaluation). The planner reads per-axis cost from it."""
-    out = {k: round(v / 60, 2) for k, v in wall.items()}
-    out["total"] = round(sum(wall.values()) / 60, 2)
+    prescreen, lora/classifier training and an ordinary candidate's rescorer
+    refit; an arm candidate refits after screen closes, so that is not here — it
+    is in rescorer_min) · holdout (evaluation). The planner reads per-axis cost
+    from it. Keys starting with `_` (record-only computation time) are not cost
+    and are left out."""
+    cost = {k: v for k, v in wall.items() if not k.startswith("_")}
+    out = {k: round(v / 60, 2) for k, v in cost.items()}
+    out["total"] = round(sum(cost.values()) / 60, 2)
     return out
 
 
 def _close_wall(wall: dict, t0: float, new_skips) -> None:
-    """Close screen as the time since t0 minus materialize. Candidate rows
-    rejected in between (new_skips) get wall_min right away — they never reach
-    holdout, so this is their whole cost."""
-    wall["screen"] = max(time.monotonic() - t0 - wall.get("materialize", 0.0), 0.0)
+    """Close screen as the time since t0 minus materialize and record-only
+    computation (_record_only). Candidate rows rejected in between (new_skips) get
+    wall_min right away — they never reach holdout, so this is their whole cost."""
+    wall["screen"] = max(time.monotonic() - t0 - wall.get("materialize", 0.0)
+                         - wall.get("_record_only", 0.0), 0.0)
     for rec in new_skips:
         rec.setdefault("wall_min", _wall_min(wall))
 
@@ -2271,6 +2319,19 @@ def _reuse_record(c: dict) -> dict:
     return out
 
 
+def _rescorer_record(c: dict) -> dict:
+    """Minutes per rescorer refit stage (rescorer_min) and the champion
+    discriminator comparison scores (rescorer_cmp) — artifact only (not carried
+    in the planner prompt)."""
+    out = {}
+    # an ordinary candidate brings the entry (underscore keys); lora and classifier
+    # arms bring the row with the output keys moved onto it
+    for key in ("rescorer_min", "rescorer_cmp"):
+        if val := c.get(f"_{key}") or c.get(key):
+            out[key] = val
+    return out
+
+
 def _classifier_lambda_record(c: dict) -> dict:
     """The classifier blend λ the candidate chose — a classifier arm (the grid's
     best when not adopted; Δ is in classifier_decision.json's grid), or an
@@ -2279,6 +2340,8 @@ def _classifier_lambda_record(c: dict) -> dict:
     lam = (c.get("crop_classifier") or {}).get("lam")
     if lam is None:
         lam = c.get("_adapt_lambda")
+    if lam is None:      # a lora arm row — the λ chosen on the winning arm, moved onto the output key
+        lam = c.get("classifier_lambda")
     out = {"classifier_lambda": lam} if lam is not None else {}
     if c.get("classifier_lambda_grid"):
         out["classifier_lambda_grid"] = c["classifier_lambda_grid"]
