@@ -392,7 +392,7 @@ def test_hygiene_drops_do_not_count_as_tried():
 def test_no_untried_line_when_everything_was_tried():
     hist = _history()
     for i, axes in enumerate([{"text_negatives": "fp_crop"},
-                              {"visual_negatives": True}, {"rescorer": True},
+                              {"visual_negatives": "fp_crop"}, {"rescorer": True},
                               {"lora": True}, {"crop_classifier": True}]):
         hist[3]["candidates"].append(_row(f"x{i}", champ={"exemplar": "base"}, **axes))
     assert _untried(_prompt(hist)) is None

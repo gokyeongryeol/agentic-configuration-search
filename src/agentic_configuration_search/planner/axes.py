@@ -28,7 +28,10 @@ AXES: dict[str, tuple] = {
     #   gt_crop    = captions of other classes' GT crops (suppress confused classes)
     #   background = captions of FPs not overlapping any GT (suppress background FPs)
     "text_negatives": (False, "fp_crop", "gt_crop", "background"),
-    "visual_negatives": (False, True),                # visual negatives + neg_eta grid
+    # visual negatives take the same three sources — the crops themselves go in
+    # as negative image prompts instead of captions (semantic queries only;
+    # screen picks the neg_eta grid)
+    "visual_negatives": (False, "fp_crop", "gt_crop", "background"),
     "tiling": (False, *TILING_GRIDS),         # grid g (see TILING_GRIDS above)
     "rescorer": (False, True),                # α_c grid (fit_train/fit_dev)
     "lora": (False, True),                    # YOLOE tail fine-tune + λ arms (name kept)
@@ -42,6 +45,9 @@ AXES: dict[str, tuple] = {
     "visual_negative_k": (None, 1, 2, 4),            # visual negatives per class
     "text_negative_k": (None, 1, 2, 4),       # suppression phrases per class
 }
+
+# negative axes whose values are the mining source (fp_crop | gt_crop | background)
+NEGATIVE_AXES = ("text_negatives", "visual_negatives")
 
 BASELINE: dict = {"exemplar": "none", "alias": False, "text_negatives": False,
                   "visual_negatives": False, "tiling": False, "rescorer": False,
@@ -85,8 +91,8 @@ def axis_values(facts: DatasetFacts | None = None) -> dict[str, tuple]:
     if facts is None:
         return out
     if facts.n_classes == 1:
-        out["text_negatives"] = tuple(v for v in AXES["text_negatives"]
-                                      if v != "gt_crop")
+        for axis in NEGATIVE_AXES:
+            out[axis] = tuple(v for v in AXES[axis] if v != "gt_crop")
     if facts.lora_block():
         out["lora"] = (False,)
     return out
@@ -112,7 +118,7 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
             raise ValueError(f"axes.{k}: {v!r} must be one of {AXES[k]}")
     # Visual negatives ride only on semantic queries — cannot be on without exemplars
     if full["visual_negatives"] and full["exemplar"] == "none":
-        raise ValueError("axes.visual_negatives=True requires an exemplar "
+        raise ValueError("axes.visual_negatives requires an exemplar "
                          "(visual negatives apply to semantic queries only — text "
                          "suppression is the text_negatives axis)")
     # Count axes are meaningful only when their feature axis is on — meaningless
@@ -131,10 +137,11 @@ def validate_axes(axes: dict, *, facts: DatasetFacts | None = None) -> dict:
     # same "suppress look-alikes" role.
     if facts is None:
         return full
-    if facts.n_classes == 1 and full["text_negatives"] == "gt_crop":
-        raise ValueError("axes.text_negatives=gt_crop is only meaningful with 2+ "
-                         "classes (sourced from other classes' GT) — on a "
-                         "single-class dataset use fp_crop or background")
+    for axis in NEGATIVE_AXES:
+        if facts.n_classes == 1 and full[axis] == "gt_crop":
+            raise ValueError(f"axes.{axis}=gt_crop is only meaningful with 2+ "
+                             "classes (sourced from other classes' GT) — on a "
+                             "single-class dataset use fp_crop or background")
     # lora (tail fine-tune) is rejected without training if fit_train has fewer
     # than lora.min_images images — the outcome follows from the data, so block it
     # before it uses a candidate slot

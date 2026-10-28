@@ -22,12 +22,12 @@ def test_validate_axes_fills_baseline_and_rejects_unknown():
 
 def test_visual_negative_requires_exemplar():
     with pytest.raises(ValueError, match="visual_negatives"):
-        validate_axes({"visual_negatives": True})
-    validate_axes({"visual_negatives": True, "exemplar": "base"})   # OK
+        validate_axes({"visual_negatives": "fp_crop"})
+    validate_axes({"visual_negatives": "fp_crop", "exemplar": "base"})   # OK
 
 
 def test_sanitize_drops_invalid_and_dedups():
-    raw = [{"axes": {"visual_negatives": True}, "rationale": "invalid — no exemplar"},
+    raw = [{"axes": {"visual_negatives": "fp_crop"}, "rationale": "invalid — no exemplar"},
            {"axes": {"alias": "vlm"}, "rationale": "a"},
            {"axes": {"alias": "vlm"}, "rationale": "duplicate"},
            "garbage",
@@ -116,12 +116,12 @@ def test_llm_error_falls_back(tmp_path):
 def test_llm_valid_candidates_pass_through(tmp_path):
     planner = LLMPlanner(
         chat=lambda m, **k: {"candidates": [
-            {"id": "my", "axes": {"exemplar": "base", "visual_negatives": True},
+            {"id": "my", "axes": {"exemplar": "base", "visual_negatives": "fp_crop"},
              "rationale": "suppress background FPs"}], "stop": False},
         artifact_dir=tmp_path)
     out = planner.propose([], {})
     assert out["candidates"][0]["id"] == "my"
-    assert out["candidates"][0]["axes"]["visual_negatives"] is True
+    assert out["candidates"][0]["axes"]["visual_negatives"] == "fp_crop"
 
 
 def test_llm_prompt_is_compacted(tmp_path):
@@ -623,7 +623,7 @@ def test_sanitize_records_duplicate_and_overflow_drops():
 
 def test_sanitize_without_sink_keeps_old_signature():
     """Existing call sites that do not pass dropped keep working."""
-    out = sanitize_candidates([{"id": "x", "axes": {"visual_negatives": True}},
+    out = sanitize_candidates([{"id": "x", "axes": {"visual_negatives": "fp_crop"}},
                                {"id": "y", "axes": {"alias": "vlm"}}],
                               max_candidates=5)
     assert [c["id"] for c in out] == ["y"]
@@ -886,7 +886,7 @@ def test_carryover_resets_dependent_axes_on_new_champion():
     candidate turned exemplar off, an overwrite would be a contract-violating
     combination and the gate passer would vanish without a record."""
     prev = validate_axes({"exemplar": "base"})
-    win = validate_axes({"exemplar": "base", "visual_negatives": True})
+    win = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     lost = validate_axes({"alias": "vlm"})          # turned exemplar off and alias on
     hist = [{"round": 1, "champion": {"axes": prev}, "candidates": []},
             {"round": 2, "champion": {"axes": win},
@@ -962,7 +962,7 @@ def test_merge_resets_dependents_of_a_changed_feature_axis():
     axes the candidate does not name — if the champion's stayed, the validation
     rules would drop the whole candidate."""
     champ = validate_axes({"exemplar": "fn_arm", "exemplar_base_k": 4, "exemplar_fn_k": 2,
-                           "visual_negatives": True, "visual_negative_k": 2,
+                           "visual_negatives": "fp_crop", "visual_negative_k": 2,
                            "text_negatives": "fp_crop", "text_negative_k": 2,
                            "rescorer": True})
     def one(ax):

@@ -378,7 +378,7 @@ def test_empty_material_candidate_is_skipped():
     empty = Materials()
     assert _empty_material({"alias": "vlm"}, empty, {}) == "alias"
     assert _empty_material({"text_negatives": "fp_crop"}, empty, {}) == "text_negatives"
-    assert _empty_material({"visual_negatives": True}, empty, {}) == "visual_negatives"
+    assert _empty_material({"visual_negatives": "fp_crop"}, empty, {}) == "visual_negatives"
     assert _empty_material({"exemplar": "base"}, empty, {}) == "exemplar"
     # manual aliases are always applied regardless of axes.alias — empty generation means no increment
     assert _empty_material({"alias": "vlm"}, Materials(aliases={"a": "b"}),
@@ -756,7 +756,7 @@ def test_unused_axes_reads_the_screened_setting():
 
     cfgs = {0: {"visual_negatives": False, "tiling": None},
             1: {"visual_negatives": True, "tiling": None}}
-    ex = validate_axes({"exemplar": "base", "visual_negatives": True})
+    ex = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     text_only = _st({1: {"config_id": 0, "modality": "text"}}, cfgs)
     assert _unused_axes(ex, text_only) == ["exemplar", "visual_negatives"]
     sem_no_neg = _st({1: {"config_id": 0, "modality": "semantic"}}, cfgs)
@@ -849,7 +849,7 @@ def test_neg_eta_record_reads_the_screened_setting():
                            {"config_id": 3, "visual_negatives": True, "neg_eta": 0.75}],
                "per_class": {1: {"config_id": 1, "modality": "semantic"},
                              2: {"config_id": 2, "modality": "text"}}}
-    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    vn = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     assert _neg_eta_record({"axes": vn, "setting": setting}) == {
         "neg_eta_used": [0.25], "neg_eta_grid": [0.25, 0.5, 0.75]}
     # recorded against the request even after relabelling — negatives going
@@ -907,7 +907,7 @@ def test_history_records_neg_eta_for_visual_negative_candidates(big_root, tmp_pa
 
     def llm(messages, **kw):
         return {"candidates": [{"id": "vn", "axes": {"exemplar": "base",
-                                                     "visual_negatives": True},
+                                                     "visual_negatives": "fp_crop"},
                                 "rationale": "background FP"}], "stop": False}
 
     run_rounds(big_root, out_dir=tmp_path / "run", planner="llm",
@@ -923,7 +923,7 @@ def test_compact_history_and_prompt_carry_neg_eta():
     from agentic_configuration_search.planner.axes import validate_axes
 
     b = validate_axes({})
-    vn = validate_axes({"exemplar": "base", "visual_negatives": True})
+    vn = validate_axes({"exemplar": "base", "visual_negatives": "fp_crop"})
     hist = [{"round": 0, "champion": {"axes": b}, "candidates": []},
             {"round": 1, "champion": {"axes": b},
              "candidates": [{"id": "vn", "axes": vn, "neg_eta_used": [0.25],

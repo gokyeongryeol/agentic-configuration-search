@@ -37,14 +37,20 @@ REMEDY: dict[str, tuple] = {
     # The crop classifier lowers the scores of detections with a high background
     # probability — it suppresses background FPs too (λ blend; whether to drop is
     # left to the per-class thresholds). It costs the most (classifier fit +
-    # detector state swap), so it goes last.
-    "background": (("visual_negatives", True),
+    # detector state swap), so it goes after the remedies without training. The
+    # negative axes take a value per mining source — the cause-specific visual
+    # source (background FPs → background, class confusion → gt_crop) is the next
+    # variant after the general fp_crop, at the end: fp_crop covers the same
+    # errors more broadly, so it is measured first, and the cause-specific source
+    # follows once it is the champion or has been tried.
+    "background": (("visual_negatives", "fp_crop"),
                    ("text_negatives", "background"), ("rescorer", True),
-                   ("crop_classifier", True)),
+                   ("crop_classifier", True), ("visual_negatives", "background")),
     "class_confusion": (("alias", "vlm"),
                         ("crop_classifier", True),
                         ("text_negatives", "gt_crop"),
-                        ("visual_negatives", True)),
+                        ("visual_negatives", "fp_crop"),
+                        ("visual_negatives", "gt_crop")),
     "localization": (("lora", True),),
     "duplicate": (),          # handled by gateway's per-class folding — no proposal
     "tiling_artifact": (),    # tiling merge params are not an axis — left to human-injected candidates

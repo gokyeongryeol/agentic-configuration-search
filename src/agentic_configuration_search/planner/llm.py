@@ -21,7 +21,7 @@ from pathlib import Path
 
 from ..diagnose.sample import pick_detail
 from . import deterministic
-from .axes import (BASELINE, PLAN_DIFFERS_MAX, DatasetFacts, axis_values,
+from .axes import (BASELINE, NEGATIVE_AXES, PLAN_DIFFERS_MAX, DatasetFacts, axis_values,
                    sanitize_candidates)
 from .gates import INPUT_SIDE, champion_round, tiling_gate, tp_floor, under_champion
 from .ledger import K_PARENT, axis_ledger, champion_requests, tried_under_champion
@@ -659,6 +659,25 @@ def _compact_history(history: list[dict], window: int = MAX_HISTORY) -> list[dic
 
 # Cost of axes not observed yet — minutes differ per dataset, so only relative
 # size is given
+# negative axis values = the mining source. Only the values open on the dataset
+# are explained (no gt_crop on a single class)
+SOURCE_DOC = {"fp_crop": "fp_crop = false detections of the class",
+              "gt_crop": "gt_crop = other classes' ground truth (look-alike classes)",
+              "background": "background = false detections that overlap no ground truth"}
+
+
+def _source_doc(values: dict, disabled=()) -> str:
+    """One line explaining the values (mining sources) of text_negatives and visual_negatives."""
+    axes = [a for a in NEGATIVE_AXES if a not in disabled and len(values.get(a, ())) > 1]
+    if not axes:
+        return ""
+    srcs = [v for v in SOURCE_DOC if any(v in values[a] for a in axes)]
+    return ("\n" + " and ".join(axes) + " values are the mining source: "
+            + "; ".join(SOURCE_DOC[v] for v in srcs) + ". text_negatives turns the "
+            "crops into suppressing phrases; visual_negatives feeds the crops as "
+            "negative image prompts.")
+
+
 STATIC_COST = {
     "tiling": "tiling=g: every detector pass costs 1+g^2 forwards per image "
               "(champion: {forwards})",
@@ -1181,11 +1200,11 @@ class LLMPlanner:
         conversation."""
         champion = (history[-1].get("champion", {}).get("axes")
                     if history else None) or {}
-        axes_doc = "\n".join(
-            f"- {k}: one of "
-            f"{[x for x in v if x not in self.disabled_values.get(k, ())]}"
-            for k, v in axis_values(self.facts).items()
-            if k not in self.disabled_axes)
+        values = {k: tuple(x for x in v if x not in self.disabled_values.get(k, ()))
+                  for k, v in axis_values(self.facts).items()}
+        axes_doc = "\n".join(f"- {k}: one of {list(v)}" for k, v in values.items()
+                             if k not in self.disabled_axes)
+        axes_doc += _source_doc(values, self.disabled_axes)
         banned = list(self.disabled_axes) + [
             f"{k}={x!r}" for k, xs in sorted(self.disabled_values.items())
             for x in xs]

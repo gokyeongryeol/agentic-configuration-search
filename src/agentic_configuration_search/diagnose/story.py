@@ -150,6 +150,9 @@ STOP_PLAIN = {
     "empty_rounds": "no new strategy came up to test",
     "rounds": "it finished all the planned rounds",
 }
+# mining sources of the negative axes (text and visual) → plain words
+_SOURCE_PLAIN = {"fp_crop": "from wrong finds", "gt_crop": "from other kinds",
+                 "background": "from the background"}
 _SIZE_PLAIN = {"small": "small", "medium": "medium-size", "large": "large"}
 _CROWDED = ("6-20", "21+")        # only these buckets are called "crowded scenes"
 _CROWD_PLAIN = {"1": "1", "2-5": "2–5", "6-20": "6–20", "21+": "21 or more"}
@@ -168,6 +171,8 @@ def strategy_label(delta: dict) -> str:
             on.append(f"{name} ({v}×{v})")
         elif k == "exemplar" and v == "fn_arm":
             on.append(f"{name} (mostly missed objects)")
+        elif v in _SOURCE_PLAIN:
+            on.append(f"{name} ({_SOURCE_PLAIN[v]})")
         else:
             on.append(name)
     if not on and not off and any(k in _QUANTITY_KEYS for k in delta):
