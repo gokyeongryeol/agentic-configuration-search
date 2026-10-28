@@ -23,6 +23,7 @@ import logging
 import re
 from pathlib import Path
 
+from ..config import GateCfg
 from ..core.metrics import FP_KINDS
 from ..diagnose.sample import pick_detail
 from . import deterministic
@@ -62,12 +63,11 @@ SCHEMA = {
                         "expected_gain": {"type": "number"},
                         "cost_min": {"type": "number"},
                         "differs": {"type": "string", "maxLength": PLAN_DIFFERS_MAX},
-                        # rationales run to about 1,700 characters at most
-                        # (p99 about 1,050). Without a cap one rationale could
-                        # run on until the response hit the output cap. Since
-                        # the expected gain, cost and differs became structured
-                        # it is cut to 1,200 so the longest schema response
-                        # fits in OUTPUT_MAX_TOKENS
+                        # Without a cap one rationale can run on until the
+                        # response hits the output cap. The expected gain,
+                        # cost and differs are structured separately, so 1,200
+                        # is enough and the longest schema response fits in
+                        # OUTPUT_MAX_TOKENS
                         "rationale": {"type": "string", "maxLength": 1200},
                     },
                     "required": ["axes", "expected_gain", "cost_min", "differs",
@@ -111,7 +111,7 @@ CONTEXT_MARGIN = 256      # chat template tokens etc.
 # sent to the server and falls back with the reason (PromptOverBudget) — kept in
 # run_summary.
 DEFAULT_TOKEN_BUDGET = 32768 - OUTPUT_MAX_TOKENS - CONTEXT_MARGIN
-NDIGITS = 4              # float digits in the prompt — at margin scale (0.005) the
+NDIGITS = 4              # float digits in the prompt — at min_delta scale (0.005) the
                          # gate Δ/CI verdict turns on the 4th digit (3 is too few)
 
 
@@ -447,14 +447,17 @@ def _retire_line(status) -> str:
             "count). When the champion changes, OFF axes reopen as PROBE.")
 
 
-def _constraint_lines(disabled, status) -> list[str]:
+def _constraint_lines(disabled, status, champion: dict | None = None) -> list[str]:
     """Conditions whose breach drops a candidate without evaluation — up front, so
     they are not buried in the long rules. The tiling fold and per-axis
     circumstances are on the axis board (planner.board)."""
     # values that are blocked themselves (gt_crop on a single class etc.) are already
     # left out of the board's propose column
     state = [a for a in ("lora", "crop_classifier") if a not in disabled]
-    lines = ['- visual_negatives needs exemplar != "none".'
+    no_ex = (champion or {}).get("exemplar", "none") == "none"
+    lines = [('- visual_negatives needs exemplar != "none": set an exemplar value in the '
+              'same candidate (allowed while exemplar is OFF unless visual_negatives is OFF '
+              'too).' if no_ex else '- visual_negatives needs exemplar != "none".')
              if "visual_negatives" not in disabled else None,
              (f"- Once {' or '.join(state)} is on in the champion, keep it on (detector "
               "state; turning one off is dropped as skipped=\"detector_state_off\").")
@@ -502,14 +505,12 @@ def _modality_summary(modality_f: dict) -> dict:
     the number of classes.
 
     Carrying the full per-class record (history's modality_f) would make one
-    row exceed 1KB on a 19-class dataset, and the budget guard would shrink the
-    history window. The planner needs the number of classes text won and the
+    row large on a dataset with many classes, and the budget guard would shrink
+    the history window. The planner needs the number of classes text won and the
     narrowest of those margins. Wins follow screen's pick (chosen) — the
-    recorded F is rounded and cannot tell a narrow gap (rows without chosen are
-    counted by F; screen picks semantic on a tie)."""
-    def text_won(v):
-        return v["chosen"] == "text" if v.get("chosen") else v["text"] > v["semantic"]
-    margins = [v["text"] - v["semantic"] for v in modality_f.values() if text_won(v)]
+    recorded F is rounded and cannot tell a narrow gap."""
+    margins = [v["text"] - v["semantic"] for v in modality_f.values()
+               if v["chosen"] == "text"]
     out = {"text_won": len(margins), "semantic_won": len(modality_f) - len(margins)}
     if margins:
         out["closest_text_margin"] = round(min(margins), 4)
@@ -740,7 +741,8 @@ def _budget_lines(budget: dict | None) -> list[str]:
         lines.append(f"- Round {r} of {total}: {left} round"
                      f"{'s' if left != 1 else ''} left including this one.")
     if b.get("saturation_rounds"):
-        lines.append(f"- Rounds in a row without adoption: {b.get('stagnant', 0)}; "
+        lines.append(f"- Stagnant rounds in a row (no adoption, or one whose held-out "
+                     f"gain was not clearly positive): {b.get('stagnant', 0)}; "
                      f"the run stops at {b['saturation_rounds']}.")
     if b.get("empty_rounds"):
         lines.append(f"- Rounds in a row that measured nothing on the held-out split "
@@ -852,10 +854,11 @@ Rules:
 - Materials are mined from the train split only. Each candidate is screened on
   fit_dev (a slice of train) and only the best go to the held-out gate. The
   gate adopts only if a paired-bootstrap LOWER BOUND on the held-out delta
-  clears a margin AND the delta is positive, so a candidate can score higher
-  on the held-out split and still be rejected as noise: gate_delta > 0 with
-  gate_ci_lo < 0 means "close, but unproven"; a clearly negative gate_delta is
-  not worth repeating.
+  clears {margin} AND the delta is positive and at least {min_delta}, so a
+  candidate can score higher on the held-out split and still be rejected as noise:
+  gate_delta > 0 with gate_ci_lo below {margin}, or with gate_delta below {min_delta},
+  means "close, but unproven"; a clearly negative gate_delta is not worth
+  repeating.
 - A value whose single-increment candidate clearly lost on fit_dev under this
   champion is "clearly-lost": its variants (another k, or the value combined
   with other axes) are not blocked but prescreened (see the Axis board), so
@@ -908,8 +911,8 @@ this time; otherwise "") and a short "rationale"."""
 # carried in the Rules only when tiling is not disabled — what a grid means, its
 # cost and how to pick the first grid
 TILING_RULE = """- "tiling" is a grid g: every image is also cut into g x g tiles and each tile
-  is detected at magnification (g-1)(1-overlap)+1 (1.5x at g=2, 2x at g=3 with
-  the default overlap 0.5). Cost: 1 + g^2 detector passes per image. Pick the
+  is detected at magnification (g-1)(1-overlap)+1 ({mag2}x at g=2, {mag3}x at g=3
+  with overlap {overlap}). Cost: 1 + g^2 detector passes per image. Pick the
   first grid from the missed-small sizes in the diagnosis: the grid whose
   magnification brings the typical missed object to a detectable size, no
   larger. Raise g only when the previous grid was used and helped while
@@ -917,6 +920,13 @@ TILING_RULE = """- "tiling" is a grid g: every image is also cut into g x g tile
   larger ones until the champion changes (the Axis board shows the fold and a
   one-time exception).
 """
+
+
+def tiling_rule(overlap: float) -> str:
+    """TILING_RULE filled from search.tiling_overlap — the magnification example follows the setting."""
+    def mag(g):
+        return f"{(g - 1) * (1 - overlap) + 1:g}"
+    return TILING_RULE.format(mag2=mag(2), mag3=mag(3), overlap=f"{overlap:g}")
 
 # meaning of the error kinds the diagnosis digest and detail use — all of
 # core.metrics FP_KINDS and FN_KINDS
@@ -1073,8 +1083,12 @@ class LLMPlanner:
                  facts: DatasetFacts | None = None, tiling_overlap: float = 0.5,
                  tiling_tp_quantile: float = 0.1, tiling_tp_min: int = 20,
                  budget: dict | None = None, prescreen: dict | None = None,
-                 retire_after: int | None = None):
+                 retire_after: int | None = None,
+                 min_delta: float = GateCfg().min_delta,
+                 margin: float = GateCfg().margin):
         self.chat = chat
+        self.min_delta = min_delta             # gate.min_delta — the prompt's adoption rule
+        self.margin = margin                   # gate.margin — what the lower bound must clear
         self.tiling_overlap = tiling_overlap   # search.tiling_overlap — magnification
         # search.tiling_tp_quantile and tiling_tp_min — the s* line of the
         # missed-small block
@@ -1222,7 +1236,7 @@ class LLMPlanner:
         if carry_lines:
             board.append(CARRY_BLOCK.strip("\n").format(
                 carried="\n".join(f"- {x}" for x in carry_lines)))
-        constraints = _constraint_lines(self.disabled_axes, status)
+        constraints = _constraint_lines(self.disabled_axes, status, champion)
         budget = _budget_lines(self.budget)
         champion_text = _champion_block(history)
         # when tiling cannot be proposed (disabled, OFF, every grid folded), the
@@ -1255,7 +1269,10 @@ class LLMPlanner:
                     board="\n".join(board),
                     history=hist_json,
                     glossary=_glossary(hist_rows),
-                    tiling_rule=TILING_RULE if "tiling" not in self.disabled_axes else "",
+                    tiling_rule=(tiling_rule(self.tiling_overlap)
+                                 if "tiling" not in self.disabled_axes else ""),
+                    min_delta=self.min_delta,
+                    margin=self.margin,
                     older=("Earlier rounds, one line each:\n" + "\n".join(older) + "\n"
                            if older else ""),
                     error_kinds=ERROR_KINDS,
@@ -1429,6 +1446,14 @@ class LLMPlanner:
                           for i, c in enumerate(det["candidates"])]
             stop = det["stop"]
             fallback = "deterministic"
+            if raw is not None and error is None:
+                # the reply came but the sanitizer dropped every candidate — keep
+                # the reason (never an empty one)
+                error = "no valid candidate: " + ("; ".join(
+                    f"{c.get('skipped')}: {c.get('invalid') or c.get('note') or ''}".rstrip(": ")
+                    for c in dropped) or "empty candidate list")
+                log.error("LLM planner failed (%s) — this round falls back to deterministic",
+                          error)
 
         proposal = {"planner": "llm", "candidates": candidates, "stop": stop,
                     "dropped": dropped}

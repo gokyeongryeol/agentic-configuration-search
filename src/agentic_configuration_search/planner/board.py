@@ -61,7 +61,8 @@ LEGEND = (
     "champion's value are left. To turn an axis off, set exemplar to \"none\", any other "
     "axis to false; a quantity key set to null returns to its default. run = whole-run "
     "record, counted once per round; \"empty material for v\" means source value v mined "
-    "nothing on this dataset, so re-propose v only after the champion changes; \"not "
+    "nothing under the champion it was tried on, so re-propose v only after the champion "
+    "changes; \"not "
     "trained, too little data\" means the arm skipped training for lack of data — "
     "re-propose it only after the champion changes. champion "
     "= record per value since the current champion was adopted (fd = fit_dev delta with "
@@ -176,7 +177,8 @@ def board_lines(history: list[dict], values: dict, status, *, disabled=(),
                             "every remaining value mined empty under this champion")
             qty = ["{} {}".format(k, "|".join(str(v) for v in values.get(k, ())
                                               if v is not None))
-                   for k, p in K_PARENT.items() if p == axis and k in values]
+                   for k, p in K_PARENT.items()
+                   if p == axis and k in values and k not in disabled]
             # values in response-JSON notation (true; strings as they are) — the
             # same notation as the champion line
             propose = ", ".join(json.dumps(v) if isinstance(v, bool) else str(v)
@@ -206,7 +208,8 @@ def board_lines(history: list[dict], values: dict, status, *, disabled=(),
         if axis == "tiling":
             note.append(f"cost 1+g^2 passes per image (champion: {forwards})")
         if axis == "visual_negatives" and champ.get("exemplar", "none") == "none":
-            note.append("needs exemplar: only together with an exemplar value")
+            note.append("needs exemplar: set an exemplar value in the same candidate "
+                        "(allowed while exemplar is OFF unless visual_negatives is OFF too)")
         lora_blocked = axis == "lora" and facts is not None and facts.lora_block()
         if lora_blocked:
             note.append("too few fit_train images to train")

@@ -124,7 +124,6 @@ search:                                   # value space of the screen (fit_dev) 
   # near-miss exception of the fold gate — s* is a TP-size quantile of the class with the most missed_small
   tiling_tp_quantile: 0.1                 # s* = this quantile of that class's TP sizes (input px)
   tiling_tp_min: 20                       # with fewer TPs in that class, the exception is not judged
-  modalities: [semantic, text]
   disabled_axes: []                       # axes the planner may not turn on in this run (e.g. [lora, tiling]) — a champion's own value is kept
   disabled_values: {}                     # forbid only specific values of an axis — {axis: [value, ...]}
   axis_retire_after: 2                    # LLM planner: turn an axis off after this many rounds in a row without effect (reopened once when the champion changes; null = record only)

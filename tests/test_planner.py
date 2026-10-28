@@ -1084,7 +1084,7 @@ def _scripted_chat(*responses):
 def test_candidates_repeating_carried_ones_are_dropped_and_slots_refilled(tmp_path):
     """A planner repeating carried candidates gets them dropped as duplicates and is
     asked once more for the freed slots — even with the prompt saying not to spend
-    slots on carried candidates, a real run filled 2 of 3 slots with them."""
+    slots on carried candidates, the planner tends to fill slots with them."""
     hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
     chat, calls = _scripted_chat(
         {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"},

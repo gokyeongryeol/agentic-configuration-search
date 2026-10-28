@@ -46,7 +46,8 @@ from ..planner import deterministic
 from ..planner.axis_status import axis_status
 from ..planner.deterministic import tried_combos
 from ..planner.gates import tiling_gate, tiling_shortfall
-from ..planner.axes import AXES, BASELINE, DatasetFacts, sanitize_candidates
+from ..planner.axes import (AXES, BASELINE, DatasetFacts, effective_disabled,
+                            sanitize_candidates)
 from ..planner.llm import CONTEXT_MARGIN, OUTPUT_MAX_TOKENS, LLMPlanner
 from ..planner.ledger import champion_requests, lost_values, variant_of
 from . import adapt_round, rescore, tail_round
@@ -671,7 +672,7 @@ class Loop:
                                 "uses the server's value", self._ctx, want)
         return self._ctx
 
-    def _llm_planner(self, round_dir: Path) -> LLMPlanner:
+    def _llm_planner(self, round_dir: Path, champ_axes: dict | None) -> LLMPlanner:
         chat = self._planner_chat()
         if chat is None:
             raise ValueError("planner.kind=llm requires planner.base_url or "
@@ -680,7 +681,7 @@ class Loop:
                           max_candidates=self.cfg.planner.max_candidates,
                           notes=self.cfg.dataset_notes,
                           token_budget=_token_budget(self.cfg, self._server_context()),
-                          disabled_axes=self.disabled_axes,
+                          disabled_axes=effective_disabled(self.disabled_axes, champ_axes),
                           disabled_values=self.disabled_values,
                           facts=self._facts(),
                           tiling_overlap=self.cfg.search.tiling_overlap,
@@ -688,7 +689,9 @@ class Loop:
                           tiling_tp_min=self.cfg.search.tiling_tp_min,
                           budget=getattr(self, "_budget", None),
                           prescreen=self._prescreen_info(),
-                          retire_after=self.cfg.search.axis_retire_after)
+                          retire_after=self.cfg.search.axis_retire_after,
+                          min_delta=self.cfg.gate.min_delta,
+                          margin=self.cfg.gate.margin)
 
     def _prescreen_info(self) -> dict:
         """The lost-value prescreen settings the planner prompt's axis board
@@ -704,24 +707,27 @@ class Loop:
 
     def _propose(self, history: list[dict], diagnosis: dict,
                  round_dir: Path) -> dict:
+        champ_axes = history[-1].get("champion", {}).get("axes") if history else None
+        # exemplar disabled with no exemplar in the champion disables
+        # visual_negatives too, whatever the source
+        disabled = effective_disabled(self.disabled_axes, champ_axes)
         if self.cfg.planner.kind == "llm":
-            proposal = self._llm_planner(round_dir).propose(history, diagnosis)
+            proposal = self._llm_planner(round_dir, champ_axes).propose(history, diagnosis)
         else:
             proposal = deterministic.propose(history, diagnosis,
                                              max_candidates=self.cfg.planner.max_candidates,
-                                             disabled_axes=self.disabled_axes,
+                                             disabled_axes=disabled,
                                              disabled_values=self.disabled_values,
                                              facts=self._facts())
             _write(round_dir / "proposal.json", proposal)
         # merge human-injected candidates (hybrid loop)
         humans, human_dropped = _load_candidates_file(
-            self.candidates_file, self.disabled_axes, self.disabled_values,
-            base=(history[-1].get("champion", {}).get("axes") if history else None),
-            facts=self._facts())
+            self.candidates_file, disabled, self.disabled_values,
+            base=champ_axes, facts=self._facts())
         # candidates that passed the gate last round but lost to the winner —
         # carried onto the new champion whatever the planner (the shared filter
         # below still applies)
-        carried = deterministic.carryover(history, self.disabled_axes,
+        carried = deterministic.carryover(history, disabled,
                                           self.disabled_values, facts=self._facts())
         fresh, dropped = self._filter(proposal["candidates"] + humans + carried,
                                       history)
@@ -756,7 +762,8 @@ class Loop:
                               for c in acc.screened]
         # screen rows dropped by the pre-holdout fit_dev verdict are reported as rejections too
         outcomes = acc.skipped + [r for r in rows[len(acc.skipped):] if r.get("skipped")]
-        proposal = self._llm_planner(round_dir).reask(
+        champ_axes = history[-1].get("champion", {}).get("axes") if history else None
+        proposal = self._llm_planner(round_dir, champ_axes).reask(
             history, diagnosis, outcomes, k=k, taken={c["id"] for c in rows})
         if proposal is None:              # no conversation to continue, or the re-ask failed
             return None
@@ -1974,7 +1981,7 @@ def setting_forwards(setting: dict) -> int:
     (config, modality) pass (grid g tiles, 1 without tiling). The grid tile
     count does not depend on image size."""
     configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
-    groups = {(e["config_id"], e.get("modality", "semantic"))
+    groups = {(e["config_id"], e["modality"])
               for e in (setting.get("per_class") or {}).values()}
     total = 0
     for config_id, _modality in groups:
@@ -2033,7 +2040,7 @@ def _neg_eta_record(c: dict) -> dict:
     configs = {cf["config_id"]: cf for cf in c["setting"].get("configs", [])}
     used = {configs[e["config_id"]]["neg_eta"]
             for e in (c["setting"].get("per_class") or {}).values()
-            if e.get("modality", "semantic") == "semantic"
+            if e["modality"] == "semantic"
             and configs.get(e["config_id"], {}).get("visual_negatives")}
     grid = {cf["neg_eta"] for cf in configs.values() if cf.get("visual_negatives")}
     return {"neg_eta_used": sorted(used), "neg_eta_grid": sorted(grid)}
@@ -2058,7 +2065,7 @@ def _unused_axes(axes: dict, setting: dict) -> list[str]:
     negatives, and tiling when no class uses a tile config."""
     configs = {cf["config_id"]: cf for cf in setting.get("configs", [])}
     semantic = [e for e in (setting.get("per_class") or {}).values()
-                if e.get("modality", "semantic") == "semantic"]
+                if e["modality"] == "semantic"]
     out = []
     if axes.get("tiling") and not _uses_tiling(setting):
         out.append("tiling")
@@ -2082,7 +2089,7 @@ def _served_fp(setting: dict, materials: Materials, axes: dict, server: dict) ->
     Thresholds are left out — they are re-estimated on holdout."""
     configs = {cf["config_id"]: {k: v for k, v in cf.items() if k != "config_id"}
                for cf in setting.get("configs", [])}
-    per = {str(cid): [configs.get(e["config_id"]), e.get("modality", "semantic")]
+    per = {str(cid): [configs.get(e["config_id"]), e["modality"]]
            for cid, e in (setting.get("per_class") or {}).items()}
     mods = {m for _, m in per.values()}
     mat = materials.fingerprint()
@@ -2110,7 +2117,7 @@ def _material_summary(setting: dict, materials: Materials) -> str:
     For text-modality classes, per-class suppression phrases and aliases
     verbatim (what refinement converged to is the point); for semantic ones,
     only exemplar and visual negative counts. Truncated at MATERIAL_SUMMARY_MAX."""
-    mods = {e.get("modality", "semantic")
+    mods = {e["modality"]
             for e in (setting.get("per_class") or {}).values()}
     parts = []
     if "text" in mods:
@@ -2150,7 +2157,7 @@ def _modality_record(setting: dict, ontology) -> dict:
     # count a narrow text win as semantic
     out = {names.get(cid, cid): {"semantic": round(d["semantic"]["f_beta"], 4),
                                  "text": round(d["text"]["f_beta"], 4),
-                                 "chosen": d.get("chosen")}
+                                 "chosen": d["chosen"]}
            for cid, d in diag.items()}
     return {"modality_f": out} if out else {}
 
@@ -2356,9 +2363,9 @@ def _unused_record(c: dict) -> dict:
 
 def _stagnant(decision: dict, epsilon: float) -> bool:
     """Saturation counting rule — a round is stagnant if nothing was adopted, or
-    if the winner's Δ CI lower bound ≤ ε. With the default ε=0.0 an adoption
-    (the gate requires lo > margin ≥ 0) never counts, so this equals counting
-    non-adoptions; only when ε > margin do marginal adoptions count as stagnant."""
+    if the winner's Δ CI lower bound ≤ ε. The gate requires lo ≥ margin, so even
+    at the default ε=0.0 an adoption whose lower bound is exactly 0 (margin 0)
+    counts as stagnant. A larger ε counts correspondingly marginal adoptions too."""
     if not decision.get("adopted"):
         return True
     lo = ((decision.get("evaluated") or {}).get(decision.get("id"), {})

@@ -116,7 +116,7 @@ def main(argv=None) -> int:
     from agentic_configuration_search.diagnose.report import _history
     from agentic_configuration_search.loop.runner import (_token_budget, _trailing_empty,
                                                           _trailing_stagnant)
-    from agentic_configuration_search.planner.axes import DatasetFacts
+    from agentic_configuration_search.planner.axes import DatasetFacts, effective_disabled
     from agentic_configuration_search.planner.axis_status import axis_status
     from agentic_configuration_search.planner.llm import LLMPlanner
 
@@ -163,13 +163,14 @@ def main(argv=None) -> int:
                     chat=chat, artifact_dir=Path(tmp),
                     max_candidates=cfg.planner.max_candidates,
                     notes=cfg.dataset_notes, facts=facts,
-                    disabled_axes=cfg.search.disabled_axes,
+                    disabled_axes=effective_disabled(cfg.search.disabled_axes, champion),
                     disabled_values=cfg.search.disabled_values,
                     tiling_overlap=cfg.search.tiling_overlap,
                     tiling_tp_quantile=cfg.search.tiling_tp_quantile,
                     tiling_tp_min=cfg.search.tiling_tp_min, retire_after=retire,
                     token_budget=_token_budget(cfg, llm.max_model_len()), budget=budget,
-                    prescreen=prescreen)
+                    prescreen=prescreen, min_delta=cfg.gate.min_delta,
+                    margin=cfg.gate.margin)
                 prop = planner.propose(past, diag)
                 art = _load(Path(tmp) / "proposal.json") or {}
             prompt = (art.get("prompt") or [{}])[-1].get("content", "")

@@ -138,7 +138,9 @@ def test_human_candidates_are_injected(big_root, tmp_path, monkeypatch):
 
 def test_rescorer_without_embeddings_skips_as_identity(big_root, tmp_path,
                                                         monkeypatch):
-    """If the stub provides no embedding the discriminator has 0 rows — recorded as identity only."""
+    """If the stub provides no embedding the discriminator fits on hand-crafted
+    features only — on this small fixture it gains nothing (too few rows, or α=0 for
+    every class), so it is recorded as identity only."""
     monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
     cand_file = tmp_path / "candidates.yaml"
     cand_file.write_text(
@@ -654,7 +656,7 @@ def test_untiled_setting_is_relabelled_with_request_kept():
 
     setting = {"configs": [{"config_id": 0, "tiling": None},
                            {"config_id": 1, "tiling": {"grid": 2}}],
-               "per_class": {1: {"config_id": 0}}}
+               "per_class": {1: {"config_id": 0, "modality": "semantic"}}}
     entry = {"id": "x", "axes": validate_axes({"tiling": 2, "alias": "vlm"}),
              "setting": setting}
     _relabel_untiled(entry)
@@ -1175,7 +1177,8 @@ def test_compact_history_and_prompt_carry_modality_scores():
             {"round": 1, "champion": {"axes": b},
              "candidates": [{"id": "ex", "axes": validate_axes({"exemplar": "base"}),
                              "skipped": "axis_unused", "unused_axes": ["exemplar"],
-                             "modality_f": {"cat a": {"semantic": 0.1, "text": 0.3}}}]}]
+                             "modality_f": {"cat a": {"semantic": 0.1, "text": 0.3,
+                                                      "chosen": "text"}}}]}]
     row = _compact_history(hist)[1]["candidates"][0]
     assert row["modality"] == {"text_won": 1, "semantic_won": 0,
                                "closest_text_margin": 0.2}
@@ -1185,13 +1188,15 @@ def test_compact_history_and_prompt_carry_modality_scores():
 
 def test_modality_summary_size_does_not_grow_with_classes():
     """The prompt's modality summary has a size independent of the class count —
-    the full per-class record would make one row exceed 1KB on a 19-class
-    dataset and the budget guard would shrink the history window."""
+    the full per-class record would make one row large on a dataset with many
+    classes and the budget guard would shrink the history window. Wins are
+    screen's pick (chosen)."""
     import json as _json
     from agentic_configuration_search.planner.llm import _modality_summary
 
-    small = {"a": {"semantic": 0.5, "text": 0.4}}
-    big = {f"class name {i:02d}": {"semantic": 0.1 * (i % 3), "text": 0.15}
+    small = {"a": {"semantic": 0.5, "text": 0.4, "chosen": "semantic"}}
+    big = {f"class name {i:02d}": {"semantic": 0.1 * (i % 3), "text": 0.15,
+                                   "chosen": "text" if 0.15 > 0.1 * (i % 3) else "semantic"}
            for i in range(19)}
     s, b = _modality_summary(small), _modality_summary(big)
     assert s == {"text_won": 0, "semantic_won": 1}          # a tie or semantic win counts as semantic

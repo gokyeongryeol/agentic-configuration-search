@@ -9,7 +9,7 @@
 #     Calling it twice by mistake never kills the running server or starts a second one.
 #   · **setsid-detached** — stopping a background task kills its whole process tree.
 #     A resident server must live outside that tree to survive.
-#   · Model load takes ~9 min and the port is not bound until then, so success is
+#   · Model load takes several minutes and the port is not bound until then, so success is
 #     reported only after health comes up — starting runs without waiting would race:
 #     each sees a free port and launches its own vLLM.
 #
@@ -53,7 +53,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 0 < GPU_MEM <= 1 — vLLM may reject an out-of-range value only after the ~9 min load
+# 0 < GPU_MEM <= 1 — vLLM may reject an out-of-range value only after the long load
 if ! awk -v m="$GPU_MEM" 'BEGIN { exit !(m + 0 > 0 && m + 0 <= 1 && m ~ /^[0-9]*\.?[0-9]+$/) }'; then
     echo "[vllm] --gpu-mem must be a share greater than 0 and at most 1 (got: $GPU_MEM)"; exit 2
 fi
@@ -105,7 +105,7 @@ CUDA_VISIBLE_DEVICES="$GPU" VLLM_USE_FLASHINFER_SAMPLER=0 \
     --gpu-memory-utilization "$GPU_MEM" --max-model-len "$MAXLEN" \
     > "$LOG" 2>&1 &
 
-echo "[vllm] waiting for load (~9 min; the port opens after loading) — log: $LOG"
+echo "[vllm] waiting for load (several minutes; the port opens after loading) — log: $LOG"
 for i in $(seq 1 180); do
     curl -sf "$URL/health" >/dev/null 2>&1 && { echo "[vllm] ready ($((i*10))s)"; exit 0; }
     sleep 10

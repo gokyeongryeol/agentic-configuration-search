@@ -139,3 +139,19 @@ def test_off_switches_are_null_not_zero():
             config_from_dict({**BASE, section: {key: 0}})
         cfg = config_from_dict({**BASE, section: {key: None}})
         assert getattr(getattr(cfg, section), key) is None
+
+
+def test_modalities_is_not_a_setting():
+    """The screen always runs the semantic pass (with exemplars) and the text pass —
+    there is no switch. Dropping text would empty the setting of the baseline and of
+    every candidate without exemplars."""
+    with pytest.raises(ConfigError, match="modalities"):
+        config_from_dict({"dataset": "x", "search": {"modalities": ["semantic"]}})
+
+
+def test_gate_and_classifier_margins_cannot_be_negative():
+    """A margin is "at least this much to adopt" — negative, the prompt's "clears
+    {margin}" and the gate lose their meaning. Blocked like the other margins."""
+    for section in ("gate", "crop_classifier"):
+        with pytest.raises(ConfigError, match=f"{section}.margin"):
+            config_from_dict({"dataset": "x", section: {"margin": -0.01}})

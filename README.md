@@ -26,7 +26,7 @@ mine: {device: "cuda:1"}
 ```
 ```bash
 HF_HUB_OFFLINE=1 .venv/bin/acs run --config c.yaml             # → runs/<dataset>/run/
-.venv/bin/acs run --config c.yaml --resume                      # continue (replays saved proposals, no LLM calls)
+.venv/bin/acs run --config c.yaml --resume                      # continue (rounds already proposed replay their saved proposals — no new LLM calls)
 .venv/bin/acs run --config c.yaml --rounds 1 --candidates cands.yaml   # inject human candidates
 .venv/bin/acs report runs/<ds>/run [--config c.yaml]            # redraw report.md
 .venv/bin/acs ab runs/a runs/b                                  # compare two runs
