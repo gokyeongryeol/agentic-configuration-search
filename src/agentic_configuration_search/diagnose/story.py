@@ -147,7 +147,6 @@ CONDITION_PLAIN = {
 }
 # run_summary.stopped → why it stopped
 STOP_PLAIN = {
-    "planner_stop": "it judged there was no strategy left worth trying",
     "saturation": "the score stopped rising for several rounds",
     "empty_rounds": "no new strategy came up to test",
     "rounds": "it finished all the planned rounds",

@@ -64,7 +64,7 @@ decide       adopt the gate-passing candidate with max Δ  holdout
 Adoption: the one-sided paired-bootstrap lower bound of Δ ≥ `gate.margin`,
 Δ > 0, and Δ ≥ `gate.min_delta`.
 Stop: `saturation.rounds` stagnant rounds, `saturation.empty_rounds` empty
-rounds, planner stop, or the `rounds` cap.
+rounds, or the `rounds` cap (the planner never stops the run).
 
 ## Search axes
 

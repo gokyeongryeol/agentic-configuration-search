@@ -416,3 +416,19 @@ def test_failed_reask_closes_the_round(tmp_path):
         raise AssertionError("the replay called the LLM")
     assert LLMPlanner(chat=boom, artifact_dir=tmp_path).reask(
         [], {}, [], k=1, taken={"a"}) is None
+
+
+def test_reask_message_names_the_not_retried_marker(tmp_path):
+    """The re-ask message points at the board's "not retried" marker, but says to
+    leave out axes already proposed this round (the board is from the round's start)."""
+    from agentic_configuration_search.planner.axis_status import NOT_RETRIED
+    from agentic_configuration_search.planner.llm import LLMPlanner
+
+    chat, calls, _ = _planner_chat(_cands(("a", {"alias": "vlm"})),
+                                   _cands(("b", {"tiling": 2})))
+    p = LLMPlanner(chat=chat, artifact_dir=tmp_path)
+    p.propose([], {})
+    p.reask([], {}, [{"id": "a", "axes": {"alias": "vlm"}, "skipped": "no_material"}],
+            k=1, taken={"a"})
+    msg = calls[1][-1]["content"]
+    assert f'marks "{NOT_RETRIED}"' in msg and "already appears in the outcomes" in msg

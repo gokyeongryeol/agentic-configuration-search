@@ -174,9 +174,11 @@ def propose(history: list[dict], diagnosis: dict, *,
     """Candidates that each raise one axis from the champion's axes — single
     increments with clean attribution.
 
-    Returns: {"planner": "deterministic", "candidates": [...], "stop": bool}.
-    stop=True means the mapping is exhausted — a human can resume by injecting
-    candidates.yaml. disabled_axes / disabled_values (per-run bans) are
+    Returns: {"planner": "deterministic", "candidates": [...]}. When the mapping is
+    exhausted the candidates are empty and the round is an empty round — the run
+    stops on saturation.empty_rounds (to continue, raise the saturation limits and
+    resume with candidates.yaml — resume restores the counters from the history
+    tail). disabled_axes / disabled_values (per-run bans) are
     excluded from remedies.
     """
     disabled_values = disabled_values or {}
@@ -241,5 +243,4 @@ def propose(history: list[dict], diagnosis: dict, *,
     # material and arm folder names are the id as is. The remedy (kind:axis=value) stays
     # in the history row as remedy
     candidates = [{"id": f"cand_{i}", **c} for i, c in enumerate(candidates)]
-    return {"planner": "deterministic", "candidates": candidates,
-            "stop": not candidates}
+    return {"planner": "deterministic", "candidates": candidates}

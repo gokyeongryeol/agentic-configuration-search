@@ -72,7 +72,7 @@ class RunResult:
     decisions: list = field(default_factory=list)
     history: list = field(default_factory=list)
     champion: dict | None = None
-    stopped: str = "rounds"           # rounds | saturation | empty_rounds | planner_stop
+    stopped: str = "rounds"           # rounds | saturation | empty_rounds
 
 
 @dataclass
@@ -735,8 +735,7 @@ class Loop:
         # erase candidates discarded by sanitization from history.
         return {**proposal, "candidates": fresh,
                 "dropped": (list(proposal.get("dropped") or [])
-                            + human_dropped + dropped),
-                "stop": proposal["stop"] and not fresh}
+                            + human_dropped + dropped)}
 
     def _reask(self, k: int, r: int, history: list[dict], diagnosis: dict,
                round_dir: Path, champion: dict, acc: "_RoundAcc") -> dict | None:
@@ -778,8 +777,7 @@ class Loop:
         log.info("round %d: no candidate reached holdout, re-asked (%d) — %d new candidates",
                  r, k, len(fresh))
         return _with_round_ids({**proposal, "candidates": fresh,
-                                "dropped": proposal["dropped"] + dropped,
-                                "stop": proposal["stop"] and not fresh},
+                                "dropped": proposal["dropped"] + dropped},
                                r, {c["id"] for c in rows})
 
     def _filter(self, merged: list[dict], history: list[dict], *,
@@ -1345,7 +1343,7 @@ class Loop:
         # no free re-ask either (re-asks off)
         reasks = free = 0
         max_reasks = self.cfg.planner.max_reasks
-        while not acc.evaluated and not proposal["stop"] and max_reasks > 0:
+        while not acc.evaluated and max_reasks > 0:
             bonus = free < FREE_REASKS and _noop_only(proposal)
             if not bonus and reasks - free >= max_reasks:
                 break
@@ -1365,7 +1363,7 @@ class Loop:
 
         if not acc.n_runnable:
             decision = {"round": r, "adopted": False,
-                        "kind": ("planner_stop" if proposal["stop"] else "no_candidates"),
+                        "kind": "no_candidates",
                         "skipped": [c["id"] for c in skipped]} | reask_mark
             _write(rd / "decision.json", decision)
             self._append_history({
@@ -1409,10 +1407,6 @@ class Loop:
             if c.get("skipped") in FIT_DEV_SKIPS))
         if fd_skipped:
             decision["fit_dev_skipped"] = fd_skipped
-        if proposal["stop"]:
-            # the planner declared "nothing to try" while re-asked — this round
-            # measured nothing (which is why it was re-asked) and the run stops here
-            decision["kind"] = "planner_stop"
         if winner:
             w_axes, _ = _winner_axes(winner)     # defensive rescorer label reconciliation
             # downstream inheritance: a classifier-arm winner keeps its own artifact;
@@ -1868,9 +1862,6 @@ def run_rounds(dataset_root, *, out_dir, planner: str = "deterministic",
                 decision, champion = loop.run_round(r, champion, history)
                 history = loop._read_history()
                 result.decisions.append(decision)
-                if decision.get("kind") == "planner_stop":
-                    result.stopped = "planner_stop"
-                    break
                 stagnant_rounds = (stagnant_rounds + 1
                                    if _stagnant(decision, cfg.saturation.epsilon)
                                    else 0)
@@ -2550,7 +2541,7 @@ def _route_detector_state(axes: dict, champion_axes: dict) -> str:
 
 def _empty_round(decision: dict) -> bool:
     """Did the round measure nothing on holdout — evaluated still empty after the
-    re-asks (no_candidates and planner_stop included)? Not the baseline.
+    re-asks (no_candidates included)? Not the baseline.
 
     If some candidate dropped out at the pre-holdout fit_dev verdict
     (fit_dev_lost, fit_dev_identical — the decision's `fit_dev_skipped`), the

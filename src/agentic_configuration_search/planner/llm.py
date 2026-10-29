@@ -28,7 +28,7 @@ from ..core.metrics import FP_KINDS
 from ..diagnose.sample import pick_detail
 from . import deterministic
 from .axes import PLAN_DIFFERS_MAX, DatasetFacts, axis_values, sanitize_candidates
-from .axis_status import axis_status
+from .axis_status import NOT_RETRIED, axis_status
 from .board import board_lines
 from .gates import INPUT_SIDE, tiling_gate, tp_floor
 from .ledger import axis_ledger, champion_requests, kv, tried_under_champion
@@ -49,8 +49,11 @@ SCHEMA = {
     "schema": {
         "type": "object",
         "properties": {
+            # no stop field — only saturation, empty_rounds and the rounds cap stop
+            # a run. At least one candidate (constrained decoding rules out an empty proposal)
             "candidates": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     # property order is generation order — the expected gain,
@@ -74,9 +77,8 @@ SCHEMA = {
                                  "rationale"],
                 },
             },
-            "stop": {"type": "boolean"},
         },
-        "required": ["candidates", "stop"],
+        "required": ["candidates"],
     },
 }
 
@@ -866,8 +868,15 @@ Rules:
 {tiling_rule}- While some axis on the Axis board is "never tried in this run" (axes that cannot
   be proposed alone right now say "not tried" instead), prefer one of them over
   another variant of an already-tried value, unless the diagnosis
-  gives a concrete reason for the variant.
-- If nothing promising remains, return stop=true with no candidates.
+  gives a concrete reason for the variant. Re-measuring an axis marked
+  "{not_retried}" is not such a variant: its last result came from another champion.
+- An axis the Axis board marks "{not_retried}" last failed under an earlier
+  champion; the champion has changed since, so its result may differ now
+  (detector-state axes react to upstream changes). Prefer re-proposing one of them
+  over repeating an axis that was left unused.
+- Always propose at least one candidate. The run stops on its own once rounds stop
+  improving, so when nothing looks clearly promising, propose the most informative
+  remaining change (an axis "{not_retried}", then one "never tried in this run").
 
 ## Budget
 {budget}
@@ -1023,8 +1032,10 @@ changing only OFF axes on the Axis board is dropped (axis_retired), an axis the
 screen left unused stays unused for other values of it, a source value whose
 material came out empty stays empty under this champion, a quantity whose material collapsed to
 the same setting collapses again, and a variant of a clearly-lost value that the
-prescreen dropped (lost_value_prescreen) needs a real difference to pass. If
-nothing promising remains, return stop=true with no candidates."""
+prescreen dropped (lost_value_prescreen) needs a real difference to pass. Propose
+at least one candidate — an axis the Axis board marks "{not_retried}" is a good
+choice when nothing else is left, unless it already appears in the outcomes above
+(the board was built at the start of this round)."""
 
 MAX_REASK_LINES = 24     # cap on candidate lines in the re-ask message
 
@@ -1195,7 +1206,7 @@ class LLMPlanner:
         where a fresh one would not."""
         log.info("proposal replay: %s", path)
         stored = json.loads(path.read_text())
-        out = {k: stored[k] for k in ("planner", "candidates", "stop")}
+        out = {k: stored[k] for k in ("planner", "candidates")}
         out["dropped"] = stored.get("dropped") or []
         return out
 
@@ -1281,6 +1292,7 @@ class LLMPlanner:
                     diagnosis=diag_text,
                     notes_block=(NOTES_BLOCK.format(notes=self.notes)
                                  if self.notes else ""),
+                    not_retried=NOT_RETRIED,
                     max_candidates=self.max_candidates)},
             ]
         return build, carried
@@ -1348,7 +1360,8 @@ class LLMPlanner:
         champion = (history[-1].get("champion", {}).get("axes")
                     if history else None) or {}
         message = REASK.format(outcomes="\n".join(_outcome_lines(outcomes, champion))
-                               or "- (none)", k=self.max_candidates)
+                               or "- (none)", k=self.max_candidates,
+                               not_retried=NOT_RETRIED)
         tail.append({"role": "user", "content": message})
         build, _ = self._builder(history, diagnosis)
         messages, window, samples = self._fit(build, tail)
@@ -1376,9 +1389,7 @@ class LLMPlanner:
             renamed.append(c)
         dropped: list[dict] = []
         candidates = self._sanitize(renamed, self.max_candidates, dropped, champion)
-        stop = bool((raw or {}).get("stop")) and not candidates
-        proposal = {"planner": "llm", "candidates": candidates, "stop": stop,
-                    "dropped": dropped}
+        proposal = {"planner": "llm", "candidates": candidates, "dropped": dropped}
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({**proposal, "prompt": messages, **record},
                                    indent=2, ensure_ascii=False, default=str))
@@ -1419,20 +1430,17 @@ class LLMPlanner:
         carried_keys = {_axes_key(c["axes"]) for c in carried}
         candidates, dups = _drop_carried(candidates, carried_keys, dropped)
         followup = None
-        if dups and raw is not None and not raw.get("stop"):
+        if dups and raw is not None:
             followup = self._refill(build, raw, dups, candidates, champion,
                                     carried_keys, dropped,
                                     [c["id"] for c in carried])
         if dropped:
             log.info("sanitizer dropped %d candidates: %s", len(dropped),
                      [(c["id"], c["skipped"]) for c in dropped])
-        # proposing only carried candidates is still proposing — not a stop
-        stop = bool((raw or {}).get("stop")) and not candidates and not dups
         fallback = None
         # proposing only carried candidates makes an empty proposal correct (the
         # runner runs the carry-overs) — no fallback
-        if raw is None or (not candidates and not (raw or {}).get("stop")
-                           and not dups):
+        if raw is None or (not candidates and not dups):
             # Call failed or every candidate invalid — fill this round deterministically
             det = deterministic.propose(history, diagnosis,
                                         max_candidates=self.max_candidates,
@@ -1444,7 +1452,6 @@ class LLMPlanner:
             # axis-retirement filter does not block them (no empty round)
             candidates = [{**c, "id": f"det_{i}", "source": "fallback"}
                           for i, c in enumerate(det["candidates"])]
-            stop = det["stop"]
             fallback = "deterministic"
             if raw is not None and error is None:
                 # the reply came but the sanitizer dropped every candidate — keep
@@ -1455,8 +1462,7 @@ class LLMPlanner:
                 log.error("LLM planner failed (%s) — this round falls back to deterministic",
                           error)
 
-        proposal = {"planner": "llm", "candidates": candidates, "stop": stop,
-                    "dropped": dropped}
+        proposal = {"planner": "llm", "candidates": candidates, "dropped": dropped}
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_path.write_text(json.dumps(
             {**proposal, "prompt": messages, "response": raw,

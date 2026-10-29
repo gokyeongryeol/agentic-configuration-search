@@ -26,7 +26,7 @@ import json
 import statistics
 
 from .axes import BASELINE, NEGATIVE_AXES
-from .axis_status import NEVER_TRIED
+from .axis_status import NEVER_TRIED, NOT_RETRIED
 from .gates import tiling_gate
 from .ledger import K_PARENT, axis_ledger, fmt_value
 from .ledger import label as value_label
@@ -64,7 +64,8 @@ LEGEND = (
     "nothing under the champion it was tried on, so re-propose v only after the champion "
     "changes; \"not "
     "trained, too little data\" means the arm skipped training for lack of data — "
-    "re-propose it only after the champion changes. champion "
+    "re-propose it only after the champion changes; \"" + NOT_RETRIED + "\" means the "
+    "axis last failed under an earlier champion and has not been tried since. champion "
     "= record per value since the current champion was adopted (fd = fit_dev delta with "
     "upper bound ub, ho = held-out gate delta with lower bound lo; \"champion value (k "
     "variants)\" = quantity variants of the value the champion already uses; near-miss = "
@@ -220,6 +221,9 @@ def board_lines(history: list[dict], values: dict, status, *, disabled=(),
         run = st.record() if st else "-"
         if alone_blocked and NEVER_TRIED in run:
             run = run.replace(NEVER_TRIED, "not tried")
+        # the last failure was under a different champion — suggested only when a value can be proposed
+        if st and propose != "-" and not alone_blocked and st.stale(status.champion_round):
+            run += f"; {NOT_RETRIED} (champion changed in R{status.champion_round})"
         rows.append(f"{axis} | {state} | {propose} | {run} | "
                     f"{_champion_cell(axis, ledger, champ)} | {_cost_cell(axis, costs)} | "
                     + ("; ".join(note) or "-"))

@@ -37,10 +37,11 @@ def test_replay_survives_even_if_chat_would_now_fail(tmp_path):
     """Replay does not depend on the current LLM server state — resume works even if chat is dead."""
     from agentic_configuration_search.planner.llm import LLMPlanner
 
-    ok = LLMPlanner(chat=lambda m, **k: {"candidates": [], "stop": True},
+    ok = LLMPlanner(chat=lambda m, **k: {"candidates": [
+                        {"id": "a", "axes": {"rescorer": True}, "rationale": "r"}]},
                     artifact_dir=tmp_path)
     p1 = ok.propose(history=[], diagnosis={})
-    assert p1["stop"] is True
+    assert [c["axes"]["rescorer"] for c in p1["candidates"]] == [True]
 
     def boom(messages, **kw):
         raise RuntimeError("server down")

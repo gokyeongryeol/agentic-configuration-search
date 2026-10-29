@@ -362,3 +362,104 @@ def test_failure_rounds_follow_the_failure_kinds():
                                    empty_axis="text_negatives")])]
     rec = axis_status(h, 2).axes["text_negatives"].record()
     assert rec == "held-out fail x1 (last failed in R1); empty material for gt_crop"
+
+
+# ------------------------------------------------- axes worth re-measuring after a champion change
+
+LORA = validate_axes({"rescorer": True, "lora": True})
+
+
+def _stale_history():
+    """R1: classifier held-out fail (on RES). R2: lora adopted — the champion changed."""
+    return H0 + [_row(1, RES, [_cand("a", {"rescorer": True, "crop_classifier": True})],
+                      evaluated=["a"]),
+                 _row(2, LORA, [_cand("b", {"rescorer": True, "lora": True})],
+                      adopted="b", evaluated=["b"])]
+
+
+def test_axis_failed_under_an_earlier_champion_is_stale():
+    st = axis_status(_stale_history(), 2)
+    assert st.champion_round == 2
+    assert st.axes["crop_classifier"].stale(st.champion_round)
+    assert not st.axes["lora"].stale(st.champion_round)          # ON
+    assert not st.axes["exemplar"].stale(st.champion_round)      # never measured
+
+
+def test_stale_clears_once_measured_under_the_new_champion():
+    h = _stale_history() + [_held_out_fail(3, LORA, "c", {"rescorer": True, "lora": True,
+                                                         "crop_classifier": True})]
+    st = axis_status(h, 2)
+    assert not st.axes["crop_classifier"].stale(st.champion_round)
+
+
+def test_unused_and_no_change_are_not_stale():
+    """Unused and no-change are likely the same after a champion change — not suggested again."""
+    h = H0 + [_row(1, RES, [_cand("a", {"rescorer": True, "exemplar": "base"},
+                                  skipped="axis_unused", unused_axes=["exemplar"]),
+                            _cand("t", {"rescorer": True, "alias": "vlm"},
+                                  skipped="fit_dev_identical")]),
+              _row(2, LORA, [_cand("b", {"rescorer": True, "lora": True})],
+                   adopted="b", evaluated=["b"])]
+    st = axis_status(h, 2)
+    assert not st.axes["exemplar"].stale(st.champion_round)
+    assert not st.axes["alias"].stale(st.champion_round)
+
+
+def test_failure_in_the_adoption_round_was_under_the_old_champion():
+    """Other candidates of the adopting round were measured on the old champion — worth re-measuring."""
+    h = H0 + [_row(1, LORA, [_cand("b", {"rescorer": True, "lora": True}),
+                             _cand("k", {"rescorer": True, "crop_classifier": True})],
+                   adopted="b", evaluated=["b", "k"])]
+    st = axis_status(h, 2)
+    assert st.axes["crop_classifier"].stale(st.champion_round)
+
+
+def test_board_marks_axes_not_retried_under_this_champion():
+    from agentic_configuration_search.planner.axis_status import NOT_RETRIED
+    from agentic_configuration_search.planner.board import board_lines
+    h = _stale_history()
+    lines = board_lines(h, axis_values(), axis_status(h, 2))
+    clf = next(l for l in lines if l.startswith("crop_classifier | ")).split(" | ")
+    assert clf[3].endswith(f"{NOT_RETRIED} (champion changed in R2)")
+    assert NOT_RETRIED in lines[0]                                  # the legend explains it
+    ex = next(l for l in lines if l.startswith("exemplar | ")).split(" | ")
+    assert NOT_RETRIED not in ex[3]
+
+
+def test_an_attempt_without_an_outcome_still_counts_as_retried():
+    """A try under the new champion that ended without an outcome (outside screen's
+    top K) is still a try — a marker left on would have the board say "not retried"
+    while the champion column says "screened"."""
+    h = _stale_history() + [_row(3, LORA, [_cand("c", {"rescorer": True, "lora": True,
+                                                      "crop_classifier": True})])]
+    st = axis_status(h, 2)
+    assert st.axes["crop_classifier"].tried == 2
+    assert not st.axes["crop_classifier"].stale(st.champion_round)
+
+
+def test_probe_axis_can_be_stale_and_marked():
+    from agentic_configuration_search.planner.axis_status import NOT_RETRIED
+    from agentic_configuration_search.planner.board import board_lines
+    h = H0 + [_held_out_fail(1, BASE, "a", {"alias": "vlm"}),
+              _held_out_fail(2, BASE, "b", {"alias": "vlm"}),
+              _row(3, RES, [_cand("c", {"rescorer": True})], adopted="c", evaluated=["c"])]
+    st = axis_status(h, 2)
+    assert st.axes["alias"].status == "probe" and st.axes["alias"].stale(3)
+    row = next(l for l in board_lines(h, axis_values(), st) if l.startswith("alias | "))
+    assert f"{NOT_RETRIED} (champion changed in R3)" in row
+
+
+def test_marker_is_left_off_axes_that_cannot_be_proposed_alone():
+    """visual_negatives cannot be proposed alone on a champion without an exemplar — not marked."""
+    from agentic_configuration_search.planner.axis_status import NOT_RETRIED
+    from agentic_configuration_search.planner.board import board_lines
+    h = H0 + [_row(1, RES, [_cand("a", {"rescorer": True, "exemplar": "base",
+                                        "visual_negatives": "fp_crop"})], evaluated=["a"]),
+              _row(2, LORA, [_cand("b", {"rescorer": True, "lora": True})],
+                   adopted="b", evaluated=["b"])]
+    st = axis_status(h, 2)
+    assert st.axes["visual_negatives"].stale(2) and st.axes["exemplar"].stale(2)
+    lines = board_lines(h, axis_values(), st)
+    vn = next(l for l in lines if l.startswith("visual_negatives | "))
+    ex = next(l for l in lines if l.startswith("exemplar | "))
+    assert NOT_RETRIED not in vn and NOT_RETRIED in ex
