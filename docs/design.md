@@ -401,8 +401,10 @@ planner's input for the same round.
     predicted class for a false positive, the true class for a miss), and are told
     not to restate the kind or cite our upscaling as a cause.
   - Negative refinement states the pool's source (fp_crop, gt_crop, background)
-    truthfully and blocks only phrases naming the target itself — a negative is
-    attached only to the target's own prompts, so other category names are fine.
+    truthfully and blocks phrases naming the target or any other category — the
+    client emulates suppression target-agnostically (a negative removes any
+    overlapping positive), so a negative naming another category would suppress
+    it.
     Rejections come back as rule numbers only (so a long reason cannot be cut off
     and lose the whole class), and code cuts the `text_negative_k` cap by count.
   - Category-name checks in alias and negative refinement are whole-word ('fish'

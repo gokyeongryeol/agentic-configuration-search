@@ -84,8 +84,10 @@ SYSTEM = ("You filter candidate *negative* phrases for an open-vocabulary object
 # background false detection), and its effect is measured by the gate. The
 # refiner checks only rules 1-4, answerable from text alone: using a synonym,
 # part, or parent category of the target as a negative suppresses the target
-# itself. Other category names are not blocked — a negative is attached only to
-# the target's own prompts (core.prompts).
+# itself. Other category names are blocked too: the client emulates suppression
+# target-agnostically (a negative removes any overlapping positive, not only the
+# target's — clients.yoloe), so a negative naming another category suppresses
+# that category.
 # Where the phrase pool came from — stated truthfully per source (the
 # text_negatives value). gt_crop is not a false detection but another class's GT crop
 SOURCE_INTRO = {
@@ -101,15 +103,16 @@ For the category "{target}", an automatic captioner looked at {source} and
 produced these phrases (with how often each phrase occurred):
 {pool}
 
-These phrases are candidate NEGATIVE prompts for "{target}": a negative only
-suppresses "{target}"'s own prompts, so a phrase naming another category is
-fine. Do NOT judge whether the confusion looks plausible to you: you cannot see
+These phrases are candidate NEGATIVE prompts for "{target}". A negative
+suppresses every detection it overlaps, of any category, so a phrase naming
+another category in the list would suppress that category too. Do NOT judge whether the confusion looks plausible to you: you cannot see
 the crops, and a separate measurement afterwards decides whether each phrase
 actually helps.
 
 Your only job is a SAFETY filter. KEEP every phrase unless one of the following
 holds -- each is answerable from the phrase text alone:
-1. It names, contains, or is a synonym of "{target}" itself.
+1. It names, contains, or is a synonym of "{target}" or of any other category
+   in the list above.
 2. It names a PART or an ATTRIBUTE of "{target}" (e.g. for a cola bottle,
    "red cap" is its cap -- suppressing it would suppress the bottle itself).
 3. It names the object family or material that "{target}" belongs to (e.g. for
@@ -166,8 +169,8 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
 
     `source` is where the pool came from (fp_crop, gt_crop, background) — the
     prompt's opening says so. The max_keep cap is applied by code (it is not in the
-    prompt). Other category names are not blocked — a negative is attached only to
-    the target's own prompts.
+    prompt). Other category names are blocked too — emulated suppression removes any
+    overlapping positive, so a negative naming another category suppresses it.
     Returns keep=[] on failure — dropping is the safe direction.
     """
     pool = Counter(p for c in captions if c and (p := normalize_caption(c)))
@@ -194,12 +197,13 @@ def refine_negatives(base_url: str, model: str, target: str, categories: list[st
         parsed = _ask_json(sess, base_url, payload)
         keep = [p for p in parsed.get("keep", []) if isinstance(p, str) and p.strip()]
         # Mechanical double-check for rule 1 in case the LLM misses it — cheap and
-        # harmless. Only the target's own name is checked (whole words)
+        # harmless. Every category name is checked (whole words)
         safe, dropped = [], list(parsed.get("rejected", []))
         for p in keep:
-            if _names(p, target):
+            hit = next((c for c in [target, *categories] if _names(p, c)), None)
+            if hit is not None:
                 dropped.append({"phrase": p, "rule": 1,
-                                "note": "mechanical check: contains the target name"})
+                                "note": f"mechanical check: contains category name {hit!r}"})
                 continue
             safe.append(p)
         # the cap is cut by code in count order — not relying on the LLM's order
