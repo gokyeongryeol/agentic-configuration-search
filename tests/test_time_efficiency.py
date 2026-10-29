@@ -200,14 +200,14 @@ def test_small_block_reports_missed_small_input_px_and_grid_magnification():
     assert _small_block({}, overlap=0.5) == ""
 
 
-# --- T2: subset prescreen for tiling grid ≥ min_grid ---------------------------
+# --- T2: subset prescreen for tiling grid ≥ min_grid (2 by default — every grid) ---
 
 def test_prescreen_config_defaults_and_validation():
     from agentic_configuration_search.config import ConfigError, config_from_dict
 
     s = config_from_dict({"dataset": "x"}).screen
     assert (s.prescreen_fraction, s.prescreen_min_images, s.prescreen_min_grid,
-            s.prescreen_max_share) == (0.25, 20, 3, 0.5)
+            s.prescreen_max_share) == (0.25, 20, 2, 0.5)
     for bad in ({"prescreen_fraction": -0.1}, {"prescreen_fraction": 1.5},
                 {"prescreen_fraction": 0}, {"prescreen_fraction": "0.25"},
                 {"prescreen_min_images": 0}, {"prescreen_min_grid": 1},
@@ -268,12 +268,12 @@ def _recording(fake, log):
     return wrapped
 
 
-def _prescreen_cfg(root, fraction=0.5, max_share=1.0):
+def _prescreen_cfg(root, fraction=0.5, max_share=1.0, min_grid=2):
     from agentic_configuration_search.config import config_from_dict
     return config_from_dict({"dataset": str(root), "planner": {"kind": "llm"},
                              "screen": {"prescreen_fraction": fraction,
                                         "prescreen_min_images": 1,
-                                        "prescreen_min_grid": 2,
+                                        "prescreen_min_grid": min_grid,
                                         "prescreen_max_share": max_share}})
 
 
@@ -313,6 +313,23 @@ def test_prescreen_skipped_when_subset_is_most_of_fit_dev(big_root, tmp_path,  #
     rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
     assert rec["tiling_used"] is False and "prescreen" not in rec
     assert not str(rec.get("note", "")).startswith("prescreen")
+    assert calls and all(n == n_dev for tiled, n in calls if tiled)
+
+
+def test_prescreen_skipped_below_min_grid(big_root, tmp_path,  # noqa: F811
+                                          monkeypatch):
+    """A candidate with grid < prescreen_min_grid runs the full screen without a prescreen."""
+    from agentic_configuration_search.core.data import load_dataset
+
+    calls = []
+    monkeypatch.setattr(gateway, "infer_config",
+                        _recording(_fake_infer(_gt_lookup(big_root)), calls))
+    chat = _llm_by_round({1: [{"id": "t2", "axes": {"tiling": 2}, "rationale": "x"}]})
+    run_rounds(big_root, out_dir=tmp_path / "run", planner="llm", llm_chat=chat,
+               rounds=1, cfg=_prescreen_cfg(big_root, min_grid=3), **_fakes())
+    n_dev = len(load_dataset(big_root).fit_dev.images)
+    rec = {c["id"]: c for c in _hist(tmp_path / "run")[1]["candidates"]}["r1_t2"]
+    assert rec["tiling_used"] is False and "prescreen" not in rec
     assert calls and all(n == n_dev for tiled, n in calls if tiled)
 
 

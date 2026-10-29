@@ -393,6 +393,37 @@ def _two_arm_loop(root, tmp_path, monkeypatch, state):
     return loop, mined
 
 
+def test_classifier_row_records_the_refit_fit_dev(root, tmp_path, monkeypatch):
+    """A classifier candidate's row and candidate keep the final setting's (refit
+    rescorer) fit_dev too — as for lora. The λ grid values (before the refit) stay
+    in the classifier decision's grid."""
+    from agentic_configuration_search.loop import adapt_round
+    from agentic_configuration_search.loop.runner import Loop, _RoundAcc
+    state = {"w": None, "a": None}
+    loop, _ = _two_arm_loop(root, tmp_path, monkeypatch, state)
+    refit = {"fit_dev_micro_f_beta": 0.8, "configs": [], "per_class": {}}
+    monkeypatch.setattr(Loop, "_arm_rescorer", lambda self, e, s, m, d: refit)
+
+    def fake_clf(cfg, ds, axes, materials, out_dir, *, adapt_ctl, **kw):
+        art = Path(out_dir) / "artifact"
+        adapt_ctl(art, 1.0)
+        return {"adapt_root": art, "adapt_lambda": 1.0,
+                "setting": {"fit_dev_micro_f_beta": 0.5}, "decision": {"adopted": True}}
+    monkeypatch.setattr(adapt_round, "run_classifier_candidate", fake_clf)
+    champion = {"weights": None, "adapt_root": None, "adapt_lambda": None, "axes": {}}
+    acc = _RoundAcc(served_w=None, served_a=None, served_l=None)
+    try:
+        loop._attempt(tmp_path / "rd", champion,
+                      {"candidates": [{"id": "k1", "axes": {"crop_classifier": True}}],
+                       "stop": False}, acc)
+    finally:
+        gateway.set_classifier_blend(None)
+    (row,) = acc.screened
+    (ev,) = acc.evaluated
+    assert row["setting"] is refit and row["fit_dev_micro_f_beta"] == 0.8
+    assert ev["setting"] is refit and ev["fit_dev_micro_f_beta"] == 0.8
+
+
 def _two_candidates(loop, tmp_path, axis, prefix):
     from agentic_configuration_search.loop.runner import _RoundAcc
     champion = {"weights": None, "adapt_root": None, "adapt_lambda": None, "axes": {}}

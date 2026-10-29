@@ -103,7 +103,7 @@ class ScreenCfg:
     # large subset saves nothing.
     prescreen_fraction: float | None = 0.25
     prescreen_min_images: int = 20
-    prescreen_min_grid: int = 3
+    prescreen_min_grid: int = 2           # every grid — an unused tiling candidate is most often grid 2
     prescreen_max_share: float = 0.5
     # lost-value prescreen — a planner candidate containing a value that clearly
     # lost on fit_dev under the current champion (planner.ledger) is first measured
