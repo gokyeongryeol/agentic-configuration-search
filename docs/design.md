@@ -242,7 +242,7 @@ planner's input for the same round.
   responses can exceed the output cap (4096 tokens), and a cut response silently
   falls back to deterministic, so config rejects it.
 - **saturation** stops the run after `saturation.rounds` rounds without a
-  meaningful adoption, or when the planner has nothing left to try. A round
+  meaningful adoption. A round
   that measured nothing on holdout even after re-asking (an empty round) stops
   the run earlier after `saturation.empty_rounds` (default 2, 0 = off)
   consecutive ones (`stopped: "empty_rounds"`). Empty rounds are also stagnant
@@ -250,6 +250,20 @@ planner's input for the same round.
   because of the pre-holdout fit_dev verdict (`fit_dev_lost`,
   `fit_dev_identical`) is not counted as empty (it is still stagnant) — the
   skip only saves holdout time and does not change when the run stops.
+- **The planner never stops the run.** The LLM response schema has no stop
+  field and asks for at least one candidate (constrained decoding). Left to the
+  planner, stopping split runs on the same path by the LLM's reply, and it often
+  came right after a champion change, before the detector-state axes were
+  re-measured on the new champion. Useless rounds are cut by the empty-round and
+  stagnation counters above. An empty reply (a server without constrained
+  decoding) counts as a failed reply and falls back to deterministic (`no valid
+  candidate: empty candidate list`). The deterministic planner just returns no
+  candidates once its mapping is exhausted, which makes an empty round. To
+  continue such a run, raise `saturation.empty_rounds` and `saturation.rounds`
+  and `--resume` with `candidates.yaml` — resume restores both counters from the
+  history tail, so the candidates file alone would stop it again at once. With
+  `saturation.empty_rounds: 0` (off), empty rounds are cut only by the
+  stagnation count.
 - **diagnosis reuse**: if the champion and config equal the previous round's,
   the diagnosis (full train inference) and crop notes are not recomputed; the
   previous round's are copied (`diagnosis_key.json` — the champion's round, id,
@@ -468,7 +482,12 @@ planner's input for the same round.
   concrete reason (one sentence in the Rules). The basis is the axis status's
   try count (a quantity variant counts for its function axis; rows dropped
   without being measured do not count). With few candidates per round the order
-  is the budget. The deterministic planner is unchanged.
+  is the budget. Re-measuring a "not retried under this champion" axis is not
+  such a variant (its last result is from another champion). The deterministic
+  planner is unchanged.
+- **Always propose.** There is no stop field. When nothing looks promising, the
+  Rules say to propose the most informative remaining change — a "not retried
+  under this champion" axis, then an untried one.
 - If the response's `expected_gain`, `cost_min` or `differs` is missing or
   malformed only that field is dropped — the candidate is neither discarded
   nor sent to the deterministic planner. They are recorded as the candidate
@@ -510,6 +529,18 @@ PROBE) from the **whole run's** history (`search.axis_retire_after`, default 2;
   blocked.
 - When the champion changes, OFF axes reopen once as PROBE — one more failure
   turns them OFF again. Axes the champion has on are ON.
+- **Axes worth re-measuring.** An OPEN or PROBE axis whose last measured outcome
+  was a held-out fail, a fit_dev loss or an arm gate, after which the champion
+  changed and the axis has not been tried under the new champion (other
+  candidates of the adopting round were measured on the old champion too; a try
+  that ended without an outcome — outside screen's top K, no material, same as a
+  sibling — counts as a try). The board's run column gets "not retried under
+  this champion (champion changed in R<n>)" (only when a value can be proposed),
+  and the Rules and the re-ask message suggest it before repeating an unused
+  axis. The re-ask's board is from the round's start, so the message adds to
+  leave out axes already proposed this round. Detector-state axes
+  (crop_classifier, lora) tend to change with upstream changes. Unused and
+  no-change are left out — they are likely the same after a champion change.
 - **LLM planner only.** The deterministic planner is the A/B control and stays
   as is. Human and carried candidates are not blocked, for the same reason as
   the tiling fold, and neither are the deterministic fallback candidates of a
@@ -534,7 +565,7 @@ runs/<dataset>/run/
   history.jsonl        # round ledger (per-candidate wall_min, reask, fit_dev_cmp, lost_values, plan,
                        # delta_reused, classifier_reused, classifier_lambda(_grid);
                        # per-round pass_cache counts)
-  run_summary.json     # stop reason (rounds, saturation, empty_rounds, planner_stop), final champion,
+  run_summary.json     # stop reason (rounds, saturation, empty_rounds), final champion,
                        # holdout_split, fit_train (training images, images before the subset,
                        # selection record), final_diagnosis (reused or not, duration)
   fit_train_subset.json  # fit_train subset (key, picked images, selection record) — above the cap only

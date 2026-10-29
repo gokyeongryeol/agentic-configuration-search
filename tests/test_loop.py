@@ -92,8 +92,9 @@ def test_loop_adopts_then_stops(big_root, tmp_path, monkeypatch):
     assert r1["adopted"] is True
     assert result.champion["axes"]["exemplar"] == "base"
     assert result.champion["eval"]["micro_f_beta"] == pytest.approx(1.0)
-    # afterwards: errors are gone, so it stops at some round (planner_stop or saturation)
-    assert result.stopped in ("planner_stop", "saturation")
+    # afterwards: errors are gone and the mapping is exhausted — empty rounds
+    # follow and the run stops (there is no planner stop)
+    assert result.stopped in ("empty_rounds", "saturation")
 
     # artifacts — round directories and the ledger
     assert (out / "history.jsonl").exists()
@@ -1293,3 +1294,26 @@ def test_carried_row_records_only_this_rounds_measurement(big_root, tmp_path,
     for k in ("prescreen", "fit_dev_cmp", "tiling_shortfall", "wall_min",
               "setting_fp", "fit_dev_micro_f_beta"):
         assert row.get(k) is None or row[k] != src.get(k), k
+
+
+def test_planner_cannot_stop_the_run(big_root, tmp_path, monkeypatch):
+    """A planner saying stop (the old reply format) does not stop the run — only
+    saturation, empty_rounds and the rounds cap do. It stops once empty_rounds
+    rounds in a row measure nothing."""
+    from agentic_configuration_search.config import config_from_dict
+
+    monkeypatch.setattr(gateway, "infer_config", _fake_infer(_gt_lookup(big_root)))
+    cfg = config_from_dict({"dataset": str(big_root), "planner": {"kind": "llm"},
+                            "saturation": {"rounds": 9, "empty_rounds": 2}})
+
+    def quitter(messages, **kw):         # "let's stop" with no candidates every time (old format)
+        return {"candidates": [], "stop": True}
+
+    result = run_rounds(big_root, out_dir=tmp_path / "run", cfg=cfg,
+                        llm_chat=quitter, rounds=6, **_fakes())
+    kinds = [d.get("kind") for d in result.decisions]
+    assert "planner_stop" not in kinds
+    # the empty reply is filled by the deterministic fallback, so round 1 measures
+    assert result.decisions[1].get("evaluated")
+    assert result.stopped == "empty_rounds"
+    assert kinds[-2:] == ["no_candidates", "no_candidates"]

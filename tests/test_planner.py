@@ -47,7 +47,7 @@ def _diag(fn=None, fp=None, split="train"):
 def test_remedy_maps_dominant_error_to_axis():
     """missed dominates -> promoting exemplar is the first candidate."""
     out = deterministic.propose([], _diag(fn={"missed": 10, "below_threshold": 2}))
-    assert out["stop"] is False
+    assert out["candidates"] and "stop" not in out
     first = out["candidates"][0]
     assert first["axes"]["exemplar"] == "base"
     # a below_threshold remedy follows
@@ -81,9 +81,10 @@ def test_fn_arm_requires_base_first():
     assert all(c["axes"]["exemplar"] != "fn_arm" for c in out["candidates"])
 
 
-def test_stop_when_mapping_exhausted():
+def test_exhausted_mapping_yields_no_candidates_not_a_stop():
+    """An exhausted mapping just gives no candidates — there is no stop signal (the run stops on empty_rounds)."""
     out = deterministic.propose([], _diag(fn={"duplicate": 3}))
-    assert out["stop"] is True and out["candidates"] == []
+    assert out["candidates"] == [] and "stop" not in out
 
 
 def test_test_split_diagnosis_also_counts():
@@ -1128,7 +1129,7 @@ def test_only_carried_duplicates_do_not_trigger_deterministic_fallback(tmp_path)
                                 "rationale": "r"}], "stop": False}
 
     out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
-    assert out["candidates"] == [] and out["stop"] is False
+    assert out["candidates"] == [] and "stop" not in out
     stored = json.loads((tmp_path / "proposal.json").read_text())
     assert stored["fallback"] is None and "follow-up failed" in stored["followup"]["error"]
 
@@ -1156,19 +1157,6 @@ def test_refill_renames_until_free():
     from agentic_configuration_search.planner.llm import _free_id
     assert _free_id("a", {"b"}) == "a"
     assert _free_id("a", {"a", "a_2"}) == "a_3"
-
-
-def test_stop_with_only_carried_duplicates_keeps_running(tmp_path):
-    """stop=True with only carried candidates is not a stop — proposing them
-    means looking at the carry-overs further, and before this change those
-    candidates stayed, so it was not a stop either."""
-    hist = _carry_history({"rescorer": True}, winner_axes={"exemplar": "base"})
-    chat, calls = _scripted_chat(
-        {"candidates": [{"id": "dup", "axes": {"rescorer": True}, "rationale": "r"}],
-         "stop": True})
-    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(hist, {})
-    assert out["candidates"] == [] and out["stop"] is False
-    assert len(calls) == 1                               # no follow-up on stop
 
 
 def test_prompt_explains_carried_duplicate():
@@ -1307,3 +1295,42 @@ def test_llm_fallback_candidates_use_det_ids(tmp_path):
         [], _diag(fn={"missed": 10}))
     assert p["candidates"] and all(c["id"].startswith("det_") for c in p["candidates"])
     assert p["dropped"] and all(d["id"].startswith("cand_") for d in p["dropped"])
+
+
+# ------------------------------------------------- no planner stop
+
+def test_schema_has_no_stop_and_requires_a_candidate(tmp_path):
+    """The planner cannot stop the run — there is no stop field and at least one candidate is required (constrained decoding)."""
+    seen = {}
+
+    def chat(messages, **kw):
+        seen.update(kw)
+        seen["prompt"] = messages[-1]["content"]
+        return {"candidates": [{"id": "a", "axes": {"rescorer": True}, "rationale": "r"}]}
+    out = LLMPlanner(chat=chat, artifact_dir=tmp_path).propose(
+        [{"round": 0, "champion": {"axes": validate_axes({})}, "candidates": []}], {})
+    schema = seen["schema"]["schema"]
+    assert "stop" not in schema["properties"] and schema["required"] == ["candidates"]
+    assert schema["properties"]["candidates"]["minItems"] == 1
+    assert "stop" not in out
+    assert "stop=true" not in seen["prompt"]
+    assert "Always propose at least one candidate" in seen["prompt"]
+
+
+def test_empty_llm_answer_falls_back_instead_of_stopping(tmp_path):
+    """An empty reply (a server without constrained decoding etc.) is a failure, not a stop — deterministic fallback."""
+    out = LLMPlanner(chat=lambda m, **k: {"candidates": [], "stop": True},
+                     artifact_dir=tmp_path).propose(
+        [{"round": 0, "champion": {"axes": validate_axes({})}, "candidates": []}],
+        {"train": {"summary": {"fn": {"missed": 5}, "fp": {}}}})
+    assert out["candidates"] and all(c["source"] == "fallback" for c in out["candidates"])
+    stored = json.loads((tmp_path / "proposal.json").read_text())
+    assert stored["fallback"] == "deterministic" and "empty candidate list" in stored["error"]
+
+
+def test_prompts_point_at_axes_not_retried_under_this_champion():
+    from agentic_configuration_search.planner.axis_status import NOT_RETRIED
+    from agentic_configuration_search.planner.llm import PROMPT, REASK
+    assert "stop=true" not in PROMPT and "stop=true" not in REASK
+    assert "{not_retried}" in PROMPT and "{not_retried}" in REASK
+    assert NOT_RETRIED == "not retried under this champion"

@@ -34,6 +34,15 @@ Rules (per axis, function axes — count axes fold into their function axis):
   so it is measured once more).
 - An axis the champion has on is ON and never blocked (detector-state axes
   cannot even be turned off).
+- Worth re-measuring (`stale`): an OPEN or PROBE axis whose last measured
+  outcome was a failure (held-out fail, fit_dev lost, arm gate), after which the
+  champion changed and the axis has not been tried under the new champion yet (a
+  try that ended without an outcome — outside screen's top K, no material, same
+  as a sibling — counts as a try). The context changed, so the result may differ
+  (detector-state axes are sensitive to upstream changes). Unused and no-change
+  are left out: they are likely the same after a champion change. The axis board
+  marks it with NOT_RETRIED and the prompt suggests it before repeating unused
+  axes.
 
 It reads held-out results (gate failures) — "what to try next" is within what
 the held-out split may change (the core invariant). It never touches materials
@@ -63,6 +72,10 @@ _ARM_SKIP = {"rescorer_identity": "rescorer", "lora_gate": "lora",
              "classifier_gate": "crop_classifier"}
 _HELD_OUT_FAIL = "held-out fail"
 NEVER_TRIED = "never tried in this run"   # the Rules' untried rule and the axis board point to this text
+NOT_RETRIED = "not retried under this champion"   # the Rules, the re-ask and the axis board point to this text
+# failures worth re-measuring after a champion change — unused and no-change are
+# likely the same in a new context
+_RETRY_KINDS = {_HELD_OUT_FAIL, "fit_dev lost", "arm gate"}
 # on a tie between failure kinds in one round, the earlier one — no reliance on set order (PYTHONHASHSEED)
 _KIND_ORDER = ("held-out fail", "fit_dev lost", "arm gate", "no change", "unused")
 _UNUSED = "unused"
@@ -80,7 +93,21 @@ class AxisState:
     measured: int = 0                    # rounds measured (once per round × axis)
     tried: int = 0                       # attempts made (without UNMEASURED drops — no material and outside top K count)
     off_since: int | None = None         # round it turned OFF
+    last_round: int | None = None        # last measured round
+    last_tried: int | None = None        # last round it was tried (tries without an outcome included)
+    last_kind: str | None = None         # that round's outcome (None = a win)
     no_material: list = field(default_factory=list)   # values whose material came out empty
+
+    def stale(self, champion_round: int) -> bool:
+        """Was the last measurement a failure worth re-measuring, after which (at the
+        end of round champion_round) the champion changed, with no try under the new
+        champion yet? OPEN and PROBE axes only."""
+        # a try that ended without an outcome (outside screen's top K, no material,
+        # same as a sibling) was still proposed again under the new champion —
+        # compare the try round, not the measured round
+        return (self.status in ("open", "probe") and self.last_round is not None
+                and self.last_kind in _RETRY_KINDS and champion_round > 0
+                and champion_round >= max(self.last_round, self.last_tried or 0))
 
     def record(self) -> str:
         """One cell of the whole-run record — wins, failure kinds, empty material, whether tried, recent failed rounds."""
@@ -156,6 +183,7 @@ def _outcome(c: dict, changed: set[str], evaluated: dict) -> dict[str, str | Non
 class AxisStatus:
     retire_after: int | None
     axes: dict = field(default_factory=dict)     # axis → AxisState
+    champion_round: int = 0                      # round the current champion was adopted (baseline 0)
 
     @property
     def off(self) -> set[str]:
@@ -200,6 +228,7 @@ def axis_status(history: list[dict], retire_after: int | None) -> AxisStatus:
             for a in changed:
                 if a in st.axes:
                     st.axes[a].tried += 1
+                    st.axes[a].last_tried = e["round"]
             # empty or short material (including the classifier and lora tripwires) — a problem of the value
             empty = c.get("empty_axis")
             if skip == "no_material" or empty:
@@ -214,19 +243,23 @@ def axis_status(history: list[dict], retire_after: int | None) -> AxisStatus:
         for axis, kinds in rnd.items():
             s = st.axes[axis]
             s.measured += 1
+            s.last_round = e["round"]
             if None in kinds:
+                s.last_kind = None
                 s.wins += 1
                 s.streak = 0
                 if s.status in ("off", "probe"):
                     s.status, s.off_since = "open", None
                 continue
             kind = max(sorted(set(kinds), key=_KIND_ORDER.index), key=kinds.count)
+            s.last_kind = kind
             s.fails[kind] = s.fails.get(kind, 0) + 1
             s.fail_rounds.append(e["round"])
             s.streak += 1
             if retire_after and s.streak >= retire_after and s.status != "off":
                 s.status, s.off_since = "off", e["round"]
         if d.get("adopted") and e["round"] > 0:
+            st.champion_round = e["round"]
             # a new champion — reopen OFF axes once (one more failure turns them OFF again)
             for s in st.axes.values():
                 if s.status == "off":
