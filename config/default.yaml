@@ -58,7 +58,7 @@ screen:
   # unchanged). null turns it off (0 is refused).
   prescreen_fraction: 0.25
   prescreen_min_images: 20
-  prescreen_min_grid: 3                   # from grid 3 (10 forwards) — grid 2 (5) is screened in full
+  prescreen_min_grid: 2                   # every grid — an unused tiling candidate is most often grid 2
   prescreen_max_share: 0.5                # skip the prescreen when the subset is this share of fit_dev or more (full screen directly)
   # lost-value prescreen — a planner candidate containing a value that clearly
   # lost on fit_dev under the current champion (a single increment's

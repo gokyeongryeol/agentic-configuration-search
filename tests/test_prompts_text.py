@@ -56,6 +56,20 @@ def test_negatives_single_target_without_alias():
     assert negs == [("metal pole", "cat a")]
 
 
+def test_negative_equal_to_any_positive_phrase_is_dropped():
+    """A negative equal to any positive phrase is dropped — this class's own (self-
+    suppression) and another class's too. The client emulates suppression
+    target-agnostically (it removes any overlapping positive) and folds channels by
+    phrase, so a negative 'b' would suppress class b itself and collide with b's
+    positive channel."""
+    queries, _, _ = build_text_queries(
+        ["a", "b"], {"b": "bee"}, box_threshold=0.03, multimodal_threshold=0.05,
+        visual_negatives={"a": ["a", "b", "bee", "wasp"]})
+    negs = [(p["text"], p["negative_target"]) for p in queries[0]["prompts"]
+            if p.get("negative_target")]
+    assert negs == [("wasp", "a")]
+
+
 def test_identity_alias_adds_nothing():
     queries, _, alias = build_text_queries(
         ["cat a"], {"cat a": "cat a"}, box_threshold=0.03, multimodal_threshold=0.05)

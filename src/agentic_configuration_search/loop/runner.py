@@ -1019,9 +1019,10 @@ class Loop:
         """Screen on a fit_dev subset first — True if rejected. Two cases share
         the same subset screen.
 
-        (1) Large-grid tiling: a grid g screen costs 1+g² forwards, so from g ≥
-        screen.prescreen_min_grid the full fit_dev is expensive. If no class uses
-        a tile, reject as axis_unused. Only for single increments that change
+        (1) Tiling: a grid g screen costs 1+g² forwards, so the full fit_dev is
+        expensive, and a newly turned-on grid (g ≥ screen.prescreen_min_grid —
+        every grid by default) often goes unused. If no class uses a tile, reject
+        as axis_unused. Only for single increments that change
         tiling alone and raise the grid — a candidate that also changes other
         axes, or lowers the champion's grid, is not the champion even if tiles
         go unused. Not done without a subset (fit_dev is
@@ -1793,7 +1794,12 @@ class Loop:
                                | _classifier_lambda_record(row))
                 continue
             setting = self._arm_rescorer(entry, res["setting"], materials, mat_dir)
-            entry["setting"] = setting
+            # the row and the candidate keep the final setting's (refit rescorer)
+            # fit_dev — as for lora. The λ grid values (before the refit) stay in
+            # the classifier decision's grid
+            entry["setting"] = row["setting"] = setting
+            entry["fit_dev_micro_f_beta"] = row["fit_dev_micro_f_beta"] = \
+                setting["fit_dev_micro_f_beta"]
             row.update(_cmp_of(self._fit_dev_cmp(setting)) | _rescorer_record(entry))
             if self._arm_skip(row):
                 continue
