@@ -90,17 +90,28 @@ def test_refine_alias_rejects_other_category_overlap(monkeypatch):
 
 
 def test_refine_negatives_rule1_double_check(monkeypatch):
-    """Even if the LLM misses rule 1 (the target's own name), the mechanical check filters it out.
-    Another category's name is fine as a negative — a negative is attached only to the
-    target's own prompts."""
+    """Even if the LLM misses rule 1 (the target's or another category's name), the
+    mechanical check filters it out. Another category's name is blocked too — the
+    client's emulated suppression removes any overlapping positive, so a negative
+    naming class b would suppress b."""
     monkeypatch.setattr(phrases, "post_with_retry",
-                        lambda *a, **k: _FakeResp({"keep": ["red cat a", "cat b", "blue ring"],
+                        lambda *a, **k: _FakeResp({"keep": ["red cat a", "small cat b",
+                                                            "blue ring"],
                                                    "rejected": []}))
     out = phrases.refine_negatives("http://x", "m", "cat a", ["cat a", "cat b"],
-                                   ["red cat a", "cat b", "blue ring"])
-    assert out["keep"] == ["cat b", "blue ring"]
-    assert [r["phrase"] for r in out["rejected"]] == ["red cat a"]
-    assert out["rejected"][0]["rule"] == 1
+                                   ["red cat a", "small cat b", "blue ring"])
+    assert out["keep"] == ["blue ring"]
+    assert [r["phrase"] for r in out["rejected"]] == ["red cat a", "small cat b"]
+    assert all(r["rule"] == 1 for r in out["rejected"])
+    assert "'cat b'" in out["rejected"][1]["note"]
+
+
+def test_refine_prompt_blocks_other_category_names():
+    """The prompt's rule 1 covers every category in the list, and it says why."""
+    low = " ".join(phrases.RULES.lower().split())
+    assert 'or of any other category in the list above' in low
+    assert "suppresses every detection it overlaps, of any category" in low
+    assert "is fine" not in low
 
 
 def test_refine_negatives_name_check_is_whole_word(monkeypatch):
